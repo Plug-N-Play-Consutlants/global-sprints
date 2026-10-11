@@ -129,3 +129,7 @@ Support now includes a bounded, local-only diagnostic session export, a new-sess
 ## v0.6.0 initial functional audit
 
 See `docs/audit-0.6.0.md` for source findings, corrections, and outstanding runtime tests.
+
+## v0.6.1 repository trace
+
+Run `python scripts/audit_paths.py` for the offline pathway-presence matrix. Findings, corrections, and unverified runtime paths are documented in `docs/audit-0.6.1.md` and `docs/audit-trace-0.6.1.json`.

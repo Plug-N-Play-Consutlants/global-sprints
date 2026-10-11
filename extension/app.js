@@ -89,7 +89,7 @@ function showArchivedWorkspaces(){const archived=(registry.workspaces||[]).filte
 
 let assignedItems=[];
 let assignedLoadSequence=0;
-let ancestorItems=[];const workflowStates=new Map();
+let ancestorItems=[];const workflowStates=new Map();const workflowCategories=new Map();
 let searchTimer,searchSequence=0,nearbyResults=[];
 let savedSprintForm='',savedProjectVisibility='',activeSprintId='',switchingSprint=false;
 const sprintForm=()=>JSON.stringify(['sprintName','start','end','goal','status'].map(id=>$(id).value));
@@ -517,7 +517,7 @@ const LANE_PRESETS={'Backlog / Planned':'To Do','Ready to Start':'To Do','Active
 const LANE_CATEGORIES=['To Do','In Progress','Done','Closed'];
 let diagnosticEvents=[];const DIAG_KEY='pnpc-global-sprints-diagnostics-v2';
 const DIAG_LIMIT=600;
-const DIAG_VERSION='0.6.0';
+const DIAG_VERSION='0.7.0';
 let diagnosticSessionId='';
 function safeDiagnosticDetails(details){
  const out={};for(const [key,value] of Object.entries(details||{})){
@@ -565,10 +565,167 @@ function renderDiagnostics(){
 function downloadDiagnostics(){
  diagnosticCoverage();diagnostic('diagnostics.export',{eventCount:diagnosticEvents.length});
  const payload={schema:'pnpc.diagnostics.v3',product:'global-sprints',version:DIAG_VERSION,generatedAt:new Date().toISOString(),session:diagnosticSessionId,capabilities:{sdk:!!sdk,extensionStorage:!!storage,workItemApi:!!token},acceptance:diagnosticAcceptance(),events:diagnosticEvents};
- const url=URL.createObjectURL(new Blob([JSON.stringify(payload,null,2)],{type:'application/json'}));const link=document.createElement('a');link.href=url;link.download='global-sprints-test-session-0.5.7.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+ const url=URL.createObjectURL(new Blob([JSON.stringify(payload,null,2)],{type:'application/json'}));const link=document.createElement('a');link.href=url;link.download=`global-sprints-test-session-${DIAG_VERSION}.json`;link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
 }
 function clearDiagnostics(){diagnosticEvents=[];try{localStorage.removeItem(DIAG_KEY);}catch(_){}diagnostic('diagnostics.cleared');}
 function startDiagnosticSession(){diagnosticSessionId='session-'+Date.now().toString(36);diagnostic('diagnostics.session_started',{version:DIAG_VERSION});diagnosticCoverage();}
+
+// One-click, read-only live trace plus isolated synthetic assertions. No mutation API calls.
+let auditLastRun=null,auditRunning=false;
+
+// v0.7.0: consistent action help. Native titles work on hover and accessible labels on focus.
+function installActionHelp(){
+ const help={
+  wizardReset:'Discard the unsaved proposal and reset its form. Saved schedules and Outlook meetings stay intact.',
+  wizardNext:'Continue to the next meeting proposal step. Nothing is saved yet.',wizardBack:'Return to the previous proposal step.',
+  previewCeremonies:'Rebuild the unsaved meeting proposal from your current selections.',
+  confirmCeremonies:'Save approved meetings as internal records. This does not send Outlook invitations.',
+  capture:'Save a dated baseline of sprint commitments for future scope and progress comparisons.',
+  reportRefresh:'Read current source work items from Azure DevOps and update reports.',
+  reportObserve:'Save a dated progress observation. Burndown needs observations on different days.',
+  reportExport:'Download the currently displayed report data as CSV.',
+  resetSprintBoard:'Remove all assignments from this global sprint, not source work items or their states.',
+  saveBoardDraft:'Save a recoverable copy of the current global sprint board.',
+  restoreBoardDraft:'Restore a previously saved global sprint board draft.',
+  auditRunButton:'Check extension health using read-only Azure DevOps checks and isolated synthetic calculations.',
+  auditExportButton:'Export the most recent health check with evidence and coverage limitations.'
+ };
+ for(const button of document.querySelectorAll('button')){
+  if(button.title||button.classList.contains('hidden'))continue;
+  const label=(button.textContent||'').trim().replace(/\s+/g,' ');
+  const explanation=help[button.id]|| (label?`${label}. This action applies to the current section; review any confirmation before changes are saved.`:'');
+  if(explanation)button.title=explanation;
+ }
+}
+
+function auditCheck(results,id,status,observed,expected='',detail=''){
+ results.push({id,status,expected,observed,detail});
+ diagnostic('audit.check',{checkId:id,status,detail:detail.slice(0,90)},status==='FAIL'?'error':status==='WARNING'?'warn':'info');
+}
+function auditRender(){
+ const status=$('auditRunStatus'),output=$('auditRunResults');if(!status||!output)return;
+ if(auditRunning){status.textContent='Diagnostic running. Read-only checks may take a few seconds.';return;}
+ if(!auditLastRun){status.textContent='Not run yet. Live checks are read-only; synthetic checks are isolated.';output.textContent='';return;}
+ const counts={};for(const c of auditLastRun.checks)counts[c.status]=(counts[c.status]||0)+1;
+ const health=(counts.FAIL||0)?'ACTION REQUIRED':(counts.WARNING||0)?'REVIEW NEEDED':'CHECKS HEALTHY';
+ status.textContent=`${health} · Completed ${auditLastRun.finishedAt} · ${auditLastRun.checks.length} checks · ${counts.PASS||0} PASS · ${counts.FAIL||0} FAIL · ${counts.WARNING||0} WARNING · ${counts.NOT_TESTED||0} NOT TESTED`;
+ output.textContent=auditLastRun.checks.map(c=>`${c.status} · ${c.id}\n  Expected: ${c.expected||'N/A'}\n  Observed: ${c.observed}${c.detail?'\n  Note: '+c.detail:''}`).join('\n\n');
+}
+
+// Outlook-familiar meeting time picker: readable 12-hour options, canonical HH:mm values.
+function populateMeetingTimePicker(select, selected='09:30'){
+ const prior=String(selected||'09:30');select.replaceChildren();
+ for(let minutes=0;minutes<1440;minutes+=15){
+  const hour=Math.floor(minutes/60),minute=minutes%60;
+  const value=String(hour).padStart(2,'0')+':'+String(minute).padStart(2,'0');
+  const label=String(hour%12||12)+':'+String(minute).padStart(2,'0')+' '+(hour<12?'AM':'PM');
+  select.add(new Option(label,value));
+ }
+ // Preserve unusual existing meeting times instead of silently rounding them.
+ if(/^([01]\d|2[0-3]):[0-5]\d$/.test(prior)&&![...select.options].some(o=>o.value===prior)){
+  const [hh,mm]=prior.split(':').map(Number);select.add(new Option(`${hh%12||12}:${String(mm).padStart(2,'0')} ${hh<12?'AM':'PM'} (custom)`,prior));
+ }
+ select.value=prior;
+}
+function initializeMeetingTimePickers(){for(const id of ['planTime','ceremonyTime']){const element=$(id);if(element)populateMeetingTimePicker(element,element.value||'09:30');}}
+
+async function runAutomatedAudit(){
+ installActionHelp();
+ if(auditRunning)return;
+ auditRunning=true;const button=$('auditRunButton');if(button)button.disabled=true;auditRender();
+ const checks=[],startedAt=new Date().toISOString();diagnostic('audit.run.started',{version:DIAG_VERSION});
+ try{
+  auditCheck(checks,'extension.capabilities',sdk&&storage&&token?'PASS':'WARNING',`SDK ${!!sdk}, storage ${!!storage}, ADO token ${!!token}`,'All capabilities available');
+  const tooltipTargets=[...document.querySelectorAll('#tab-board button,#tab-planning button,#tab-reports button')].filter(b=>!b.classList.contains('hidden')&&!b.closest('.hidden'));
+  const missingTooltips=tooltipTargets.filter(b=>!b.title&&!b.getAttribute('aria-label')&&!b.getAttribute('aria-describedby'));
+  auditCheck(checks,'ui.action_help',missingTooltips.length?'WARNING':'PASS',`${tooltipTargets.length} controls checked; ${missingTooltips.length} missing explanations`,'Visible Board, Planning and Reports buttons have accessible help','Read-only DOM inspection; does not prove tooltip positioning or clarity.');
+  const wizardControls=['wizardReset','wizardResetStatus','wizardStepHelp','workspaceSchedules','ceremonyPreview'];
+  auditCheck(checks,'ui.meeting_setup_guidance',wizardControls.every(id=>!!$(id))?'PASS':'FAIL',`${wizardControls.filter(id=>!!$(id)).length}/${wizardControls.length} required guidance and proposal elements present`,'Proposal clearing and saved schedules have distinct guidance','Does not execute destructive or persisted operations.');
+  const scheduleRecords=(activeScheduleWorkspace()?.meetingSchedules||[]);
+  auditCheck(checks,'live.schedule_record_integrity',scheduleRecords.every(sc=>Array.isArray(sc.meetings))?'PASS':'WARNING',`${scheduleRecords.length} saved workspace schedules; ${scheduleRecords.filter(sc=>!Array.isArray(sc.meetings)).length} invalid meeting arrays`,'Saved schedules retain a meeting list','Read-only; no Outlook changes.');
+  const baselineHelp=$('commitmentHelp');auditCheck(checks,'ui.baseline_explanation',baselineHelp?.textContent.includes('baseline')?'PASS':'WARNING',baselineHelp?'Commitment history explanation present':'No baseline explanation found','Explain why commitment snapshots differ from current sprint summary');
+
+  const s=currentSprint();
+  if(!s){auditCheck(checks,'live.sprint_selection','NOT_TESTED','No selected sprint','A selected sprint');}
+  else{
+   const ids=[...new Set((s.itemIds||[]).map(Number))].filter(Number.isFinite);
+   const local=new Map([...items,...assignedItems].map(w=>[Number(w.id),w]));
+   const missing=ids.filter(id=>!local.has(id));
+   auditCheck(checks,'live.assignment_coverage',missing.length?'WARNING':'PASS',`${ids.length} assigned, ${missing.length} not locally loaded`,'Every assigned item loaded','Read-only; no automatic refresh or changes');
+   const loaded=ids.map(id=>local.get(id)).filter(Boolean);
+   const uniqueProjects=new Set(loaded.map(w=>w.project));
+   auditCheck(checks,'live.project_coverage',loaded.length?'PASS':'NOT_TESTED',`${uniqueProjects.size} source projects, ${loaded.length} loaded items`,'Work items retain source project metadata');
+   const bad=loaded.filter(w=>!w.id||!w.project||!w.type||!w.state);
+   auditCheck(checks,'live.item_integrity',bad.length?'WARNING':'PASS',`${bad.length} incomplete records among ${loaded.length}`,'ID, project, type and state on every item');
+   const snapshots=s.snapshots||[];
+   const invalid=snapshots.filter(x=>!x.at||!Array.isArray(x.items));
+   auditCheck(checks,'live.snapshot_structure',invalid.length?'WARNING':'PASS',`${snapshots.length} snapshots, ${invalid.length} malformed`,'Timestamp and item array in every observation');
+   const uniqueDays=new Set(snapshots.map(x=>String(x.at||'').slice(0,10)).filter(Boolean));
+   auditCheck(checks,'live.burndown_history',uniqueDays.size>=2?'PASS':'NOT_TESTED',`${uniqueDays.size} distinct observation days`,'At least two dated observations','Cannot manufacture historical observations');
+   const activeIds=new Set(ids);
+   auditCheck(checks,'live.assignment_duplicates',ids.length===(s.itemIds||[]).length?'PASS':'WARNING',`${(s.itemIds||[]).length-ids.length} duplicate sprint assignments`,'No duplicate IDs');
+   // State metadata is retrieved through GET only, using source project and work-item type.
+   if(token&&loaded.length){
+    const samples=[...new Map(loaded.map(w=>[workflowKey(w),w])).values()].slice(0,12);
+    for(const w of samples){
+     const key=workflowKey(w);
+     try{
+      const metadata=await api(`/${encodeURIComponent(w.project)}/_apis/wit/workitemtypes/${encodeURIComponent(w.type)}/states?api-version=7.1`);
+      const states=metadata.value||[];
+      const present=states.some(x=>x.name===w.state);
+      const unmapped=states.filter(x=>!['proposed','inprogress','resolved','completed','removed'].includes(String(x.category||'').toLowerCase())&&!WORKFLOW_MAP[String(x.name||'').toLowerCase()]);
+      auditCheck(checks,'live.workflow.'+checks.length,present?'PASS':'WARNING',`${w.project} / ${w.type}: ${states.length} states; current state ${present?'recognized':'not recognized'}; ${unmapped.length} unmapped`,'Source state appears in its work-item-type metadata');
+      if(unmapped.length)auditCheck(checks,'live.workflow_unmapped.'+checks.length,'WARNING',`${unmapped.length} unmapped states for ${w.type}`,'Every state can be classified safely','Names intentionally excluded from diagnostic export');
+     }catch(e){auditCheck(checks,'live.workflow.'+checks.length,'WARNING',`Metadata GET failed (${String(e.message||e).slice(0,110)})`,'Readable workflow state metadata');}
+    }
+    auditCheck(checks,'live.process_ancestry','NOT_TESTED','Work-item-type state metadata is not proof of Agile/Scrum ancestry','Agile/Scrum or inherited process verified','Requires authoritative project/process ancestry mapping');
+    // Read-only parent-link verification for loaded tickets. No mutation or hierarchy inference.
+    try{
+     const relationshipIds=loaded.map(w=>Number(w.id)).filter(Number.isFinite);
+     const relationshipRecords=[];
+     for(let offset=0;offset<relationshipIds.length;offset+=100){
+      const batch=relationshipIds.slice(offset,offset+100);
+      const response=await api(`/_apis/wit/workitems?ids=${batch.join(',')}&$expand=relations&api-version=7.1`);
+      relationshipRecords.push(...(response.value||[]));
+     }
+     const byId=new Map(relationshipRecords.map(w=>[Number(w.id),w]));
+     const absent=relationshipIds.filter(id=>!byId.has(id));
+     const parents=relationshipRecords.filter(w=>(w.relations||[]).some(r=>r.rel==='System.LinkTypes.Hierarchy-Reverse'));
+     const invalid=relationshipRecords.filter(w=>(w.relations||[]).filter(r=>r.rel==='System.LinkTypes.Hierarchy-Reverse').length>1);
+     auditCheck(checks,'live.parent_relationships',absent.length||invalid.length?'WARNING':'PASS',`${relationshipRecords.length} source records; ${parents.length} parent-linked; ${absent.length} missing; ${invalid.length} multiple-parent anomalies`,'Source parent links readable; no work item has multiple parents','Read-only snapshot. Does not prove links remain unchanged after future edits.');
+    }catch(e){auditCheck(checks,'live.parent_relationships','WARNING',`Relationship GET failed: ${String(e.message||e).slice(0,120)}`,'Source parent links readable');}
+   }else auditCheck(checks,'live.workflow_metadata','NOT_TESTED','No authenticated loaded work items','At least one source work item');
+   try{
+    const selected=loaded.slice(0,100),fresh=[];
+    for(let offset=0;offset<selected.length;offset+=100){const batch=selected.slice(offset,offset+100);if(!batch.length)continue;const response=await api(`/_apis/wit/workitems?ids=${batch.map(w=>w.id).join(',')}&fields=System.Id,System.State,System.Rev&api-version=7.1`);fresh.push(...(response.value||[]));}
+    const freshById=new Map(fresh.map(w=>[Number(w.id),w]));
+    const mismatches=selected.filter(w=>freshById.has(Number(w.id))&&freshById.get(Number(w.id)).fields?.['System.State']!==w.state);
+    const absent=selected.filter(w=>!freshById.has(Number(w.id)));
+    auditCheck(checks,'live.source_freshness',absent.length?'WARNING':mismatches.length?'WARNING':'PASS',`${selected.length} compared; ${mismatches.length} state differences; ${absent.length} unavailable`,'Local state matches a fresh read-only ADO GET','Differences indicate refresh is needed; no production tickets modified.');
+   }catch(e){auditCheck(checks,'live.source_freshness','WARNING',String(e.message||e).slice(0,120),'Fresh source work-item read');}
+   auditCheck(checks,'live.inbound_roundtrip','NOT_TESTED','No external source mutation performed','External change reflected after refresh','Read-only freshness comparison does not prove a full mutation-and-refresh roundtrip');
+  }
+  // Pure synthetic tests: do not switch Demo Mode or save to browser/organization storage.
+  const sample=demoSeed('risk');const active=sample.work.filter(w=>w.inSprint&&w.type!=='Feature');
+  const before=active.filter(w=>w.state==='Closed').length;
+  const candidate=active.find(w=>w.state==='New'||w.state==='Active');
+  if(candidate){candidate.state='Closed';const after=active.filter(w=>w.state==='Closed').length;
+   auditCheck(checks,'synthetic.state_recalculation',after===before+1?'PASS':'FAIL',`${before} -> ${after} closed`,'Exactly one additional Closed item');
+  }else auditCheck(checks,'synthetic.state_recalculation','FAIL','No open candidate','At least one open sample');
+  const block=sample.work.find(w=>w.inSprint&&!['Closed','Done'].includes(w.state));
+  if(block){block.blocked=false;const beforeBlocked=sample.work.filter(w=>w.inSprint&&w.blocked).length;block.blocked=true;const afterBlocked=sample.work.filter(w=>w.inSprint&&w.blocked).length;
+   auditCheck(checks,'synthetic.blocker_recalculation',afterBlocked===beforeBlocked+1?'PASS':'FAIL',`${beforeBlocked} -> ${afterBlocked} blocked`,'One additional blocker');
+  }
+  const excluded=sample.work.find(w=>w.inSprint);if(excluded){const beforeCount=sample.work.filter(w=>w.inSprint).length;excluded.inSprint=false;const afterCount=sample.work.filter(w=>w.inSprint).length;
+   auditCheck(checks,'synthetic.membership_recalculation',afterCount===beforeCount-1?'PASS':'FAIL',`${beforeCount} -> ${afterCount} included`,'One fewer sprint member');}
+  auditCheck(checks,'synthetic.history',sample.observations.length>=2?'PASS':'FAIL',`${sample.observations.length} dated observations`,'At least two synthetic observations');
+  auditCheck(checks,'outlook.delivery','NOT_TESTED','No Graph write or invitation issued','Actual attendee invitation delivery','Read-only runner cannot validate external email delivery');
+ }catch(e){auditCheck(checks,'audit.unexpected_error','FAIL',String(e.message||e).slice(0,180),'Audit completes without uncaught error');}
+ finally{auditLastRun={schema:'pnpc.audit.v1',version:DIAG_VERSION,startedAt,finishedAt:new Date().toISOString(),mode:'read-only-live-and-isolated-synthetic',checks};auditRunning=false;if(button)button.disabled=false;diagnostic('audit.run.completed',{checkCount:checks.length,failed:checks.filter(x=>x.status==='FAIL').length,warnings:checks.filter(x=>x.status==='WARNING').length});auditRender();}
+}
+function exportAutomatedAudit(){if(!auditLastRun)return notify('Run the automated diagnostic first.',true);
+ const url=URL.createObjectURL(new Blob([JSON.stringify(auditLastRun,null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download=`global-sprints-automated-audit-${DIAG_VERSION}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
 
 // Resolve lane membership from the current sprint; default is never a workflow mutation.
 function laneFor(id){return currentSprint()?.itemLanes?.[id] || 'Default';}
@@ -678,9 +835,27 @@ async function renameLane(){const old=$('lanePicker').value;if(!old||old==='Defa
 async function removeNamedLane(old){if(!currentSprint()?.customLanes?.includes(old))return;if(!confirm(`Remove lane "${old}"? Its cards will move to Default.`))return;const ok=await saveLanes(s=>{s.customLanes=s.customLanes.filter(n=>n!==old);delete s.laneMappings[old];for(const [id,n] of Object.entries(s.itemLanes))if(n===old)s.itemLanes[id]='Default';},`Lane "${old}" removed; its cards moved to Default.`);if(ok)diagnostic('swimlane.removed',{name:old});}
 function removeLane(){const lanes=currentSprint()?.customLanes||[];if(!lanes.length)return notify('No custom lanes to remove.');$('laneDialog').classList.remove('hidden');$('laneEditor').classList.add('hidden');$('laneMappingList').classList.remove('hidden');$('laneDialogTitle').textContent='Remove custom lane';const list=$('laneMappingList');list.replaceChildren();for(const name of lanes){const b=document.createElement('button');b.type='button';b.textContent='Remove '+name;b.className='secondary';b.onclick=async()=>{await removeNamedLane(name);closeLaneDialog();};list.append(b);}const close=document.createElement('button');close.textContent='Cancel';close.onclick=closeLaneDialog;list.append(close);}
 async function moveLaneItem(id,lane){await saveLanes(s=>{s.itemLanes[id]=lane;},`Work item #${id} moved to ${lane}.`);}
-async function getStates(w){const key=`${w.project}::${w.type}`;if(workflowStates.has(key))return workflowStates.get(key);
+// Workflow metadata is scoped by project AND work-item type. Never mutate a global
+// state-name map from an individual project's inherited/custom process.
+function workflowKey(w){return `${w.project}::${w.type}`;}
+function workflowCategory(w,state=w.state){
+ const scoped=workflowCategories.get(workflowKey(w));
+ const name=String(state||'').trim().toLowerCase();
+ return scoped?.get(name)||WORKFLOW_MAP[name]||'Other';
+}
+async function getStates(w){const key=workflowKey(w);if(workflowStates.has(key))return workflowStates.get(key);
  const result=await api(`/${encodeURIComponent(w.project)}/_apis/wit/workitemtypes/${encodeURIComponent(w.type)}/states?api-version=7.1`);
- const entries=result.value||[];const states=entries.map(x=>x.name);for(const entry of entries){const label=String(entry.name||'').trim().toLowerCase();if(!label||WORKFLOW_MAP[label])continue;const category=String(entry.category||'').toLowerCase();const categoryMap={proposed:'To Do',inprogress:'In Progress',resolved:'Done',completed:'Closed'};if(categoryMap[category])WORKFLOW_MAP[label]=categoryMap[category];else diagnostic('ado.workflow.unmapped_state',{workItemType:w.type,category});}diagnostic('ado.workflow.states_loaded',{workItemType:w.type,stateCount:states.length,unmapped:entries.filter(x=>!WORKFLOW_MAP[String(x.name||'').trim().toLowerCase()]).length});workflowStates.set(key,states);return states;}
+ const entries=result.value||[];const states=entries.map(x=>x.name);
+ const mapping=new Map();const categoryMap={proposed:'To Do',inprogress:'In Progress',resolved:'Done',completed:'Closed'};
+ for(const entry of entries){const label=String(entry.name||'').trim().toLowerCase();if(!label)continue;
+  const category=String(entry.category||'').toLowerCase();const normalized=categoryMap[category]||WORKFLOW_MAP[label];
+  if(normalized)mapping.set(label,normalized);
+  else diagnostic('ado.workflow.unmapped_state',{workItemType:w.type,project:w.project,category});
+ }
+ workflowCategories.set(key,mapping);
+ diagnostic('ado.workflow.states_loaded',{workItemType:w.type,project:w.project,stateCount:states.length,unmapped:entries.filter(x=>!mapping.has(String(x.name||'').trim().toLowerCase())).length});
+ workflowStates.set(key,states);return states;
+}
 function assignedSelection(){
   const sprint=registry?.sprints.find(x=>x.id===$('sprintPicker').value);
   const available=new Map([...items,...assignedItems].map(w=>[w.id,w]));
@@ -700,7 +875,7 @@ const WORKFLOW_MAP={
  'closed':'Closed','accepted':'Closed','tested and approved':'Closed'
 };
 function isRemoved(w){return ['removed','cut','cancelled','canceled'].includes((w.state||'').toLowerCase());}
-function workflowColumn(w){return WORKFLOW_MAP[(w.state||'').trim().toLowerCase()]||'Other';}
+function workflowColumn(w){return workflowCategory(w);}
 // Presentation-only exception: an ADO Closed item may be displayed in Done.
 // Never rewrite the underlying terminal ADO state or report it as awaiting validation.
 function boardColumn(w){return workflowColumn(w)==='Closed'&&currentSprint()?.doneDisplayIds?.[w.id]?'Done':workflowColumn(w);}
@@ -717,13 +892,13 @@ async function updateWorkItemState(w,next){
    body:JSON.stringify([{op:'test',path:'/rev',value:w.rev},{op:'add',path:'/fields/System.State',value:next}])
   });
   for(const item of [w,...assignedItems,...items])if(item.id===w.id){item.state=result.fields['System.State'];item.rev=result.rev;}
-  diagnostic('ado.state_update.success',{workItemId:w.id,revisionBefore,revisionAfter:result.rev,toState:result.fields['System.State']});renderBoard();renderSprintHealth();renderTimeline();notify(`Updated #${w.id} to ${result.fields['System.State']} in Azure DevOps.`);
+  diagnostic('ado.state_update.success',{workItemId:w.id,revisionBefore,revisionAfter:result.rev,toState:result.fields['System.State'],revisionAdvanced:Number(result.rev)>Number(revisionBefore)});renderBoard();renderSprintHealth();renderTimeline();notify(`Updated #${w.id} to ${result.fields['System.State']} in Azure DevOps.`);
   return true;
  }catch(e){diagnostic('ado.state_update.failure',{workItemId:w.id,reason:String(e.message||e)},'error');notify(`State update rejected for #${w.id}: ${e.message}`,true);return false;}
 }
 async function destinationState(w,column){
  const available=await getStates(w);
- const candidates=available.filter(state=>WORKFLOW_MAP[state.trim().toLowerCase()]===column);
+ const candidates=available.filter(state=>workflowCategory(w,state)===column);
  if(!candidates.length)throw Error(`No ${column} state is defined for ${w.type} in ${w.project}. The original Azure DevOps workflow is unchanged.`);
  if(candidates.includes(w.state))return w.state;
  const preferred={'To Do':['New','To Do','Approved','Proposed'],'In Progress':['Active','In Progress','Committed','Doing'],'Done':['Done','Resolved','Development Complete'],'Closed':['Closed','Accepted','Tested and Approved']};
@@ -923,6 +1098,9 @@ $('configureLane').onclick=()=>{if(!currentSprint())return notify('Select a spri
 $('downloadDiagnostics').onclick=downloadDiagnostics;
 $('diagnosticStart').onclick=startDiagnosticSession;
 $('diagnosticClear').onclick=clearDiagnostics;
+initializeMeetingTimePickers();
+$('auditRunButton').onclick=runAutomatedAudit;
+$('auditExportButton').onclick=exportAutomatedAudit;
 try{const parsed=JSON.parse(localStorage.getItem(DIAG_KEY)||'[]');diagnosticEvents=Array.isArray(parsed)?parsed.slice(-DIAG_LIMIT):[];}catch(_){diagnosticEvents=[];}startDiagnosticSession();
 window.addEventListener('error',e=>{if(/ResizeObserver loop (limit exceeded|completed with undelivered notifications)/i.test(String(e.message||'')))return;diagnostic('runtime.error',{message:String(e.message).slice(0,250)},'error');});
 window.addEventListener('unhandledrejection',e=>diagnostic('runtime.rejection',{message:String(e.reason?.message||e.reason).slice(0,250)},'error'));
@@ -972,7 +1150,7 @@ document.querySelectorAll('.gs-tab').forEach(b=>b.addEventListener('click',()=>a
 try{activateTab(sessionStorage.getItem('pnpc-gs-tab')||'board');}catch{activateTab('board');}
 function ceremonyForm(){return {type:$('ceremonyType').value,title:$('ceremonyTitle').value.trim(),date:$('ceremonyDate').value,time:$('ceremonyTime').value,duration:Number($('ceremonyDuration').value)||30,participants:$('ceremonyParticipants').value.trim(),secondary:$('ceremonySecondary').value,status:$('ceremonyStatus').value,agenda:$('ceremonyAgenda').value.trim(),outcome:$('ceremonyOutcome').value.trim()};}
 function resetCeremony(){selectedCeremonyId=null;selectedWorkspaceMeeting=null;for(const id of CEREMONY_FIELDS){const el=$(id);if(el.tagName==='SELECT')el.selectedIndex=0;else el.value='';}$('ceremonyDuration').value='30';$('ceremonyEditStatus').textContent='New meeting record';$('saveCeremony').textContent='Save ceremony';}
-function editCeremony(id,source=null){const s=currentSprint();const w=activeScheduleWorkspace();const found=source?{record:w?.meetingSchedules?.find(x=>x.id===source)?.meetings?.find(x=>x.id===id),scheduleId:source}:((s?.ceremonies||[]).some(x=>x.id===id)?{record:s.ceremonies.find(x=>x.id===id)}:findWorkspaceMeeting(id));const c=found?.record;if(!c)return;selectedCeremonyId=id;selectedWorkspaceMeeting=found.scheduleId||null;const map={ceremonyType:c.type,ceremonyTitle:c.title,ceremonyDate:c.date,ceremonyTime:c.time,ceremonyDuration:c.duration,ceremonyParticipants:c.participants,ceremonySecondary:c.secondary,ceremonyStatus:c.status,ceremonyAgenda:c.agenda,ceremonyOutcome:c.outcome};for(const [key,value] of Object.entries(map))$(key).value=value??'';$('ceremonyEditStatus').textContent=selectedWorkspaceMeeting?'Editing workspace schedule meeting':'Editing saved ceremony';$('saveCeremony').textContent=c.outlook?.state==='booked'?'Update ceremony & Outlook':'Update ceremony';$('ceremonyPanel').scrollIntoView({block:'start',behavior:'smooth'});}
+function editCeremony(id,source=null){const s=currentSprint();const w=activeScheduleWorkspace();const found=source?{record:w?.meetingSchedules?.find(x=>x.id===source)?.meetings?.find(x=>x.id===id),scheduleId:source}:((s?.ceremonies||[]).some(x=>x.id===id)?{record:s.ceremonies.find(x=>x.id===id)}:findWorkspaceMeeting(id));const c=found?.record;if(!c)return;selectedCeremonyId=id;selectedWorkspaceMeeting=found.scheduleId||null;const map={ceremonyType:c.type,ceremonyTitle:c.title,ceremonyDate:c.date,ceremonyTime:c.time,ceremonyDuration:c.duration,ceremonyParticipants:c.participants,ceremonySecondary:c.secondary,ceremonyStatus:c.status,ceremonyAgenda:c.agenda,ceremonyOutcome:c.outcome};for(const [key,value] of Object.entries(map)){if(key==='ceremonyTime')populateMeetingTimePicker($(key),value||'09:30');else $(key).value=value??'';}$('ceremonyEditStatus').textContent=selectedWorkspaceMeeting?'Editing workspace schedule meeting':'Editing saved ceremony';$('saveCeremony').textContent=c.outlook?.state==='booked'?'Update ceremony & Outlook':'Update ceremony';$('ceremonyPanel').scrollIntoView({block:'start',behavior:'smooth'});}
 function findWorkspaceMeeting(id){for(const sc of activeScheduleWorkspace()?.meetingSchedules||[]){const record=(sc.meetings||[]).find(m=>m.id===id);if(record)return {record,scheduleId:sc.id};}return null;}
 async function saveCeremony(){const linked=selectedCeremonyId?outlookCeremonyRecord(selectedCeremonyId,selectedWorkspaceMeeting):null;if(linked?.outlook?.state==='booked')return outlookUpdateCeremony(selectedCeremonyId,selectedWorkspaceMeeting,ceremonyForm());if(linked?.outlook?.state)return notify('This Outlook operation needs review before editing.',true);const sp=currentSprint(),w=activeScheduleWorkspace();if(!sp&&!selectedWorkspaceMeeting)return notify('Select a sprint or existing meeting.',true);const c=ceremonyForm();if(c.secondary===c.type)return notify('Choose a different secondary ceremony purpose.',true);if(c.duration<5||c.duration>480)return notify('Duration must be 5–480 minutes.',true);if(c.status==='Scheduled externally'&&!c.date)return notify('Enter a date for an externally scheduled meeting.',true);const id=selectedCeremonyId||crypto.randomUUID();const scheduleId=selectedWorkspaceMeeting;const now=new Date().toISOString();const ok=await persist(r=>{if(scheduleId){const target=r.workspaces.find(x=>x.id===w.id)?.meetingSchedules?.find(x=>x.id===scheduleId)?.meetings?.find(x=>x.id===id);if(!target)throw Error('Workspace meeting no longer exists.');Object.assign(target,c,{updatedAt:now,manuallyEdited:true});}else{const target=r.sprints.find(x=>x.id===sp.id);target.ceremonies ||= [];const existing=target.ceremonies.find(x=>x.id===id);if(existing)Object.assign(existing,c,{updatedAt:now});else target.ceremonies.push({...c,id,createdAt:now,updatedAt:now});}},false);if(ok){resetCeremony();renderCeremonies();renderWorkspaceSchedules();renderCeremonyInsights();renderPmAssistance();notify('Meeting record saved. No Outlook event was created.');}}
 async function deleteCeremony(id,scheduleId=null){const linked=outlookCeremonyRecord(id,scheduleId);if(linked?.outlook?.state&&linked.outlook.state!=='cancelled')return notify('Cancel the Outlook meeting and confirm cancellation before removing this record. Unresolved Outlook operations must be reviewed first.',true);const sp=currentSprint(),w=activeScheduleWorkspace();if(!confirm(linked?.outlook?.state==='cancelled'?'Remove this cancelled meeting from Global Sprints? Its Outlook event has already been cancelled.':'Remove this meeting record from Global Sprints?'))return;const ok=await persist(r=>{if(scheduleId){const sc=r.workspaces.find(x=>x.id===w.id)?.meetingSchedules?.find(x=>x.id===scheduleId);if(!sc)throw Error('Schedule missing.');const meeting=(sc.meetings||[]).find(x=>x.id===id);if(!meeting)throw Error('Meeting no longer exists.');if(meeting.outlook?.state&&meeting.outlook.state!=='cancelled')throw Error('Outlook event is not cancelled.');sc.meetings=(sc.meetings||[]).filter(x=>x.id!==id);}else{const target=r.sprints.find(x=>x.id===sp?.id);if(!target)throw Error('Sprint missing.');const meeting=(target.ceremonies||[]).find(x=>x.id===id);if(!meeting)throw Error('Meeting no longer exists.');if(meeting.outlook?.state&&meeting.outlook.state!=='cancelled')throw Error('Outlook event is not cancelled.');target.ceremonies=(target.ceremonies||[]).filter(x=>x.id!==id);}},false);if(ok){if(selectedCeremonyId===id)resetCeremony();renderCeremonies();renderWorkspaceSchedules();renderCeremonyInsights();renderPmAssistance();notify('Meeting record removed from Planning.');}}
@@ -1259,7 +1437,7 @@ const planISO=d=>d.toISOString().slice(0,10);
 function planAgenda(type){return ({'Sprint Planning':'Review goals, capacity, candidate work, dependencies and commitments.','Standup':'Progress since last check-in; next steps; blockers requiring action.','Sprint Review':'Review delivered work, outcomes, feedback and remaining commitments.','Retrospective':'What worked, what did not, and improvement actions.','Backlog Refinement':'Review carryovers, clarify candidates, acceptance criteria and priorities.'})[type]||'';}
 function clearCeremonyProposal(){proposedCeremonies=[];proposedSprintId='';proposalWorkspaceId='';proposalRange=null;const el=$('ceremonyPreview');if(el)el.replaceChildren();if($('proposalCalendar'))$('proposalCalendar').replaceChildren();if($('confirmCeremonies'))$('confirmCeremonies').disabled=true;if($('ceremonyPreviewStatus'))$('ceremonyPreviewStatus').textContent='';}
 let wizardStep=1;let proposalWorkspaceId='';let proposalRange=null;
-function showWizardStep(n){wizardStep=Math.max(1,Math.min(4,n));for(let i=1;i<=4;i++)$('wizardStep'+i).classList.toggle('hidden',i!==wizardStep);$('wizardStepLabel').textContent='Step '+wizardStep+' of 4';$('wizardBack').disabled=wizardStep===1;$('wizardNext').classList.toggle('hidden',wizardStep===4);if(wizardStep===4)previewCeremonyPlan();}
+function showWizardStep(n){wizardStep=Math.max(1,Math.min(4,n));for(let i=1;i<=4;i++)$('wizardStep'+i).classList.toggle('hidden',i!==wizardStep);$('wizardStepLabel').textContent='Step '+wizardStep+' of 4';const hint=$('wizardStepHelp');if(hint)hint.textContent=['','Choose the dates to cover. This creates a proposal, not meetings.','Select which ceremony types to propose.','Choose meeting cadence, time and participants.','Review each proposed meeting. Saving creates internal records only; Outlook booking is separate.'][wizardStep];$('wizardBack').disabled=wizardStep===1;$('wizardNext').classList.toggle('hidden',wizardStep===4);if(wizardStep===4)previewCeremonyPlan();}
 function activeScheduleWorkspace(){return registry?.workspaces?.find(w=>w.id===activeWorkspaceId);}
 function scheduleRange(){
  const scope=$('planScope').value;
@@ -1299,7 +1477,7 @@ function previewCeremonyPlan(){
  if(checked('planStandup'))for(let i=0;i<=span;i++){const date=planISO(new Date(start.getTime()+i*86400000)),day=planDate(date).getUTCDay();if(!days.has(day))continue;if($('planCadence').value==='unoccupied'&&existing.some(c=>c.date===date&&c.status!=='Cancelled'))continue;if($('planCadence').value==='unoccupied'&&proposedCeremonies.some(c=>c.date===date))continue;add('Standup',date,duration);}
  proposedCeremonies.sort((a,b)=>a.date.localeCompare(b.date)||a.time.localeCompare(b.time));proposalWorkspaceId=w.id;proposalRange=range;
  const table=document.createElement('table'),header=document.createElement('tr');for(const label of ['Include','Ceremony','Date','Time','Minutes']){const th=document.createElement('th');th.textContent=label;header.append(th);}table.append(header);
- for(const c of proposedCeremonies){const tr=document.createElement('tr');const cell=()=>{const td=document.createElement('td');tr.append(td);return td;};const include=document.createElement('input');include.type='checkbox';include.checked=true;include.onchange=()=>{c.excluded=!include.checked;proposalCalendar();};cell().append(include);cell().textContent=c.type+(c.secondary?' + '+c.secondary:'');for(const [key,type] of [['date','date'],['time','time'],['duration','number']]){const input=document.createElement('input');input.type=type;input.value=c[key];if(type==='number'){input.min='5';input.max='480';}input.onchange=()=>{c[key]=type==='number'?Number(input.value):input.value;proposalCalendar();};cell().append(input);}table.append(tr);}
+ for(const c of proposedCeremonies){const tr=document.createElement('tr');const cell=()=>{const td=document.createElement('td');tr.append(td);return td;};const include=document.createElement('input');include.type='checkbox';include.checked=true;include.onchange=()=>{c.excluded=!include.checked;proposalCalendar();};cell().append(include);cell().textContent=c.type+(c.secondary?' + '+c.secondary:'');for(const [key,type] of [['date','date'],['time','time'],['duration','number']]){const input=document.createElement(type==='time'?'select':'input');if(type==='time')populateMeetingTimePicker(input,c[key]);else{input.type=type;input.value=c[key];}if(type==='number'){input.min='5';input.max='480';}input.onchange=()=>{c[key]=type==='number'?Number(input.value):input.value;proposalCalendar();};cell().append(input);}table.append(tr);}
  $('ceremonyPreview').replaceChildren(table);$('confirmCeremonies').disabled=!proposedCeremonies.length;$('ceremonyPreviewStatus').textContent=proposedCeremonies.length+' new meetings proposed. Calendar availability has not been checked.';proposalCalendar();
 }
 async function confirmCeremonyPlan(){const w=activeScheduleWorkspace();if(!w||w.id!==proposalWorkspaceId||!proposalRange)return notify('Workspace changed. Regenerate the proposal.',true);const selected=proposedCeremonies.filter(c=>!c.excluded);if(!selected.length)return notify('Select at least one meeting.',true);if(selected.some(c=>!c.date||c.date<proposalRange.start||c.date>proposalRange.end||!c.time||!Number.isInteger(c.duration)||c.duration<5||c.duration>480))return notify('Selected meetings need valid dates, times and durations within the chosen period.',true);
@@ -1402,7 +1580,19 @@ function prepareStandup(){const node=$('standupSummary');if(node){node.textConte
 $('prepareStandup')?.addEventListener('click',prepareStandup);
 $('copyStandup')?.addEventListener('click',()=>{const summary=standupText();if(navigator.clipboard?.writeText)navigator.clipboard.writeText(summary).then(()=>notify('Standup summary copied.')).catch(()=>notify('Clipboard unavailable; select and copy the displayed summary.',true));else notify('Clipboard unavailable; select and copy the displayed summary.',true);});
 
-$('wizardBack').onclick=()=>showWizardStep(wizardStep-1);$('wizardReset').onclick=()=>{if(proposedCeremonies.length&&!confirm('Clear the current unsaved proposal and start over?'))return;clearCeremonyProposal();showWizardStep(1);notify('Unsaved proposal cleared.');};
+$('wizardBack').onclick=()=>showWizardStep(wizardStep-1);$('wizardReset').onclick=()=>{
+ const hasProposal=proposedCeremonies.length>0;
+ if(hasProposal&&!confirm('Discard the unsaved meeting proposal? Saved workspace schedules and Outlook meetings will remain unchanged.'))return;
+ clearCeremonyProposal();
+ $('planScope').value='period';$('planStart').value='';$('planEnd').value='';
+ for(const id of ['planPlanning','planStandup','planReview','planRetro','planGroom'])$(id).checked=true;
+ $('planCombine').checked=false;$('planCadence').value='unoccupied';$('planDuration').value='15';
+ populateMeetingTimePicker($('planTime'),'09:30');$('planParticipants').value='';
+ document.querySelectorAll('#planDays input[type=checkbox]').forEach(el=>{el.checked=el.value!=='0'&&el.value!=='6';});
+ syncPlanScope();showWizardStep(1);
+ $('wizardResetStatus').textContent='New proposal form ready. Saved workspace schedules and Outlook meetings were not changed.';
+ notify('Unsaved proposal and form selections cleared. Saved meetings unchanged.');
+};
 $('wizardNext').onclick=()=>{if(wizardStep===1){const r=scheduleRange();if(!r.start||!r.end||r.end<r.start)return notify($('planScope').value==='sprint'?'Select a saved sprint with valid start and end dates, or choose Defined project period.':'Choose a valid schedule period.',true);}showWizardStep(wizardStep+1);};
 $('planScope').onchange=syncPlanScope;
 $('planScope').value='sprint';
@@ -1724,3 +1914,6 @@ m365ShowAccount();
 m365RenderCalendars();
 
 init();
+
+// Install static action help after all module initialization.
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',installActionHelp,{once:true});else installActionHelp();

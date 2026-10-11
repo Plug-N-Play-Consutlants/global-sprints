@@ -69,3 +69,23 @@ Runtime verification: pending.
 - Uncertain initial POST without an event ID still requires manual Outlook reconciliation to prevent duplicate invitations.
 - Linked records remain protected from deletion.
 - Multi-user concurrency and recovery from external Outlook changes require further production testing.
+
+
+## v0.4.1 — Outlook lifecycle hardening
+
+- Retains proposed ceremony changes during an uncertain Outlook PATCH so they can be recovered.
+- The Review Outlook status action compares event title, start/end time and attendee addresses before accepting a pending update. If the event differs, it remains pending for manual investigation.
+- Treats an Outlook DELETE returning HTTP 404 as an already-absent event and records cancellation, without issuing another invitation.
+- Existing event creation, rescheduling, attendee updates, and cancellation are preserved.
+- No Outlook changes are performed automatically on load.
+
+**Runtime verification pending.** Shared-registry multi-user conflict handling and initial booking without an event ID remain production hardening tasks.
+
+
+## v0.4.2 — Ceremony removal and shared-write safeguards
+
+- Cancelled Outlook meetings can now be removed from the Planning ceremony list. Active or unresolved Outlook-linked meetings remain protected from orphaning.
+- Registry mutations check the current server ETag before applying changes, and retain the service ETag during writes so concurrent edits fail rather than silently overwriting. A conflict requires refreshing before retrying; automatic merge is intentionally not attempted.
+- Retains all v0.4.1 Outlook creation, update, cancellation and reconciliation behavior.
+
+Runtime verification is required in Azure DevOps, including multi-user conflict testing.

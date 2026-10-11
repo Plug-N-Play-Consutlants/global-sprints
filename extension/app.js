@@ -275,6 +275,8 @@ async function init(){try{
   sdk.init({loaded:false,applyTheme:true});await sdk.ready();context=sdk.getHost();m365Identity();
   // ADO hub readiness must not depend on organization queries or board restoration.
   sdk.notifyLoadSucceeded();notify('Connecting to organization data…');
+  // Session recovery is independent of Azure DevOps data initialization.
+  void m365RestoreSession();
   token=await sdk.getAccessToken();if(!token)throw Error('Azure DevOps did not provide an access token.');
   const service=await sdk.getService('ms.vss-features.extension-data-service');storage=await service.getExtensionDataManager(sdk.getExtensionContext().id,token);
   try{registry=await storage.getDocument(COLLECTION,ROOT);}catch(e){if(e.status!==404 && !/404|not found/i.test(String(e.message)))throw e;registry={id:ROOT,sprints:[]};}
@@ -1147,51 +1149,23 @@ $('demoReset').addEventListener('click',()=>{if(!confirm('Reset demo scenario to
 $('demoAddDecision').addEventListener('click',()=>{const v=$('demoDecision').value.trim();if(!v)return;demoState.decisions.push(v);$('demoDecision').value='';saveDemo();renderDemo();});
 
 
-// Microsoft 365 readiness only. No Graph authentication or token handling occurs here.
-const M365_CONFIG_KEY='pnpc-gs-m365-config-v1';
+// Microsoft 365 identity is independent of the Azure DevOps identity.
 function m365Identity(){
  try{const u=sdk?.getUser?.();const c=sdk?.getWebContext?.();const name=u?.displayName||u?.name||c?.user?.name||'Not available';
  $('m365AdoIdentity').textContent='Azure DevOps user: '+name+' (not necessarily the Microsoft 365 calendar owner).';}
  catch(e){$('m365AdoIdentity').textContent='Azure DevOps identity unavailable: '+String(e.message||e);}
 }
-function m365CheckNaa(interactive=false){
- const out=$('m365NaaStatus');
- try{
-  const available=typeof sdkModule.enableNestedAppAuth==='function';
-  out.textContent=available?'Azure DevOps SDK includes enableNestedAppAuth(). Host support and Microsoft 365 sign-in remain unverified until the PNPC Entra application is registered.':'This bundled Azure DevOps SDK does not expose enableNestedAppAuth(). A supported authentication fallback must be evaluated.';
-  out.dataset.available=available?'sdk-api-present':'sdk-api-missing';
- if(interactive){const stamp=new Date().toLocaleTimeString();out.textContent += ' Capability check completed at '+stamp+'. SDK API '+(available?'detected':'not detected')+'; host sign-in has not been attempted.';notify('NAA capability check completed. See the updated status in Configuration.');}
- }catch(e){out.textContent='NAA capability check failed: '+String(e.message||e);}
- $('m365Status').textContent='Microsoft 365: Not connected. No Graph authorization has been requested.';
-}
-$('m365CheckNaa')?.addEventListener('click',()=>m365CheckNaa(true));
 const M365_CLIENT_ID='9b4b5cd6-4fb7-4e27-8424-e00abfc7a08e';
-const M365_HOME_TENANT='9fb3f913-9ac8-4d6a-b876-bb9343698b5c';
-$('m365EnableNaa')?.addEventListener('click',async()=>{
- const btn=$('m365EnableNaa'),status=$('m365NaaStatus');
- btn.disabled=true;btn.textContent='Initializing NAA…';
- try{
-  if(!sdk||typeof sdk.enableNestedAppAuth!=='function')throw Error('NAA API is unavailable in the initialized Azure DevOps SDK.');
-  const result=await sdk.enableNestedAppAuth();
-  const label=result===undefined?'SDK bridge request completed (no host acknowledgment provided)':result===true?'SDK bridge enabled':result===false?'SDK bridge returned false':'SDK bridge response received';
-  status.textContent=label+'. This does not establish Microsoft 365 sign-in or prove Graph access. Application '+M365_CLIENT_ID+'.';
-  notify('NAA bridge initialization returned. See Configuration for the result.');
- }catch(e){status.textContent='NAA bridge initialization failed: '+String(e.message||e);notify('NAA initialization failed: '+String(e.message||e),true);}
- finally{btn.disabled=false;btn.textContent='Initialize NAA host bridge';}
-});
-
-$('m365Clear')?.addEventListener('click',()=>{try{localStorage.removeItem(M365_CONFIG_KEY);notify('Legacy Microsoft 365 identifiers cleared from this browser.');}catch(e){notify('Unable to clear legacy configuration: '+String(e.message||e),true);}});
-m365CheckNaa();
 // Identity display is refreshed after SDK initialization in init().
 
 
-// MSAL v4.25.1, official Microsoft browser distribution, loaded as local UMD script.
-// Identity is distinct from Azure DevOps. No Graph calls or calendar mutations in this release.
+// MSAL v4.25.1, official Microsoft browser distribution, loaded on demand as a local UMD script.
+// Identity is distinct from Azure DevOps. Calendar discovery is read-only; no events are created.
 const M365_SCOPES=['User.Read','Calendars.ReadWrite'];
 let m365Client=null,m365Account=null,m365AuthKind='';
 function m365ShowAccount(){
  const el=$('m365Status');
- el.textContent=m365Account?`Microsoft 365: Connected as ${m365Account.username||m365Account.name||'account'} (${m365AuthKind}). No calendar has been selected and no events have been created.`:'Microsoft 365: Not connected. No Graph authorization has been requested.';
+ el.textContent=m365Account?`Microsoft 365: Connected as ${m365Account.username||m365Account.name||'account'} (${m365AuthKind}). No Outlook events have been created.`:'Microsoft 365: Not connected. No Graph authorization has been requested.';
  $('m365Disconnect').disabled=!m365Account;
 }
 async function m365GetClient(){
@@ -1228,16 +1202,40 @@ async function m365GetClient(){
  m365Client=instance;
  return instance;
 }
+// Restore an existing MSAL account without opening a login prompt. This runs only
+// after Azure DevOps has acknowledged hub readiness, and never blocks startup.
+async function m365RestoreSession(){
+ if(m365Account)return;
+ try{
+  const client=await m365GetClient();
+  const accounts=await Promise.resolve(client.getAllAccounts?.()||[]);
+  if(!accounts.length){m365ShowAccount();return;}
+  const active=client.getActiveAccount?.();
+  const account=active&&accounts.some(a=>a.homeAccountId===active.homeAccountId)?active:accounts[0];
+  // Validate the cached session silently. Never display a connected status on
+  // the strength of a stale account record alone.
+  await client.acquireTokenSilent({account,scopes:['User.Read']});
+  m365Account=account;
+  client.setActiveAccount?.(account);
+  m365ShowAccount();m365RenderCalendars();
+  diagnostic('m365.session.restored',{account:account.username||'account'});
+ }catch(e){
+  // Silent renewal can require interaction, or the browser may have cleared its
+  // session cache. Neither condition should break the ADO hub.
+  m365Account=null;
+  m365ShowAccount();m365RenderCalendars('Microsoft 365 session could not be restored silently. Select Connect Microsoft 365 to sign in again.');
+  diagnostic('m365.session.restore_unavailable',{message:String(e.message||e)},'warn');
+ }
+}
 async function m365Connect(){
  const btn=$('m365Connect');btn.disabled=true;btn.textContent='Connecting…';
  try{
   const client=await m365GetClient();
-  const accounts=client.getAllAccounts();
   // Always let the user choose an account on an explicit Connect action.
   const response=await client.loginPopup({scopes:M365_SCOPES,prompt:'select_account'});
   if(!response?.account)throw Error('Microsoft sign-in did not return an account.');
   m365Account=response.account;client.setActiveAccount?.(m365Account);
-  m365ShowAccount();notify('Microsoft 365 connected as '+(m365Account.username||m365Account.name)+'.');
+  m365ShowAccount();m365RenderCalendars();notify('Microsoft 365 connected as '+(m365Account.username||m365Account.name)+'.');
  }catch(e){
   const message=String(e.message||e);diagnostic('m365.signin.failed',{message},'warn');
   $('m365Status').textContent='Microsoft 365 connection unsuccessful: '+message;
@@ -1250,12 +1248,82 @@ async function m365Disconnect(){
  try{
   // Clear the application account and its cached tokens; avoid signing the user out of Microsoft 365 globally.
   await m365Client.clearCache({account:m365Account});
-  m365Account=null;m365ShowAccount();notify('Global Sprints Microsoft 365 connection cleared.');
+  m365Account=null;m365Calendars=[];m365ShowAccount();m365RenderCalendars();notify('Global Sprints Microsoft 365 connection cleared.');
  }catch(e){$('m365Status').textContent='Disconnect failed: '+String(e.message||e);notify('Disconnect failed. See Configuration.',true);}
  finally{btn.disabled=!m365Account;}
 }
+// Calendar selection belongs to the connected user, not the organization-wide sprint registry.
+// Never store access tokens or write Outlook events during calendar discovery.
+let m365Calendars=[];
+const M365_CALENDAR_PREF='pnpc-gs-calendar-selection-v1';
+function m365CalendarPreferenceKey(){
+ if(!m365Account)return '';
+ const org=String(context?.account?.name||context?.collection?.name||location.hostname||'ado');
+ const account=String(m365Account.homeAccountId||m365Account.username||'').toLowerCase();
+ return M365_CALENDAR_PREF+':'+org+':'+account;
+}
+function m365ReadCalendarPreference(){
+ try{return localStorage.getItem(m365CalendarPreferenceKey())||'';}catch{return '';}
+}
+function m365RenderCalendars(message=''){
+ const picker=$('m365CalendarPicker'),refresh=$('m365RefreshCalendars'),save=$('m365SaveCalendar'),status=$('m365CalendarStatus');
+ if(!picker||!refresh||!save||!status)return;
+ picker.replaceChildren(new Option('Select an Outlook calendar',''));
+ for(const cal of m365Calendars)picker.add(new Option(cal.name+(cal.isDefaultCalendar?' (default)':'')+(cal.canEdit===false?' (read-only)':''),cal.id));
+ const pref=m365ReadCalendarPreference();
+ picker.value=m365Calendars.some(c=>c.id===pref)?pref:'';
+ const connected=!!m365Account;
+ picker.disabled=!connected||!m365Calendars.length;
+ refresh.disabled=!connected;
+ save.disabled=!connected||!m365Calendars.length;
+ status.textContent=message||(connected?(m365Calendars.length?`${m365Calendars.length} calendar(s) available. ${picker.value?'A calendar is selected.':'Choose a calendar and save your preference.'} No events have been created.`:'Select Refresh calendars to discover calendars for this account.'):'Connect Microsoft 365 to discover Outlook calendars.');
+}
+async function m365GraphToken(){
+ if(!m365Client||!m365Account)throw Error('Connect Microsoft 365 first.');
+ const request={account:m365Account,scopes:['Calendars.ReadWrite']};
+ try{return (await m365Client.acquireTokenSilent(request)).accessToken;}
+ catch(e){
+  // A Graph consent or interaction-required response must be handled by MSAL, not hidden.
+  if(!/interaction_required|consent_required|login_required|no_tokens_found|token_refresh_required/i.test(String(e.errorCode||'')+' '+String(e.message||e)))throw e;
+  return (await m365Client.acquireTokenPopup(request)).accessToken;
+ }
+}
+async function m365RefreshCalendars(){
+ const btn=$('m365RefreshCalendars');btn.disabled=true;btn.textContent='Loading calendars…';
+ $('m365CalendarStatus').textContent='Requesting your calendars from Microsoft Graph…';
+ try{
+  const token=await m365GraphToken();
+  let url='https://graph.microsoft.com/v1.0/me/calendars?$select=id,name,isDefaultCalendar,canEdit&$top=100';
+  const calendars=[];
+  for(let page=0;url&&page<10;page++){
+   const response=await fetch(url,{headers:{Authorization:'Bearer '+token,Accept:'application/json'}});
+   if(!response.ok){let details='';try{const body=await response.json();details=body?.error?.message||'';}catch{}throw Error(`Microsoft Graph returned HTTP ${response.status}${details?': '+details:''}`);}
+   const body=await response.json();
+   if(!Array.isArray(body.value))throw Error('Microsoft Graph returned an unexpected calendar response.');
+   calendars.push(...body.value.filter(c=>typeof c.id==='string'&&typeof c.name==='string'));
+   const next=body['@odata.nextLink'];
+   if(next&&!next.startsWith('https://graph.microsoft.com/'))throw Error('Unexpected Microsoft Graph pagination URL.');
+   url=next||'';
+  }
+  m365Calendars=calendars;
+  m365RenderCalendars(`${calendars.length} Outlook calendar(s) retrieved. ${m365ReadCalendarPreference()?'Saved preference restored when available.':'Choose a calendar and save your preference.'} No events have been created.`);
+  notify(`${calendars.length} Outlook calendar(s) retrieved.`);
+ }catch(e){m365RenderCalendars('Calendar discovery failed: '+String(e.message||e));diagnostic('m365.calendars.failed',{message:String(e.message||e)},'warn');notify('Unable to retrieve Outlook calendars. See Configuration.',true);}
+ finally{btn.disabled=!m365Account;btn.textContent='Refresh calendars';}
+}
+function m365SaveCalendar(){
+ const id=$('m365CalendarPicker').value;
+ if(!m365Account||!m365Calendars.some(c=>c.id===id)){notify('Choose a calendar from the retrieved list.',true);return;}
+ try{localStorage.setItem(m365CalendarPreferenceKey(),id);m365RenderCalendars('Default calendar preference saved for this Microsoft 365 account in this browser. No Outlook events have been created.');notify('Outlook calendar preference saved.');}
+ catch(e){notify('Unable to save calendar preference: '+String(e.message||e),true);}
+}
+$('m365RefreshCalendars')?.addEventListener('click',()=>void m365RefreshCalendars());
+$('m365SaveCalendar')?.addEventListener('click',m365SaveCalendar);
+$('m365CalendarPicker')?.addEventListener('change',()=>{$('m365CalendarStatus').textContent='Selection changed. Save calendar to retain this preference.';});
+
 $('m365Connect').addEventListener('click',()=>void m365Connect());
 $('m365Disconnect').addEventListener('click',()=>void m365Disconnect());
 m365ShowAccount();
+m365RenderCalendars();
 
 init();

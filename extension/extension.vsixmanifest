@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011" xmlns:d="http://schemas.microsoft.com/developer/vsx-schema-design/2011">
   <Metadata>
-    <Identity Language="en-US" Id="global-sprints" Version="0.3.51" Publisher="PlugNPlayConsultants"/>
+    <Identity Language="en-US" Id="global-sprints" Version="0.4.0" Publisher="PlugNPlayConsultants"/>
     <DisplayName>PNPC Global Sprints</DisplayName>
     <Description xml:space="preserve">Cross-project sprint planning and execution for Azure DevOps.</Description>
     <Categories>Azure Boards</Categories>

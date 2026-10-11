@@ -30,3 +30,7 @@ print('Calendar discovery invariants PASS')
 
 assert "async function m365RestoreSession()" in app and "client.getAllAccounts" in app and "client.acquireTokenSilent({account,scopes:['User.Read']})" in app, "Silent account recovery missing"
 print("Microsoft 365 session recovery checks PASS")
+
+assert 'void m365RefreshCalendars({silent:true})' in app, 'Calendar refresh after session recovery missing'
+assert 'if(m365Account!==accountAtStart)return' in app, 'Stale calendar response guard missing'
+print('Calendar session restoration checks PASS')

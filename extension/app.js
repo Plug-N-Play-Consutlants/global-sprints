@@ -893,11 +893,177 @@ document.querySelectorAll('.gs-tab').forEach(b=>b.addEventListener('click',()=>a
 try{activateTab(sessionStorage.getItem('pnpc-gs-tab')||'board');}catch{activateTab('board');}
 function ceremonyForm(){return {type:$('ceremonyType').value,title:$('ceremonyTitle').value.trim(),date:$('ceremonyDate').value,time:$('ceremonyTime').value,duration:Number($('ceremonyDuration').value)||30,participants:$('ceremonyParticipants').value.trim(),secondary:$('ceremonySecondary').value,status:$('ceremonyStatus').value,agenda:$('ceremonyAgenda').value.trim(),outcome:$('ceremonyOutcome').value.trim()};}
 function resetCeremony(){selectedCeremonyId=null;selectedWorkspaceMeeting=null;for(const id of CEREMONY_FIELDS){const el=$(id);if(el.tagName==='SELECT')el.selectedIndex=0;else el.value='';}$('ceremonyDuration').value='30';$('ceremonyEditStatus').textContent='New meeting record';$('saveCeremony').textContent='Save ceremony';}
-function editCeremony(id,source=null){const s=currentSprint();const w=activeScheduleWorkspace();const found=source?{record:w?.meetingSchedules?.find(x=>x.id===source)?.meetings?.find(x=>x.id===id),scheduleId:source}:((s?.ceremonies||[]).some(x=>x.id===id)?{record:s.ceremonies.find(x=>x.id===id)}:findWorkspaceMeeting(id));const c=found?.record;if(!c)return;selectedCeremonyId=id;selectedWorkspaceMeeting=found.scheduleId||null;const map={ceremonyType:c.type,ceremonyTitle:c.title,ceremonyDate:c.date,ceremonyTime:c.time,ceremonyDuration:c.duration,ceremonyParticipants:c.participants,ceremonySecondary:c.secondary,ceremonyStatus:c.status,ceremonyAgenda:c.agenda,ceremonyOutcome:c.outcome};for(const [key,value] of Object.entries(map))$(key).value=value??'';$('ceremonyEditStatus').textContent=selectedWorkspaceMeeting?'Editing workspace schedule meeting':'Editing saved ceremony';$('saveCeremony').textContent='Update ceremony';$('ceremonyPanel').scrollIntoView({block:'start',behavior:'smooth'});}
+function editCeremony(id,source=null){const s=currentSprint();const w=activeScheduleWorkspace();const found=source?{record:w?.meetingSchedules?.find(x=>x.id===source)?.meetings?.find(x=>x.id===id),scheduleId:source}:((s?.ceremonies||[]).some(x=>x.id===id)?{record:s.ceremonies.find(x=>x.id===id)}:findWorkspaceMeeting(id));const c=found?.record;if(!c)return;selectedCeremonyId=id;selectedWorkspaceMeeting=found.scheduleId||null;const map={ceremonyType:c.type,ceremonyTitle:c.title,ceremonyDate:c.date,ceremonyTime:c.time,ceremonyDuration:c.duration,ceremonyParticipants:c.participants,ceremonySecondary:c.secondary,ceremonyStatus:c.status,ceremonyAgenda:c.agenda,ceremonyOutcome:c.outcome};for(const [key,value] of Object.entries(map))$(key).value=value??'';$('ceremonyEditStatus').textContent=selectedWorkspaceMeeting?'Editing workspace schedule meeting':'Editing saved ceremony';$('saveCeremony').textContent=c.outlook?.state==='booked'?'Update ceremony & Outlook':'Update ceremony';$('ceremonyPanel').scrollIntoView({block:'start',behavior:'smooth'});}
 function findWorkspaceMeeting(id){for(const sc of activeScheduleWorkspace()?.meetingSchedules||[]){const record=(sc.meetings||[]).find(m=>m.id===id);if(record)return {record,scheduleId:sc.id};}return null;}
-async function saveCeremony(){const sp=currentSprint(),w=activeScheduleWorkspace();if(!sp&&!selectedWorkspaceMeeting)return notify('Select a sprint or existing meeting.',true);const c=ceremonyForm();if(c.secondary===c.type)return notify('Choose a different secondary ceremony purpose.',true);if(c.duration<5||c.duration>480)return notify('Duration must be 5–480 minutes.',true);if(c.status==='Scheduled externally'&&!c.date)return notify('Enter a date for an externally scheduled meeting.',true);const id=selectedCeremonyId||crypto.randomUUID();const scheduleId=selectedWorkspaceMeeting;const now=new Date().toISOString();const ok=await persist(r=>{if(scheduleId){const target=r.workspaces.find(x=>x.id===w.id)?.meetingSchedules?.find(x=>x.id===scheduleId)?.meetings?.find(x=>x.id===id);if(!target)throw Error('Workspace meeting no longer exists.');Object.assign(target,c,{updatedAt:now,manuallyEdited:true});}else{const target=r.sprints.find(x=>x.id===sp.id);target.ceremonies ||= [];const existing=target.ceremonies.find(x=>x.id===id);if(existing)Object.assign(existing,c,{updatedAt:now});else target.ceremonies.push({...c,id,createdAt:now,updatedAt:now});}},false);if(ok){resetCeremony();renderCeremonies();renderWorkspaceSchedules();renderCeremonyInsights();renderPmAssistance();notify('Meeting record saved. No Outlook event was created.');}}
-async function deleteCeremony(id,scheduleId=null){const sp=currentSprint(),w=activeScheduleWorkspace();if(!confirm('Remove this meeting record? This does not affect Outlook.'))return;const ok=await persist(r=>{if(scheduleId){const sc=r.workspaces.find(x=>x.id===w.id)?.meetingSchedules?.find(x=>x.id===scheduleId);if(!sc)throw Error('Schedule missing.');sc.meetings=(sc.meetings||[]).filter(x=>x.id!==id);}else{const target=r.sprints.find(x=>x.id===sp?.id);if(!target)throw Error('Sprint missing.');target.ceremonies=(target.ceremonies||[]).filter(x=>x.id!==id);}},false);if(ok){if(selectedCeremonyId===id)resetCeremony();renderCeremonies();renderWorkspaceSchedules();renderCeremonyInsights();renderPmAssistance();notify('Meeting record removed.');}}
-function renderCeremonies(){const list=$('ceremonyList');if(!list)return;list.replaceChildren();const sp=currentSprint(),w=activeScheduleWorkspace();const records=[...(w?.meetingSchedules||[]).flatMap(sc=>(sc.meetings||[]).map(c=>({...c,_scheduleId:sc.id}))),...(sp?.ceremonies||[])].sort((a,b)=>(a.date||'9999').localeCompare(b.date||'9999')||(a.time||'').localeCompare(b.time||''));if(!records.length){list.textContent='No meeting records yet. Use Meeting Schedule Setup or create a meeting above.';return;}for(const c of records){const box=document.createElement('div');box.className='ceremony-record';const h=document.createElement('strong');h.textContent=(c.title||c.type)+(c.secondary?' + '+c.secondary:'');const info=document.createElement('p');info.className='muted';info.textContent=[c.status||'Proposed',c.date,c.time,c.duration?c.duration+' min':'',c.participants,c._scheduleId?'Workspace schedule':'Sprint record'].filter(Boolean).join(' · ');box.append(h,info);for(const [label,key] of [['Agenda','agenda'],['Decisions / follow-up','outcome']])if(c[key]){const p=document.createElement('p');const strong=document.createElement('strong');strong.textContent=label+': ';p.append(strong,document.createTextNode(c[key]));box.append(p);}if(c.secondary){const completion=document.createElement('div');completion.className='row';for(const [purpose,key] of [[c.type,'primary'],[c.secondary,'secondary']]){const label=document.createElement('label');const check=document.createElement('input');check.type='checkbox';check.checked=!!c.ceremonyCompletion?.[key];check.onchange=async()=>{const ok=await persist(r=>{const m=c._scheduleId?r.workspaces.find(x=>x.id===w.id)?.meetingSchedules?.find(x=>x.id===c._scheduleId)?.meetings?.find(x=>x.id===c.id):(r.sprints.find(x=>x.id===sp.id)?.ceremonies||[]).find(x=>x.id===c.id);if(!m)throw Error('Meeting missing.');m.ceremonyCompletion||={primary:false,secondary:false};m.ceremonyCompletion[key]=check.checked;},false);if(!ok)check.checked=!check.checked;else renderCeremonyInsights();};label.append(check,document.createTextNode(' '+purpose+' complete'));completion.append(label);}box.append(completion);}const actions=document.createElement('div');actions.className='row';const edit=document.createElement('button');edit.type='button';edit.textContent='Edit';edit.onclick=()=>editCeremony(c.id,c._scheduleId||null);const remove=document.createElement('button');remove.type='button';remove.className='secondary';remove.textContent='Remove';remove.onclick=()=>void deleteCeremony(c.id,c._scheduleId||null);actions.append(edit,remove);box.append(actions);list.append(box);}}
+async function saveCeremony(){const linked=selectedCeremonyId?outlookCeremonyRecord(selectedCeremonyId,selectedWorkspaceMeeting):null;if(linked?.outlook?.state==='booked')return outlookUpdateCeremony(selectedCeremonyId,selectedWorkspaceMeeting,ceremonyForm());if(linked?.outlook?.state)return notify('This Outlook operation needs review before editing.',true);const sp=currentSprint(),w=activeScheduleWorkspace();if(!sp&&!selectedWorkspaceMeeting)return notify('Select a sprint or existing meeting.',true);const c=ceremonyForm();if(c.secondary===c.type)return notify('Choose a different secondary ceremony purpose.',true);if(c.duration<5||c.duration>480)return notify('Duration must be 5–480 minutes.',true);if(c.status==='Scheduled externally'&&!c.date)return notify('Enter a date for an externally scheduled meeting.',true);const id=selectedCeremonyId||crypto.randomUUID();const scheduleId=selectedWorkspaceMeeting;const now=new Date().toISOString();const ok=await persist(r=>{if(scheduleId){const target=r.workspaces.find(x=>x.id===w.id)?.meetingSchedules?.find(x=>x.id===scheduleId)?.meetings?.find(x=>x.id===id);if(!target)throw Error('Workspace meeting no longer exists.');Object.assign(target,c,{updatedAt:now,manuallyEdited:true});}else{const target=r.sprints.find(x=>x.id===sp.id);target.ceremonies ||= [];const existing=target.ceremonies.find(x=>x.id===id);if(existing)Object.assign(existing,c,{updatedAt:now});else target.ceremonies.push({...c,id,createdAt:now,updatedAt:now});}},false);if(ok){resetCeremony();renderCeremonies();renderWorkspaceSchedules();renderCeremonyInsights();renderPmAssistance();notify('Meeting record saved. No Outlook event was created.');}}
+async function deleteCeremony(id,scheduleId=null){const linked=outlookCeremonyRecord(id,scheduleId);if(linked?.outlook?.state)return notify('This meeting has an Outlook booking or unresolved request. Unlink/cancellation support is planned for the next build; the record cannot be removed yet.',true);const sp=currentSprint(),w=activeScheduleWorkspace();if(!confirm('Remove this meeting record? This does not affect Outlook.'))return;const ok=await persist(r=>{if(scheduleId){const sc=r.workspaces.find(x=>x.id===w.id)?.meetingSchedules?.find(x=>x.id===scheduleId);if(!sc)throw Error('Schedule missing.');sc.meetings=(sc.meetings||[]).filter(x=>x.id!==id);}else{const target=r.sprints.find(x=>x.id===sp?.id);if(!target)throw Error('Sprint missing.');target.ceremonies=(target.ceremonies||[]).filter(x=>x.id!==id);}},false);if(ok){if(selectedCeremonyId===id)resetCeremony();renderCeremonies();renderWorkspaceSchedules();renderCeremonyInsights();renderPmAssistance();notify('Meeting record removed.');}}
+
+// Outlook event creation is intentionally explicit. The internal ceremony is saved first.
+// A pending operation is persisted BEFORE calling Graph, so an uncertain response cannot
+// cause an accidental second invitation. Do not automatically retry an uncertain POST.
+let outlookBookingBusy=false;
+function outlookCeremonyRecord(id,scheduleId=null){
+ const w=activeScheduleWorkspace(),sp=currentSprint();
+ return scheduleId
+  ? w?.meetingSchedules?.find(x=>x.id===scheduleId)?.meetings?.find(x=>x.id===id)
+  : sp?.ceremonies?.find(x=>x.id===id);
+}
+function outlookAttendees(raw){
+ const values=String(raw||'').split(/[,;\n]+/).map(s=>s.trim()).filter(Boolean);
+ const unique=[...new Set(values.map(s=>s.toLowerCase()))];
+ if(unique.some(s=>!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s)))
+  throw Error('Participants must be email addresses separated by commas or semicolons. Remove names without email addresses.');
+ return unique.map(address=>({emailAddress:{address},type:'required'}));
+}
+function outlookLocalTime(date,time,duration){
+ if(!/^\d{4}-\d{2}-\d{2}$/.test(date||'')||!/^\d{2}:\d{2}$/.test(time||''))throw Error('Enter a meeting date and time.');
+ const start=new Date(`${date}T${time}:00`);
+ if(!Number.isFinite(start.getTime())||start.getFullYear()!==Number(date.slice(0,4))||start.getMonth()+1!==Number(date.slice(5,7))||start.getDate()!==Number(date.slice(8,10)))throw Error('Invalid meeting date or time.');
+ const mins=Number(duration);
+ if(!Number.isFinite(mins)||mins<5||mins>480)throw Error('Meeting duration must be 5–480 minutes.');
+ const end=new Date(start.getTime()+mins*60000);
+ // Graph accepts ISO UTC; the user's browser timezone determines the local meeting time.
+ return {start:{dateTime:start.toISOString().replace(/\.\d{3}Z$/,'Z'),timeZone:'UTC'},end:{dateTime:end.toISOString().replace(/\.\d{3}Z$/,'Z'),timeZone:'UTC'}};
+}
+function outlookEventPayload(c){
+ const times=outlookLocalTime(c.date,c.time,c.duration||30);
+ return {subject:(c.title||c.type||'Global Sprints meeting').slice(0,120),
+  body:{contentType:'Text',content:[c.agenda||'',c.secondary?'Combined ceremony: '+c.secondary:'','Scheduled from PNPC Global Sprints'].filter(Boolean).join('\n\n')},
+  ...times,attendees:outlookAttendees(c.participants)};
+}
+function outlookTarget(r,id,scheduleId,workspaceId,sprintId){
+ return scheduleId?r.workspaces.find(x=>x.id===workspaceId)?.meetingSchedules?.find(x=>x.id===scheduleId)?.meetings?.find(x=>x.id===id):r.sprints.find(x=>x.id===sprintId)?.ceremonies?.find(x=>x.id===id);
+}
+async function outlookGraph(method,path,body){
+ const token=await m365GraphToken();
+ const response=await fetch('https://graph.microsoft.com/v1.0'+path,{method,headers:{Authorization:'Bearer '+token,Accept:'application/json',...(body?{'Content-Type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{})});
+ if(!response.ok)throw Error('Microsoft Graph '+response.status+': '+(await response.text()).slice(0,350));
+ return response.status===204?null:response.json();
+}
+async function outlookReconcile(id,scheduleId=null){
+ const c=outlookCeremonyRecord(id,scheduleId),o=c?.outlook;
+ if(!o||!['pending','sync-pending','cancel-pending'].includes(o.state))return notify('This meeting has no pending Outlook operation.',true);
+ if(!m365Account||!o.calendarId)return notify('Connect the Outlook account associated with this meeting.',true);
+ if(o.accountId!==(m365Account.homeAccountId||m365Account.username))return notify('Reconnect the Microsoft 365 account used to book this meeting.',true);
+ if(outlookBookingBusy)return notify('Another Outlook operation is in progress.',true);
+ outlookBookingBusy=true;
+ try{
+  let event=null;
+  if(o.eventId){try{event=await outlookGraph('GET','/me/calendars/'+encodeURIComponent(o.calendarId)+'/events/'+encodeURIComponent(o.eventId));}catch(e){if(!String(e).includes('404'))throw e;}}
+  else if(o.operationId){
+   // transactionId is a Graph idempotency key, but not a query filter.
+   // Do not guess by subject/time: multiple events may share those fields.
+   notify('The original booking result is uncertain. Check Outlook for the event; automatic matching without an event ID would risk linking the wrong meeting.',true);return;
+  }
+  if(o.state==='cancel-pending'&&!event){
+   const ok=await persist(r=>{const t=outlookTarget(r,id,scheduleId,activeWorkspaceId,currentSprint()?.id);if(!t||t.outlook?.operationId!==o.operationId)throw Error('Meeting changed.');t.outlook={...o,state:'cancelled',cancelledAt:new Date().toISOString()};t.status='Cancelled';},false);
+   if(ok)notify('Outlook cancellation reconciled.');return;
+  }
+  if(!event)return notify('The Outlook event could not be located. No changes were made.',true);
+  const ok=await persist(r=>{const t=outlookTarget(r,id,scheduleId,activeWorkspaceId,currentSprint()?.id);if(!t||t.outlook?.operationId!==o.operationId)throw Error('Meeting changed.');t.outlook={...o,state:'booked',eventId:event.id,webLink:event.webLink||o.webLink||'',syncedAt:new Date().toISOString()};t.status='Scheduled externally';},false);
+  if(ok)notify('Outlook event confirmed and meeting link restored.');
+ }catch(e){notify('Reconciliation failed: '+String(e.message||e),true);}finally{outlookBookingBusy=false;renderCeremonies();renderWorkspaceSchedules();}
+}
+async function outlookUpdateCeremony(id,scheduleId,c){
+ const previous=outlookCeremonyRecord(id,scheduleId),o=previous?.outlook;
+ if(!o||o.state!=='booked'||!o.eventId)return notify('This meeting is not ready for Outlook updates.',true);
+ if(!m365Account||o.accountId!==(m365Account.homeAccountId||m365Account.username))return notify('Connect the Microsoft 365 account that owns this booking.',true);
+ let payload;try{payload=outlookEventPayload(c);}catch(e){return notify(String(e.message||e),true);}
+ if(outlookBookingBusy)return notify('An Outlook operation is in progress.',true);
+ if(!confirm('Update this existing Outlook event? Outlook may send updated invitations to attendees.'))return;
+ outlookBookingBusy=true;
+ const w=activeScheduleWorkspace(),sp=currentSprint(),operationId=crypto.randomUUID();
+ try{
+  const marked=await persist(r=>{const t=outlookTarget(r,id,scheduleId,w?.id,sp?.id);if(t?.outlook?.state!=='booked'||t.outlook.eventId!==o.eventId)throw Error('Meeting was modified.');t.outlook={...t.outlook,state:'sync-pending',operationId};},false);
+  if(!marked)return;
+  await outlookGraph('PATCH','/me/calendars/'+encodeURIComponent(o.calendarId)+'/events/'+encodeURIComponent(o.eventId),payload);
+  const saved=await persist(r=>{const t=outlookTarget(r,id,scheduleId,w?.id,sp?.id);if(t?.outlook?.operationId!==operationId)throw Error('Meeting changed during synchronization.');Object.assign(t,c,{updatedAt:new Date().toISOString(),outlook:{...o,state:'booked',syncedAt:new Date().toISOString()}});},false);
+  if(saved){resetCeremony();notify('Existing Outlook event updated and meeting saved.');}
+  else notify('Outlook accepted the update, but saving the ceremony failed. Reconcile before retrying.',true);
+ }catch(e){notify('Outlook update is uncertain: '+String(e.message||e)+'. Use Review Outlook status before retrying.',true);}finally{outlookBookingBusy=false;renderCeremonies();renderWorkspaceSchedules();}
+}
+async function outlookCancelCeremony(id,scheduleId=null){
+ const c=outlookCeremonyRecord(id,scheduleId),o=c?.outlook;
+ if(o?.state!=='booked'||!o.eventId)return notify('Only confirmed Outlook bookings can be cancelled.',true);
+ if(!m365Account||o.accountId!==(m365Account.homeAccountId||m365Account.username))return notify('Connect the Microsoft 365 account that owns this booking.',true);
+ if(outlookBookingBusy)return notify('An Outlook operation is in progress.',true);
+ if(!confirm('Cancel this Outlook meeting and notify attendees? This cannot be undone. The ceremony record will be retained as Cancelled.'))return;
+ outlookBookingBusy=true;const w=activeScheduleWorkspace(),sp=currentSprint(),operationId=crypto.randomUUID();
+ try{
+  const marked=await persist(r=>{const t=outlookTarget(r,id,scheduleId,w?.id,sp?.id);if(t?.outlook?.state!=='booked')throw Error('Meeting changed.');t.outlook={...t.outlook,state:'cancel-pending',operationId};},false);
+  if(!marked)return;
+  // DELETE is appropriate for organizer-owned events; Graph notifies attendees.
+  await outlookGraph('DELETE','/me/calendars/'+encodeURIComponent(o.calendarId)+'/events/'+encodeURIComponent(o.eventId));
+  const saved=await persist(r=>{const t=outlookTarget(r,id,scheduleId,w?.id,sp?.id);if(t?.outlook?.operationId!==operationId)throw Error('Meeting changed.');t.outlook={...o,state:'cancelled',cancelledAt:new Date().toISOString()};t.status='Cancelled';},false);
+  if(saved)notify('Outlook meeting cancelled. Ceremony history retained.');else notify('Outlook cancellation succeeded, but registry confirmation failed. Use Review Outlook status.',true);
+ }catch(e){notify('Cancellation result uncertain: '+String(e.message||e)+'. Review Outlook status before retrying.',true);}finally{outlookBookingBusy=false;renderCeremonies();renderWorkspaceSchedules();}
+}
+async function scheduleCeremonyInOutlook(id,scheduleId=null){
+ if(outlookBookingBusy)return notify('Another Outlook booking is in progress.',true);
+ const c=outlookCeremonyRecord(id,scheduleId);
+ if(!c)return notify('Meeting record is no longer available. Reload before scheduling.',true);
+ if(c.outlook?.state==='booked')return notify('This meeting is already linked to an Outlook event. Duplicate booking prevented.',true);
+ if(c.outlook?.state==='pending')return notify('An earlier Outlook request has an unresolved result. Check the selected Outlook calendar before attempting any further booking.',true);
+ if(c.status==='Cancelled'||c.status==='Completed')return notify('Cancelled or completed meetings cannot be newly booked.',true);
+ const calendarId=m365ReadCalendarPreference();
+ if(!m365Account||!calendarId||!m365Calendars.some(x=>x.id===calendarId))
+  return notify('Connect Microsoft 365, load calendars, and save a preferred calendar first.',true);
+ let payload;
+ try{payload=outlookEventPayload(c);}catch(e){return notify(String(e.message||e),true);}
+ const calendar=m365Calendars.find(x=>x.id===calendarId);
+ if(calendar.canEdit===false)return notify('The selected calendar is read-only.',true);
+ const accountId=m365Account.homeAccountId||m365Account.username;
+ if(!confirm(`Create "${payload.subject}" in Outlook calendar "${calendar.name}"${payload.attendees.length?' and send invitations to '+payload.attendees.length+' attendee(s)':''}?`))return;
+ outlookBookingBusy=true;
+ const operationId=crypto.randomUUID();
+ const sp=currentSprint(),w=activeScheduleWorkspace();
+ const mark=await persist(r=>{
+  const target=scheduleId
+   ? r.workspaces.find(x=>x.id===w?.id)?.meetingSchedules?.find(x=>x.id===scheduleId)?.meetings?.find(x=>x.id===id)
+   : r.sprints.find(x=>x.id===sp?.id)?.ceremonies?.find(x=>x.id===id);
+  if(!target||target.outlook?.state==='booked'||target.outlook?.state==='pending')throw Error('Meeting changed or is already being booked.');
+  target.outlook={state:'pending',operationId,calendarId,accountId,startedAt:new Date().toISOString()};
+ },false);
+ if(!mark){outlookBookingBusy=false;return;}
+ renderCeremonies();renderWorkspaceSchedules();
+ try{
+  const accessToken=await m365GraphToken();
+  const response=await fetch(`https://graph.microsoft.com/v1.0/me/calendars/${encodeURIComponent(calendarId)}/events`,{
+   method:'POST',headers:{Authorization:`Bearer ${accessToken}`,'Content-Type':'application/json',Accept:'application/json'},
+   body:JSON.stringify({...payload,transactionId:operationId})});
+  if(!response.ok)throw Error(`Microsoft Graph ${response.status}: ${(await response.text()).slice(0,350)}`);
+  const event=await response.json();
+  if(!event.id)throw Error('Microsoft Graph did not return an event identifier.');
+  const saved=await persist(r=>{
+   const target=scheduleId
+    ? r.workspaces.find(x=>x.id===w?.id)?.meetingSchedules?.find(x=>x.id===scheduleId)?.meetings?.find(x=>x.id===id)
+    : r.sprints.find(x=>x.id===sp?.id)?.ceremonies?.find(x=>x.id===id);
+   if(!target||target.outlook?.operationId!==operationId)throw Error('Meeting changed during Outlook booking.');
+   target.outlook={state:'booked',operationId,calendarId,accountId,eventId:event.id,webLink:event.webLink||'',syncedAt:new Date().toISOString()};
+   target.status='Scheduled externally';
+  },false);
+  if(saved)notify('Outlook event created and linked to the ceremony. Invitations are handled by Microsoft Outlook.');
+  else notify('Outlook event was created, but saving its link failed. Do not book again; reconcile the calendar event first.',true);
+ }catch(e){
+  // A network failure can occur after Graph has created the event.
+  // Preserve the pending marker for manual reconciliation, never blindly retry.
+  notify('Outlook booking result needs verification: '+String(e.message||e)+'. Check Outlook before retrying. The meeting is marked pending to prevent duplicates.',true);
+ }finally{outlookBookingBusy=false;renderCeremonies();renderWorkspaceSchedules();}
+}
+function renderCeremonies(){const list=$('ceremonyList');if(!list)return;list.replaceChildren();const sp=currentSprint(),w=activeScheduleWorkspace();const records=[...(w?.meetingSchedules||[]).flatMap(sc=>(sc.meetings||[]).map(c=>({...c,_scheduleId:sc.id}))),...(sp?.ceremonies||[])].sort((a,b)=>(a.date||'9999').localeCompare(b.date||'9999')||(a.time||'').localeCompare(b.time||''));if(!records.length){list.textContent='No meeting records yet. Use Meeting Schedule Setup or create a meeting above.';return;}for(const c of records){const box=document.createElement('div');box.className='ceremony-record';const h=document.createElement('strong');h.textContent=(c.title||c.type)+(c.secondary?' + '+c.secondary:'');const info=document.createElement('p');info.className='muted';info.textContent=[c.status||'Proposed',c.date,c.time,c.duration?c.duration+' min':'',c.participants,c._scheduleId?'Workspace schedule':'Sprint record'].filter(Boolean).join(' · ');box.append(h,info);for(const [label,key] of [['Agenda','agenda'],['Decisions / follow-up','outcome']])if(c[key]){const p=document.createElement('p');const strong=document.createElement('strong');strong.textContent=label+': ';p.append(strong,document.createTextNode(c[key]));box.append(p);}if(c.secondary){const completion=document.createElement('div');completion.className='row';for(const [purpose,key] of [[c.type,'primary'],[c.secondary,'secondary']]){const label=document.createElement('label');const check=document.createElement('input');check.type='checkbox';check.checked=!!c.ceremonyCompletion?.[key];check.onchange=async()=>{const ok=await persist(r=>{const m=c._scheduleId?r.workspaces.find(x=>x.id===w.id)?.meetingSchedules?.find(x=>x.id===c._scheduleId)?.meetings?.find(x=>x.id===c.id):(r.sprints.find(x=>x.id===sp.id)?.ceremonies||[]).find(x=>x.id===c.id);if(!m)throw Error('Meeting missing.');m.ceremonyCompletion||={primary:false,secondary:false};m.ceremonyCompletion[key]=check.checked;},false);if(!ok)check.checked=!check.checked;else renderCeremonyInsights();};label.append(check,document.createTextNode(' '+purpose+' complete'));completion.append(label);}box.append(completion);}const actions=document.createElement('div');actions.className='row';const edit=document.createElement('button');edit.type='button';edit.textContent='Edit';edit.onclick=()=>editCeremony(c.id,c._scheduleId||null);const remove=document.createElement('button');remove.type='button';remove.className='secondary';remove.textContent='Remove';remove.onclick=()=>void deleteCeremony(c.id,c._scheduleId||null);actions.append(edit);
+ const outlook=document.createElement('button');outlook.type='button';outlook.className='secondary';
+ outlook.textContent=c.outlook?.state==='booked'?'Booked in Outlook':c.outlook?.state==='pending'?'Booking needs review':c.outlook?.state==='cancelled'?'Cancelled in Outlook':c.outlook?.state?'Outlook sync needs review':'Schedule in Outlook';
+ outlook.disabled=!!c.outlook?.state||c.status==='Cancelled'||c.status==='Completed';
+ outlook.onclick=()=>void scheduleCeremonyInOutlook(c.id,c._scheduleId||null);
+ actions.append(outlook);
+ if(c.outlook?.state==='booked'){
+  const cancel=document.createElement('button');cancel.type='button';cancel.className='secondary';cancel.textContent='Cancel Outlook meeting';cancel.onclick=()=>void outlookCancelCeremony(c.id,c._scheduleId||null);actions.append(cancel);
+ }else if(['pending','sync-pending','cancel-pending'].includes(c.outlook?.state)){
+  const review=document.createElement('button');review.type='button';review.className='secondary';review.textContent='Review Outlook status';review.onclick=()=>void outlookReconcile(c.id,c._scheduleId||null);actions.append(review);
+ }
+ actions.append(remove);
+ if(c.outlook?.state==='booked'&&c.outlook.webLink){const link=document.createElement('a');link.href=c.outlook.webLink;link.target='_blank';link.rel='noopener noreferrer';link.textContent='Open Outlook event';actions.append(link);}
+ box.append(actions);list.append(box);}}
 $('saveCeremony').onclick=()=>void saveCeremony();$('clearCeremony').onclick=resetCeremony;
 function sprintHealthData(){const s=currentSprint();if(!s)return {label:'No sprint selected',reason:'Select a sprint to assess its health.',metrics:[]};const ids=(s.itemIds||[]).map(Number),byId=new Map([...items,...assignedItems].map(w=>[Number(w.id),w]));const missing=ids.filter(id=>!byId.has(id)).length;const work=ids.map(id=>byId.get(id)).filter(Boolean).filter(w=>!isPlanningContextType(w));const completed=work.filter(w=>/^(done|closed|resolved|accepted|completed)$/i.test(w.state||'')).length;const blocked=work.filter(w=>!!s.blockedItems?.[w.id]).length;const today=new Date().toISOString().slice(0,10);const overdue=work.filter(w=>{const date=w.dueDate||w.targetDate||w.due||'';return date&&String(date).slice(0,10)<today&&!/^(done|closed|resolved|accepted|completed)$/i.test(w.state||'');}).length;const remaining=work.length-completed;const end=s.end||'';let label='On track',reason='No blockers or overdue items are visible in the loaded work.';if(!work.length||missing||!s.start||!s.end){label='Insufficient data';reason=missing?`${missing} assigned work items have not loaded; the assessment is incomplete.`:!work.length?'No executable assigned work is loaded yet.':'Sprint start/end dates are required for a reliable assessment.';}else if(blocked||overdue||(end&&end<today&&remaining)){label='At risk';reason=[blocked?`${blocked} blocked`:null,overdue?`${overdue} overdue`:null,end&&end<today&&remaining?`${remaining} incomplete after sprint end`:null].filter(Boolean).join(' · ');}else if(end&&remaining&&((planDate(end)-planDate(today))/86400000)<=2){label='Needs attention';reason=`${remaining} unfinished items with two days or fewer remaining.`;}return {label,reason,metrics:[['Loaded work',work.length],['Completed',completed],['Blocked',blocked],['Overdue (known dates)',overdue],['Not loaded',missing]]};}
 function renderSprintHealth(){const data=sprintHealthData();const node=$('sprintHealthReport');if(node){node.replaceChildren();const heading=document.createElement('p');heading.className='health-indicator';heading.textContent=data.label+' — '+data.reason;node.append(heading);const row=document.createElement('div');row.className='health-metrics';for(const [label,n] of data.metrics){const el=document.createElement('div');el.className='health-metric';const strong=document.createElement('strong');strong.textContent=String(n);const span=document.createElement('span');span.textContent=label;el.append(strong,span);row.append(el);}node.append(row);}const compact=$('planningHealthIndicator');if(compact)compact.textContent=data.label+' · '+data.reason;renderReportCatalogue();renderCeremonyInsights();}
@@ -968,12 +1134,21 @@ function renderWorkspaceSchedules(){const list=$('workspaceSchedules');if(!list)
  if(lifecycle==='Draft'){const commit=document.createElement('button');commit.textContent='Commit schedule';commit.onclick=()=>void changeScheduleLifecycle(sc.id,'commit');const discard=document.createElement('button');discard.className='secondary';discard.textContent='Discard draft';discard.onclick=()=>void changeScheduleLifecycle(sc.id,'discard');actions.append(commit,discard);}
  if(lifecycle==='Committed'){const end=document.createElement('button');end.className='secondary';end.textContent='End schedule…';end.onclick=()=>void changeScheduleLifecycle(sc.id,'retire');actions.append(end);}
  if(lifecycle==='Retired')extend.disabled=true;
- box.append(actions);if(calendarScheduleId===sc.id){const calendar=document.createElement('div');renderMeetingCalendar(calendar,sc.meetings||[],sc.start);box.append(calendar);}if(expandedScheduleId===sc.id){const panel=document.createElement('div');panel.className='schedule-meetings';for(const c of [...(sc.meetings||[])].sort((a,b)=>(a.date||'').localeCompare(b.date||''))){const line=document.createElement('div');line.className='row';const label=document.createElement('span');label.textContent=`${c.date} ${c.time} · ${c.title||c.type}${c.secondary?' + '+c.secondary:''} · ${c.duration||30} min · ${c.status||'Proposed'}`;const edit=document.createElement('button');edit.className='secondary';edit.textContent='Edit';edit.onclick=()=>editCeremony(c.id,sc.id);line.append(label,edit);panel.append(line);}box.append(panel);}list.append(box);}}
+ box.append(actions);if(calendarScheduleId===sc.id){const calendar=document.createElement('div');renderMeetingCalendar(calendar,sc.meetings||[],sc.start);box.append(calendar);}if(expandedScheduleId===sc.id){const panel=document.createElement('div');panel.className='schedule-meetings';for(const c of [...(sc.meetings||[])].sort((a,b)=>(a.date||'').localeCompare(b.date||''))){const line=document.createElement('div');line.className='row';const label=document.createElement('span');label.textContent=`${c.date} ${c.time} · ${c.title||c.type}${c.secondary?' + '+c.secondary:''} · ${c.duration||30} min · ${c.status||'Proposed'}`;const edit=document.createElement('button');edit.className='secondary';edit.textContent='Edit';edit.onclick=()=>editCeremony(c.id,sc.id);line.append(label,edit);
+ const outlook=document.createElement('button');outlook.type='button';outlook.className='secondary';
+ outlook.textContent=c.outlook?.state==='booked'?'Booked in Outlook':c.outlook?.state==='pending'?'Booking needs review':c.outlook?.state==='cancelled'?'Cancelled in Outlook':c.outlook?.state?'Outlook sync needs review':'Schedule in Outlook';
+ outlook.disabled=!!c.outlook?.state||c.status==='Cancelled'||c.status==='Completed';
+ outlook.onclick=()=>void scheduleCeremonyInOutlook(c.id,sc.id);
+ line.append(outlook);
+ if(c.outlook?.state==='booked'){const cancel=document.createElement('button');cancel.type='button';cancel.className='secondary';cancel.textContent='Cancel Outlook meeting';cancel.onclick=()=>void outlookCancelCeremony(c.id,sc.id);line.append(cancel);}
+ else if(['pending','sync-pending','cancel-pending'].includes(c.outlook?.state)){const review=document.createElement('button');review.type='button';review.className='secondary';review.textContent='Review Outlook status';review.onclick=()=>void outlookReconcile(c.id,sc.id);line.append(review);}
+ panel.append(line);}box.append(panel);}list.append(box);}}
 
 
 async function changeScheduleLifecycle(id,action){
  const w=activeScheduleWorkspace(),sc=w?.meetingSchedules?.find(x=>x.id===id);if(!sc)return;
  const state=sc.lifecycle||'Draft';const now=new Date().toISOString();
+ if((action==='discard'||action==='retire')&&(sc.meetings||[]).some(m=>m.outlook?.state))return notify('This schedule contains Outlook bookings or unresolved requests. Retire/discard requires Outlook synchronization in the next build.',true);
  if(action==='discard'&&state!=='Draft')return notify('Only draft schedules can be discarded.',true);
  if(action==='commit'&&state!=='Draft')return notify('Only drafts can be committed.',true);
  if(action==='retire'&&state==='Retired')return;
@@ -1217,7 +1392,10 @@ async function m365RestoreSession(){
   await client.acquireTokenSilent({account,scopes:['User.Read']});
   m365Account=account;
   client.setActiveAccount?.(account);
-  m365ShowAccount();m365RenderCalendars();
+  m365ShowAccount();m365RenderCalendars('Microsoft 365 session restored. Refreshing Outlook calendars…');
+  // The MSAL account and the Graph calendar list have separate lifecycles.
+  // Restore the calendar list after silent account validation, without a popup.
+  void m365RefreshCalendars({silent:true});
   diagnostic('m365.session.restored',{account:account.username||'account'});
  }catch(e){
   // Silent renewal can require interaction, or the browser may have cleared its
@@ -1278,21 +1456,23 @@ function m365RenderCalendars(message=''){
  save.disabled=!connected||!m365Calendars.length;
  status.textContent=message||(connected?(m365Calendars.length?`${m365Calendars.length} calendar(s) available. ${picker.value?'A calendar is selected.':'Choose a calendar and save your preference.'} No events have been created.`:'Select Refresh calendars to discover calendars for this account.'):'Connect Microsoft 365 to discover Outlook calendars.');
 }
-async function m365GraphToken(){
+async function m365GraphToken({silent=false}={}){
  if(!m365Client||!m365Account)throw Error('Connect Microsoft 365 first.');
  const request={account:m365Account,scopes:['Calendars.ReadWrite']};
  try{return (await m365Client.acquireTokenSilent(request)).accessToken;}
  catch(e){
   // A Graph consent or interaction-required response must be handled by MSAL, not hidden.
   if(!/interaction_required|consent_required|login_required|no_tokens_found|token_refresh_required/i.test(String(e.errorCode||'')+' '+String(e.message||e)))throw e;
+  if(silent)throw Error('Calendar authorization needs renewed interaction. Select Refresh calendars to continue.');
   return (await m365Client.acquireTokenPopup(request)).accessToken;
  }
 }
-async function m365RefreshCalendars(){
+async function m365RefreshCalendars({silent=false}={}){
  const btn=$('m365RefreshCalendars');btn.disabled=true;btn.textContent='Loading calendars…';
  $('m365CalendarStatus').textContent='Requesting your calendars from Microsoft Graph…';
  try{
-  const token=await m365GraphToken();
+  const accountAtStart=m365Account;
+  const token=await m365GraphToken({silent});
   let url='https://graph.microsoft.com/v1.0/me/calendars?$select=id,name,isDefaultCalendar,canEdit&$top=100';
   const calendars=[];
   for(let page=0;url&&page<10;page++){
@@ -1305,10 +1485,11 @@ async function m365RefreshCalendars(){
    if(next&&!next.startsWith('https://graph.microsoft.com/'))throw Error('Unexpected Microsoft Graph pagination URL.');
    url=next||'';
   }
+  if(m365Account!==accountAtStart)return; // Ignore a response after account change or disconnect.
   m365Calendars=calendars;
   m365RenderCalendars(`${calendars.length} Outlook calendar(s) retrieved. ${m365ReadCalendarPreference()?'Saved preference restored when available.':'Choose a calendar and save your preference.'} No events have been created.`);
-  notify(`${calendars.length} Outlook calendar(s) retrieved.`);
- }catch(e){m365RenderCalendars('Calendar discovery failed: '+String(e.message||e));diagnostic('m365.calendars.failed',{message:String(e.message||e)},'warn');notify('Unable to retrieve Outlook calendars. See Configuration.',true);}
+  if(!silent)notify(`${calendars.length} Outlook calendar(s) retrieved.`);
+ }catch(e){m365RenderCalendars('Calendar discovery failed: '+String(e.message||e));diagnostic('m365.calendars.failed',{message:String(e.message||e)},'warn');if(!silent)notify('Unable to retrieve Outlook calendars. See Configuration.',true);}
  finally{btn.disabled=!m365Account;btn.textContent='Refresh calendars';}
 }
 function m365SaveCalendar(){

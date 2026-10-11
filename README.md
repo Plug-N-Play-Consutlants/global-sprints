@@ -42,3 +42,30 @@ v0.3.48: Azure DevOps extension loads and Microsoft 365 NAA sign-in was verified
 
 ### v0.3.51 session recovery repair
 On startup, after the Azure DevOps load handshake, the extension attempts to restore an MSAL account and validate it with a silent User.Read token request. No interactive prompt is triggered automatically. If the browser has discarded MSAL's cache, Connect remains available. Calendar preferences are unchanged and no events are written.
+
+
+## v0.4.0 Outlook ceremony booking (initial integration)
+
+- Select and save an Outlook calendar in Configuration.
+- Save a meeting record under Planning, then select **Schedule in Outlook**.
+- The explicit confirmation shows the calendar and attendee count.
+- Dates/times use the scheduling user's browser local timezone and are transmitted to Graph as UTC.
+- Participants must be email addresses separated by commas or semicolons.
+- The meeting is first marked `outlook.state=pending` in the shared registry. Graph is called only after this save succeeds.
+- Successful Graph creation stores the calendar, connected account, event ID and event URL in the meeting.
+- If Graph's result or the subsequent registry save is uncertain, the meeting stays pending. **Do not repeat booking** without reconciling the calendar.
+- Booked/pending meetings cannot be edited or removed until Outlook update/cancellation support is implemented.
+- This build does not synchronize reschedules, deletions, recurring series, Teams links or meetings edited directly in Outlook.
+- The selected calendar preference is still browser-local, as in v0.3.52.
+- Multi-user conflict handling still depends on the Azure DevOps storage service ETag behavior; this is not a fully tested production transaction system.
+
+Runtime verification: pending.
+
+
+## v0.4.0 Outlook lifecycle
+- Edit a linked ceremony to PATCH the existing Outlook event.
+- Cancel a confirmed event with explicit confirmation, retaining ceremony history.
+- Review uncertain updates and cancellations using the saved event ID.
+- Uncertain initial POST without an event ID still requires manual Outlook reconciliation to prevent duplicate invitations.
+- Linked records remain protected from deletion.
+- Multi-user concurrency and recovery from external Outlook changes require further production testing.

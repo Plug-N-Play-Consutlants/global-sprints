@@ -90,6 +90,42 @@ Runtime verification: pending.
 
 Runtime verification is required in Azure DevOps, including multi-user conflict testing.
 
-## v0.5.0 Reporting and synchronization
+## v0.5.1 Reporting and synchronization
 
 Reports now includes Azure DevOps-backed sprint health, segmented completion, project and workload breakdowns, management attention, CSV export, observation-based burndown and item-count velocity, plus an interactive auto-generated timeline with revision-checked write-through to original work-item scheduling fields. Refresh explicitly retrieves current work-item revisions. History is not reconstructed from present-day state. Calendar and board functionality remain from v0.4.2.
+
+## v0.5.2 — Integrated reporting and workflow corrections
+- Closed work items can occupy the visual Done column for project processes without native Done; native Closed status and accepted reporting remain unchanged. Moving an open item to Done in such a process explicitly warns before closing its original ADO ticket.
+- PM Action Queue refreshes after assigned work is loaded and shares the report's assigned-item coverage definition.
+- Reporting identifies assigned, executable, planning-context, and unavailable work separately.
+- Automatic dated observations are recorded on complete work-item loads (maximum once per calendar day) without inventing historical observations.
+- Current graphical charts and date-editing timeline are retained; older historical velocity cannot be inferred without evidence.
+
+
+## v0.5.3 — Reports startup crash repair
+
+Normalizes legacy and current observation timestamps before Reports burndown/velocity sorting and rendering. Invalid timestamps are excluded from charts rather than causing a runtime exception. No sprint or Outlook data is changed.
+
+## v0.5.4 demo reporting
+Demo Mode now includes a populated, isolated reporting workspace with synthetic sprint health, velocity, burndown, project/team charts and interactive ticket dates, effort and state. Existing older local demo fixtures are regenerated to include reporting history. Production ADO and Outlook data are untouched.
+
+## v0.5.5 reporting visualization refinements
+
+- Calendar date axes and Today markers in live and demo timelines.
+- Blocker drill-down from demo Sprint Health to ticket editor.
+- Burndown axis labels and per-observation SVG tooltips.
+- No changes to Outlook, ADO write-through or persistence.
+
+## v0.5.6 reporting acceptance diagnostics
+
+Support now includes a bounded, local-only diagnostic session export, a new-session control and a clear-log control. It captures work-item coverage, failures and existing diagnostic operations, without transmitting records automatically. Review exported JSON before sharing. This is instrumentation for acceptance testing, not proof of runtime success.
+
+## v0.5.7 acceptance instrumentation
+- Diagnostics export schema v3 includes current-session acceptance checklist and aggregate warning/error counts.
+- Captures ADO state/date write attempts, successes and failures; refresh events; automatic snapshot outcomes; demo ticket, blocker, membership and scenario interactions.
+- Checks are marked observed, not tested, failed, or pass where evidence is sufficient. An observed event is not a comprehensive regression pass.
+- No access tokens or request/response bodies are logged. The local diagnostic log is bounded to 600 events.
+
+## v0.6.0 initial functional audit
+
+See `docs/audit-0.6.0.md` for source findings, corrections, and outstanding runtime tests.

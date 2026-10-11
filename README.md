@@ -89,3 +89,7 @@ Runtime verification: pending.
 - Retains all v0.4.1 Outlook creation, update, cancellation and reconciliation behavior.
 
 Runtime verification is required in Azure DevOps, including multi-user conflict testing.
+
+## v0.5.0 Reporting and synchronization
+
+Reports now includes Azure DevOps-backed sprint health, segmented completion, project and workload breakdowns, management attention, CSV export, observation-based burndown and item-count velocity, plus an interactive auto-generated timeline with revision-checked write-through to original work-item scheduling fields. Refresh explicitly retrieves current work-item revisions. History is not reconstructed from present-day state. Calendar and board functionality remain from v0.4.2.

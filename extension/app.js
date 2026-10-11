@@ -146,7 +146,11 @@ function organizationApiBase(){
   if(name)return `https://dev.azure.com/${encodeURIComponent(name)}`;
   throw Error('Azure DevOps organization context is incomplete (no collection URL or name). Please report this message and the project URL.');
 }
-async function api(path,options={}){const started=Date.now();const method=options.method||'GET';const response=await fetch(`${organizationApiBase()}${path}`,{...options,headers:{Authorization:`Bearer ${token}`,Accept:'application/json',...options.headers}});if(!response.ok){diagnostic('ado.api_failure',{status:response.status,method,durationMs:Date.now()-started},'error');const body=(await response.text()).slice(0,450);throw Error(`Azure DevOps API ${response.status}: ${body}`);}if(method!=='GET')diagnostic('ado.api_write',{status:response.status,method,durationMs:Date.now()-started});return response.status===204?null:response.json();}
+function serviceHttpError(service,status){
+ const category=status===401?'Authentication required':status===403?'Permission denied':status===404?'Resource not found':status===409||status===412?'Concurrent change detected':status===429?'Request throttled':status>=500?'Service temporarily unavailable':'Request failed';
+ return Error(`${service}: ${category} (HTTP ${Number(status)||0}). Check Extension Health or contact support if this persists.`);
+}
+async function api(path,options={}){const started=Date.now();const method=options.method||'GET';const response=await fetch(`${organizationApiBase()}${path}`,{...options,headers:{Authorization:`Bearer ${token}`,Accept:'application/json',...options.headers}});if(!response.ok){diagnostic('ado.api_failure',{status:response.status,method,durationMs:Date.now()-started},'error');throw serviceHttpError('Azure DevOps',response.status);}if(method!=='GET')diagnostic('ado.api_write',{status:response.status,method,durationMs:Date.now()-started});return response.status===204?null:response.json();}
 
 // Local UI preferences are scoped to the Azure DevOps user and organization.
 let browserItems=[],browserSequence=0,contextKey='',browserBusy=false;
@@ -517,14 +521,19 @@ const LANE_PRESETS={'Backlog / Planned':'To Do','Ready to Start':'To Do','Active
 const LANE_CATEGORIES=['To Do','In Progress','Done','Closed'];
 let diagnosticEvents=[];const DIAG_KEY='pnpc-global-sprints-diagnostics-v2';
 const DIAG_LIMIT=600;
-const DIAG_VERSION='0.7.0';
+const DIAG_VERSION='0.7.2';
 let diagnosticSessionId='';
+// Production diagnostic payloads are deliberately numeric/boolean or finite enums.
+// Free-form strings (including messages and exception text) must never be exported.
+const DIAGNOSTIC_SAFE_FIELDS=new Set(['status','method','durationMs','assigned','unavailable','loaded','missing','count','checkCount','failed','warnings','version','projectCount','itemCount','snapshotCount','success','connected','enabled','state']);
+const DIAGNOSTIC_ENUMS={method:new Set(['GET','POST','PUT','PATCH','DELETE']),state:new Set(['connected','disconnected','pending','active','inactive','expired','unknown'])};
 function safeDiagnosticDetails(details){
- const out={};for(const [key,value] of Object.entries(details||{})){
-  if(/token|secret|password|authorization|email|account|participant|attendee|body|description|title|name|url|uri|headers|response|payload/i.test(key))continue;
-  if(value===null||typeof value==='boolean'||typeof value==='number')out[key]=value;
-  else if(typeof value==='string')out[key]=/message|error|reason/i.test(key)?value.replace(/https?:\/\/\S+/gi,'[URL]').replace(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/g,'[email]').slice(0,220):value.slice(0,100);
-  else if(Array.isArray(value))out[key]=value.length;
+ const out={};
+ for(const [key,value] of Object.entries(details||{})){
+  if(!DIAGNOSTIC_SAFE_FIELDS.has(key))continue;
+  if(typeof value==='boolean'||(typeof value==='number'&&Number.isFinite(value)))out[key]=value;
+  else if(typeof value==='string'&&DIAGNOSTIC_ENUMS[key]?.has(value))out[key]=value;
+  else if(key==='version'&&typeof value==='string'&&/^\d+\.\d+\.\d+$/.test(value))out[key]=value;
  }
  return out;
 }
@@ -636,14 +645,14 @@ async function runAutomatedAudit(){
  const checks=[],startedAt=new Date().toISOString();diagnostic('audit.run.started',{version:DIAG_VERSION});
  try{
   auditCheck(checks,'extension.capabilities',sdk&&storage&&token?'PASS':'WARNING',`SDK ${!!sdk}, storage ${!!storage}, ADO token ${!!token}`,'All capabilities available');
-  const tooltipTargets=[...document.querySelectorAll('#tab-board button,#tab-planning button,#tab-reports button')].filter(b=>!b.classList.contains('hidden')&&!b.closest('.hidden'));
+  const tooltipTargets=[...document.querySelectorAll('#tab-board button,#tab-planning button,#tab-reports button')].filter(b=>!b.classList.contains('hidden')); // Audit inactive tabs too; tab panels are intentionally hidden until selected.
   const missingTooltips=tooltipTargets.filter(b=>!b.title&&!b.getAttribute('aria-label')&&!b.getAttribute('aria-describedby'));
-  auditCheck(checks,'ui.action_help',missingTooltips.length?'WARNING':'PASS',`${tooltipTargets.length} controls checked; ${missingTooltips.length} missing explanations`,'Visible Board, Planning and Reports buttons have accessible help','Read-only DOM inspection; does not prove tooltip positioning or clarity.');
+  auditCheck(checks,'ui.action_help',!tooltipTargets.length?'NOT TESTED':missingTooltips.length?'WARNING':'PASS',`${tooltipTargets.length} controls checked; ${missingTooltips.length} missing explanations`,'Visible Board, Planning and Reports buttons have accessible help','Read-only DOM inspection; does not prove tooltip positioning or clarity.');
   const wizardControls=['wizardReset','wizardResetStatus','wizardStepHelp','workspaceSchedules','ceremonyPreview'];
   auditCheck(checks,'ui.meeting_setup_guidance',wizardControls.every(id=>!!$(id))?'PASS':'FAIL',`${wizardControls.filter(id=>!!$(id)).length}/${wizardControls.length} required guidance and proposal elements present`,'Proposal clearing and saved schedules have distinct guidance','Does not execute destructive or persisted operations.');
   const scheduleRecords=(activeScheduleWorkspace()?.meetingSchedules||[]);
-  auditCheck(checks,'live.schedule_record_integrity',scheduleRecords.every(sc=>Array.isArray(sc.meetings))?'PASS':'WARNING',`${scheduleRecords.length} saved workspace schedules; ${scheduleRecords.filter(sc=>!Array.isArray(sc.meetings)).length} invalid meeting arrays`,'Saved schedules retain a meeting list','Read-only; no Outlook changes.');
-  const baselineHelp=$('commitmentHelp');auditCheck(checks,'ui.baseline_explanation',baselineHelp?.textContent.includes('baseline')?'PASS':'WARNING',baselineHelp?'Commitment history explanation present':'No baseline explanation found','Explain why commitment snapshots differ from current sprint summary');
+  auditCheck(checks,'live.schedule_record_integrity',!scheduleRecords.length?'NOT TESTED':scheduleRecords.every(sc=>Array.isArray(sc.meetings))?'PASS':'WARNING',`${scheduleRecords.length} saved workspace schedules; ${scheduleRecords.filter(sc=>!Array.isArray(sc.meetings)).length} invalid meeting arrays`,'Saved schedules retain a meeting list','Read-only; no Outlook changes.');
+  const historyReady=!!$('historyToggle')&&!!$('historyPanel')&&!!$('history');auditCheck(checks,'ui.history_record',historyReady?'PASS':'FAIL',historyReady?'Capture history controls present':'History Record controls missing','History Record access and detail container exist','Does not exercise export or persistence.');const demoReady=!!document.querySelector('[data-tab=demo]')&&!!$('tab-demo')&&!!$('demoWorkspace');auditCheck(checks,'ui.demo_entry',demoReady?'PASS':'FAIL',demoReady?'Demo tab and isolated workspace present':'Demo entry incomplete','Dedicated demo entry points exist','Does not execute synthetic scenarios.');const baselineHelp=$('commitmentHelp');auditCheck(checks,'ui.baseline_explanation',baselineHelp?.textContent.toLowerCase().includes('commitment')?'PASS':'WARNING',baselineHelp?'Read-only commitment record explanation present':'No baseline explanation found','Explain why commitment snapshots differ from current sprint summary');
 
   const s=currentSprint();
   if(!s){auditCheck(checks,'live.sprint_selection','NOT_TESTED','No selected sprint','A selected sprint');}
@@ -1034,7 +1043,7 @@ function renderHybridBoard(){
 }
 function renderBoard(){renderHybridBoard();}
 async function changeState(w,state){await updateWorkItemState(w,state);renderBacklog();renderBoard();}
-async function capture(){let s;try{s=requireSprint();}catch(e){return notify(e.message,true);}const missing=s.itemIds.filter(id=>![...items,...assignedItems].some(w=>w.id===id));if(missing.length)return notify(`Load all committed work items before capturing a baseline. ${missing.length} item(s) are not currently loaded.`,true);const snapshot={at:new Date().toISOString(),items:s.itemIds.map(id=>{const w=[...items,...assignedItems].find(x=>x.id===id);return {id,project:w.project,title:w.title,state:w.state};})};const ok=await persist(r=>{r.sprints.find(x=>x.id===s.id).snapshots.push(snapshot);});if(ok)notify(`Commitment baseline captured with ${snapshot.items.length} work items.`);}
+async function capture(){let s;try{s=requireSprint();}catch(e){return notify(e.message,true);}const missing=s.itemIds.filter(id=>![...items,...assignedItems].some(w=>w.id===id));if(missing.length)return notify(`Load all committed work items before capturing a baseline. ${missing.length} item(s) are not currently loaded.`,true);const snapshot={at:new Date().toISOString(),items:s.itemIds.map(id=>{const w=[...items,...assignedItems].find(x=>x.id===id);return {id,project:w.project,title:w.title,state:w.state};})};const ok=await persist(r=>{r.sprints.find(x=>x.id===s.id).snapshots.push(snapshot);});if(ok){renderHistory();notify(`Commitment baseline captured with ${snapshot.items.length} work items at ${new Date(snapshot.at).toLocaleString()}. Open History Record to inspect it.`);}}
 
 // Advisory sprint-readiness checks. No mutations, enforced cadence, or new persisted schema.
 function renderGuidance(){
@@ -1092,7 +1101,28 @@ function renderPlanningSteps(){
 $('guidanceDismiss').addEventListener('click',()=>{const key=guidancePreferenceKey();if(key)localStorage.setItem(key,'1');renderPlanningSteps();});
 $('guidanceRestore').addEventListener('click',()=>{const key=guidancePreferenceKey();if(key)localStorage.removeItem(key);renderPlanningSteps();});
 
-function renderHistory(){renderGuidance();const s=registry?.sprints.find(x=>x.id===$('sprintPicker').value);$('history').textContent=s?.snapshots?.length?s.snapshots.map(x=>`${(reportSnapshotTimestamp(x.at)?new Date(reportSnapshotTimestamp(x.at)).toLocaleString():'Unknown date')}: ${x.items.length} committed work items`).join(' · '):'No commitment baseline captured.';}
+function renderHistory(){
+ renderGuidance();const sp=currentSprint(),records=(sp?.snapshots||[]).map((record,index)=>({record,index})).filter(x=>!x.record.automatic);
+ const btn=$('historyToggle'),root=$('history');if(btn)btn.textContent=`History Record (${records.length})`;if(!root)return;
+ root.replaceChildren();if(!records.length){root.textContent='No commitment records yet. Capture a baseline to begin.';return;}
+ for(const {record,index} of records.reverse()){
+  const details=document.createElement('details');details.className='panel';details.style.margin='8px 0';
+  const stamp=reportSnapshotTimestamp(record.at),summary=document.createElement('summary');summary.textContent=`Record ${index+1} · ${stamp?new Date(stamp).toLocaleString():'Date unavailable (legacy record)'} · ${(record.items||[]).length} work items`;details.append(summary);
+  const description=document.createElement('p');description.className='muted';description.textContent='Captured source states at this point in time. This is not a restore point.';details.append(description);
+  const table=document.createElement('table');const head=document.createElement('thead');const tr=document.createElement('tr');for(const label of ['ID','Project','Work item','Recorded state']){const th=document.createElement('th');th.textContent=label;tr.append(th);}head.append(tr);table.append(head);
+  const body=document.createElement('tbody');for(const item of record.items||[]){const row=document.createElement('tr');for(const value of [item.id,item.project,item.title,item.state]){const td=document.createElement('td');td.textContent=String(value??'—');row.append(td);}body.append(row);}table.append(body);const wrap=document.createElement('div');wrap.style.overflowX='auto';wrap.append(table);details.append(wrap);
+  const download=document.createElement('button');download.type='button';download.className='secondary';download.textContent='Download record (JSON)';download.title='Export this historical capture without changing the sprint';download.addEventListener('click',()=>{const payload={schema:'pnpc.commitment-record.v1',sprintId:sp.id,sprintName:sp.name,recordNumber:index+1,capturedAt:stamp||null,record};const url=URL.createObjectURL(new Blob([JSON.stringify(payload,null,2)],{type:'application/json'}));const link=document.createElement('a');link.href=url;link.download=`global-sprint-commitment-${index+1}.json`;link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);});details.append(download);
+  const csv=document.createElement('button');csv.type='button';csv.className='secondary';csv.textContent='Download CSV';csv.title='Download this capture as a spreadsheet-compatible CSV';csv.style.marginLeft='8px';csv.addEventListener('click',()=>{
+   const fields=['Capture date','Sprint','Record number','Work item ID','Project','Title','Recorded state'];
+   const quote=value=>'"'+String(value??'').replace(/^[=+@\-\t\r]/,'\u0027$&').replace(/"/g,'""')+'"';
+   const rows=[fields,...(record.items||[]).map(item=>[stamp||'',sp.name,index+1,item.id,item.project,item.title,item.state])];
+   const content='\uFEFF'+rows.map(row=>row.map(quote).join(',')).join('\r\n');
+   const url=URL.createObjectURL(new Blob([content],{type:'text/csv;charset=utf-8'}));const link=document.createElement('a');link.href=url;link.download=`global-sprint-commitment-${index+1}.csv`;link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+  });details.append(csv);root.append(details);
+ }
+}
+$('historyToggle').addEventListener('click',()=>{const panel=$('historyPanel'),show=panel.classList.contains('hidden');panel.classList.toggle('hidden',!show);$('historyToggle').setAttribute('aria-expanded',String(show));if(show){renderHistory();requestAnimationFrame(()=>{panel.scrollIntoView({behavior:'smooth',block:'start'});panel.focus({preventScroll:true});});}});
+
 // Legacy toolbar movement is retired; lane headers own their controls.
 $('configureLane').onclick=()=>{if(!currentSprint())return notify('Select a sprint first.',true);openLaneMappingList();};
 $('downloadDiagnostics').onclick=downloadDiagnostics;
@@ -1140,7 +1170,7 @@ $('laneSave').onclick=()=>void commitLaneEditor();$('laneCancel').onclick=closeL
 let selectedCeremonyId=null;let selectedWorkspaceMeeting=null;let expandedScheduleId=null;let calendarScheduleId=null;
 const CEREMONY_FIELDS=['ceremonyType','ceremonyTitle','ceremonyDate','ceremonyTime','ceremonyDuration','ceremonyParticipants','ceremonySecondary','ceremonyStatus','ceremonyAgenda','ceremonyOutcome'];
 function activateTab(name){diagnostic('ui.tab.opened',{tab:name});
- if(!['board','planning','reports','configuration','support'].includes(name))name='board';
+ if(!['board','planning','reports','demo','configuration','support'].includes(name))name='board';
  document.querySelectorAll('.gs-tab').forEach(b=>{const on=b.dataset.tab===name;b.setAttribute('aria-selected',String(on));b.tabIndex=on?0:-1;});
  document.querySelectorAll('.gs-tab-panel').forEach(p=>p.classList.toggle('hidden',p.id!=='tab-'+name));
  if(name==='reports'){renderSprintHealth();renderTimeline();}if(name==='planning'){renderCeremonies();renderSprintHealth();}if(name==='board')renderBoard();
@@ -1194,7 +1224,7 @@ function outlookTarget(r,id,scheduleId,workspaceId,sprintId){
 async function outlookGraph(method,path,body){
  const token=await m365GraphToken();
  const response=await fetch('https://graph.microsoft.com/v1.0'+path,{method,headers:{Authorization:'Bearer '+token,Accept:'application/json',...(body?{'Content-Type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{})});
- if(!response.ok)throw Error('Microsoft Graph '+response.status+': '+(await response.text()).slice(0,350));
+ if(!response.ok)throw serviceHttpError('Microsoft Graph',response.status);
  return response.status===204?null:response.json();
 }
 async function outlookReconcile(id,scheduleId=null){
@@ -1300,7 +1330,7 @@ async function scheduleCeremonyInOutlook(id,scheduleId=null){
   const response=await fetch(`https://graph.microsoft.com/v1.0/me/calendars/${encodeURIComponent(calendarId)}/events`,{
    method:'POST',headers:{Authorization:`Bearer ${accessToken}`,'Content-Type':'application/json',Accept:'application/json'},
    body:JSON.stringify({...payload,transactionId:operationId})});
-  if(!response.ok)throw Error(`Microsoft Graph ${response.status}: ${(await response.text()).slice(0,350)}`);
+  if(!response.ok)throw serviceHttpError('Microsoft Graph',response.status);
   const event=await response.json();
   if(!event.id)throw Error('Microsoft Graph did not return an event identifier.');
   const saved=await persist(r=>{
@@ -1723,7 +1753,7 @@ function renderDemo(){if(!demoState)return;const m=demoHealth();$('demoStats').t
  demoReportRender();
  const decisions=$('demoDecisions');decisions.replaceChildren();for(const d of demoState.decisions){const p=document.createElement('p');p.textContent=d;decisions.append(p);}
 }
-function setDemoMode(enabled){diagnostic('demo.mode.changed',{enabled});demoActive=enabled;$('demoWorkspace').classList.toggle('hidden',!enabled);document.querySelector('.gs-tabs').classList.toggle('hidden',enabled);document.querySelectorAll('.gs-tab-panel').forEach(el=>el.classList.toggle('demo-hidden',enabled));document.querySelector('.gs-context').classList.toggle('hidden',enabled);$('demoToggle').classList.toggle('hidden',enabled);if(enabled){if(!demoState){try{demoState=JSON.parse(localStorage.getItem(DEMO_KEY));}catch{}if(!demoState||!Array.isArray(demoState.history)||!Array.isArray(demoState.observations))demoState=demoSeed('risk');} $('demoScenario').value=demoState.kind;renderDemo();}else{document.querySelectorAll('.gs-tab-panel').forEach(el=>el.classList.remove('demo-hidden'));} }
+function setDemoMode(enabled){diagnostic('demo.mode.changed',{enabled});demoActive=enabled;$('demoWorkspace').classList.toggle('hidden',!enabled);document.querySelector('.gs-tabs').classList.toggle('hidden',enabled);document.querySelectorAll('.gs-tab-panel').forEach(el=>el.classList.toggle('demo-hidden',enabled));document.querySelector('.gs-context').classList.toggle('hidden',enabled);$('demoToggle').classList.toggle('hidden',enabled);if(enabled){if(!demoState){try{demoState=JSON.parse(localStorage.getItem(DEMO_KEY));}catch{}if(!demoState||!Array.isArray(demoState.history)||!Array.isArray(demoState.observations))demoState=demoSeed('risk');} $('demoScenario').value=demoState.kind;renderDemo();}else{document.querySelectorAll('.gs-tab-panel').forEach(el=>el.classList.remove('demo-hidden'));activateTab('demo');} }
 $('demoToggle').addEventListener('click',()=>setDemoMode(true));$('demoExit').addEventListener('click',()=>setDemoMode(false));
 $('demoLoad').addEventListener('click',()=>{if(demoState&&demoState.decisions.length&&!confirm('Replace current demo scenario and its changes?'))return;demoState=demoSeed($('demoScenario').value);saveDemo();diagnostic('demo.scenario.loaded',{scenario:demoState.kind,ticketCount:demoState.work.length,observations:demoState.observations.length});renderDemo();notify('Synthetic demo scenario loaded.');});
 $('demoReset').addEventListener('click',()=>{if(!confirm('Reset demo scenario to its original state? Production data is unaffected.'))return;demoState=demoSeed(demoState.kind);saveDemo();diagnostic('demo.scenario.reset',{scenario:demoState.kind});renderDemo();notify('Demo reset.');});
@@ -1883,7 +1913,7 @@ async function m365RefreshCalendars({silent=false}={}){
   const calendars=[];
   for(let page=0;url&&page<10;page++){
    const response=await fetch(url,{headers:{Authorization:'Bearer '+token,Accept:'application/json'}});
-   if(!response.ok){let details='';try{const body=await response.json();details=body?.error?.message||'';}catch{}throw Error(`Microsoft Graph returned HTTP ${response.status}${details?': '+details:''}`);}
+   if(!response.ok)throw serviceHttpError('Microsoft Graph',response.status);
    const body=await response.json();
    if(!Array.isArray(body.value))throw Error('Microsoft Graph returned an unexpected calendar response.');
    calendars.push(...body.value.filter(c=>typeof c.id==='string'&&typeof c.name==='string'));

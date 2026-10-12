@@ -4,6 +4,34 @@ window.addEventListener('error',event=>{if(/ResizeObserver loop (limit exceeded|
 window.addEventListener('unhandledrejection',event=>{const el=document.getElementById('message');if(el){el.textContent='Extension startup error: '+String(event.reason?.message||event.reason||'Unknown rejection');el.className='message error';}});
 /* Organization-scoped extension data. No PAT, passwords, or browser-local sprint store. */
 const $=id=>document.getElementById(id);
+// PNPC Global Sprints / Product Command Azure DevOps room client.
+// Browser token is passed only to the configured HTTPS Product Command endpoint.
+// Responses are advisory until production identity verification and paid-license
+// integration are exercised. Never cache bearer tokens or license keys.
+const ROOM_API='https://plugnplayconsultants.com/wp-json/pnpc-product-command/v1';
+const ALLOWED=new Set(['licensed','trial_active','trial_expired','unlicensed','expired','suspended','revoked']);
+const ROOM_ENFORCE_PREVIEW=true; // UI-level evaluation only; NOT tamper-resistant commercial enforcement.
+function normalizeRoomResponse(raw){
+ if(!raw||typeof raw!=='object'||!ALLOWED.has(raw.status)||typeof raw.allowed!=='boolean')throw Error('Unexpected licensing service response.');
+ if(raw.allowed!==['licensed','trial_active'].includes(raw.status))throw Error('Inconsistent licensing decision.');
+ return {status:raw.status,allowed:raw.allowed,startedAt:typeof raw.started_at==='string'?raw.started_at:null,expiresAt:typeof raw.expires_at==='string'?raw.expires_at:null};
+}
+async function roomRequest({operation,organization,token,licenseKey,signal}){
+ if(!['entitlement','trial','activate'].includes(operation))throw Error('Unsupported licensing operation.');
+ if(!/^[A-Za-z0-9][A-Za-z0-9-]{0,99}$/.test(organization||''))throw Error('Invalid Azure DevOps organization name.');
+ if(!token||typeof token!=='string')throw Error('Azure DevOps authentication is required.');
+ if(operation==='activate'&&(!licenseKey||typeof licenseKey!=='string'))throw Error('A license key is required.');
+ const body={organization};
+ if(operation==='activate')body.license_key=licenseKey;
+ const response=await fetch(`${ROOM_API}/ado/${operation}`,{method:'POST',mode:'cors',cache:'no-store',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify(body),signal});
+ const payload=await response.json().catch(()=>null);
+ if(!response.ok){
+  const error=new Error(response.status===503?'Licensing service temporarily unavailable.':response.status===401?'Azure DevOps authentication was not accepted.':response.status===403?'Organization authorization was denied.':(payload?.message||`Licensing request failed (${response.status}).`));
+  error.status=response.status;throw error;
+ }
+ return normalizeRoomResponse(payload);
+}
+
 const COLLECTION='global-sprints-v1';
 const ROOT='registry';
 const DEFAULT_WORKSPACE_ID='default-workspace';
@@ -16,6 +44,66 @@ let activeWorkspaceId=DEFAULT_WORKSPACE_ID;
 function activeWorkspace(){return registry?.workspaces?.find(w=>w.id===activeWorkspaceId);}
 function workspaceSprints(){return (registry?.sprints||[]).filter(s=>s.workspaceId===activeWorkspaceId);}
 function workspaceProjectIds(){return activeWorkspace()?.projectIds||[];}
+// License-room requests are opt-in during integration testing. No commercial
+// enforcement is enabled until the server and browser token flows are verified.
+let roomStatus=null,roomBusy=false,roomCheckPending=false;
+function roomReadableStatus(){
+ if(!roomStatus)return 'Entitlement not checked';
+ const names={licensed:'Licensed',trial_active:'Trial active',trial_expired:'Trial expired',unlicensed:'Not licensed',expired:'License expired',suspended:'License suspended',revoked:'License revoked'};
+ const when=roomStatus.expiresAt?` · Ends ${new Date(roomStatus.expiresAt).toLocaleString()}`:'';
+ return `${names[roomStatus.status]||roomStatus.status}${when}`;
+}
+function renderRoomAccess(){
+ const denied=ROOM_ENFORCE_PREVIEW&&roomStatus&&!roomStatus.allowed;
+ const banner=$('licenseAccessNotice');if(banner){banner.classList.toggle('hidden',!denied);banner.textContent=denied?`${roomReadableStatus()}. Global Sprints work areas are unavailable until a trial or paid license is active. Existing sprint data is retained. Open Configuration to manage licensing.`:'';}
+ for(const name of ['board','planning','reports','demo']){
+  const panel=$('tab-'+name);if(panel){panel.inert=!!denied;panel.setAttribute('aria-disabled',String(!!denied));}
+ }
+ const ctx=document.querySelector('.gs-context');if(ctx)ctx.inert=!!denied;
+ for(const b of document.querySelectorAll('.gs-tab')){
+  const restricted=['board','planning','reports','demo'].includes(b.dataset.tab);
+  b.disabled=!!denied&&restricted;
+ }
+ if(denied){activateTab('configuration');}
+}
+
+function roomOrganization(){
+ const host=sdk?.getHost?.();
+ const name=host?.name||'';
+ return /^[A-Za-z0-9][A-Za-z0-9-]{0,99}$/.test(name)?name:'';
+}
+function renderRoomStatus(message){
+ const node=$('licenseRoomStatus');if(!node)return;
+ node.textContent=message||(roomStatus?`Organization entitlement: ${roomReadableStatus()}.`:'Entitlement has not yet been checked.');
+ renderRoomAccess();
+}
+async function checkRoom(operation='entitlement'){
+ if(roomBusy)return;
+ const organization=roomOrganization();
+ if(!organization)return renderRoomStatus('Azure DevOps organization could not be identified. Licensing request not sent.');
+ if(!token)return renderRoomStatus('Azure DevOps access token unavailable.');
+ const key=operation==='activate'?$('licenseRoomKey')?.value.trim():undefined;
+ if(operation==='activate'&&!key)return renderRoomStatus('Enter a license key to activate.');
+ if(operation==='trial'&&!confirm('Start the 14-day organization-wide Global Sprints trial? This cannot be restarted.'))return;
+ roomBusy=true;
+ for(const id of ['licenseRoomCheck','licenseRoomTrial','licenseRoomActivate'])if($(id))$(id).disabled=true;
+ renderRoomStatus('Contacting Product Command licensing service…');
+ try{
+  const result=await roomRequest({operation,organization,token,licenseKey:key});
+  roomStatus=result;
+  if($('licenseRoomKey'))$('licenseRoomKey').value='';
+  renderRoomStatus();
+  diagnostic('licensing.room.checked',{operation,status:result.status,allowed:result.allowed});
+ }catch(error){
+  // A transient service failure must not be confused with an unlicensed decision.
+  // Retain the last verified decision, if one exists.
+  renderRoomStatus(`Licensing check failed: ${error.message} ${roomStatus?'Last verified status: '+roomReadableStatus()+'.':'No verified entitlement is available. Access remains available in this integration preview.'}`);
+  diagnostic('licensing.room.unavailable',{operation,status:error.status||'network'},'warn');
+ }finally{
+  roomBusy=false;
+  for(const id of ['licenseRoomCheck','licenseRoomTrial','licenseRoomActivate'])if($(id))$(id).disabled=false;
+ }
+}
 function workspaceLabel(){const w=activeWorkspace();return w?`${w.projectIds.length} project(s) · ${workspaceSprints().length} sprint(s)`:'';}
 function renderWorkspacePicker(preferred){
  const picker=$('workspacePicker');const selected=preferred||activeWorkspaceId;
@@ -281,7 +369,7 @@ async function init(){try{
   sdk.notifyLoadSucceeded();notify('Connecting to organization data…');
   // Session recovery is independent of Azure DevOps data initialization.
   void m365RestoreSession();
-  token=await sdk.getAccessToken();if(!token)throw Error('Azure DevOps did not provide an access token.');
+  token=await sdk.getAccessToken();if(!token)throw Error('Azure DevOps did not provide an access token.');renderRoomStatus();void checkRoom('entitlement');
   const service=await sdk.getService('ms.vss-features.extension-data-service');storage=await service.getExtensionDataManager(sdk.getExtensionContext().id,token);
   try{registry=await storage.getDocument(COLLECTION,ROOT);}catch(e){if(e.status!==404 && !/404|not found/i.test(String(e.message)))throw e;registry={id:ROOT,sprints:[]};}
   await loadProjects();
@@ -501,7 +589,7 @@ async function saveBoardDraft(){
  const name=prompt('Name this planning draft:',`${sp.name} · Draft ${drafts.length+1}`)?.trim();if(!name)return;
  const now=new Date().toISOString(),draft={id:crypto.randomUUID(),name:name.slice(0,120),savedAt:now,sourceSprintId:sp.id,itemIds:[...(sp.itemIds||[])],itemLanes:structuredClone(sp.itemLanes||{}),blockedItems:structuredClone(sp.blockedItems||{}),customLanes:structuredClone(sp.customLanes||[]),laneMappings:structuredClone(sp.laneMappings||{})};
  const ok=await persist(r=>{const target=r.workspaces.find(x=>x.id===w.id);target.boardDrafts||=[];if(target.boardDrafts.length>=10)throw Error('Draft limit reached.');target.boardDrafts.push(draft);},false);
- if(ok){renderBoardDrafts();$('boardDraftPicker').value=draft.id;notify('Planning draft saved. Azure DevOps work items were not changed.');}
+ if(ok){renderBoardDrafts();$('boardDraftPicker').value=draft.id;try{const stored=await storage.getDocument(COLLECTION,ROOT);if(!stored.workspaces?.find(x=>x.id===w.id)?.boardDrafts?.some(x=>x.id===draft.id))throw Error('Draft was not found in saved registry.');registry=stored;renderBoardDrafts();$('boardDraftPicker').value=draft.id;notify('Planning draft saved and verified. Azure DevOps work items were not changed.');}catch(e){notify('Draft save could not be verified: '+e.message,true);}}
 }
 async function resetSprintBoard(){
  const sp=currentSprint();if(!sp)return notify('Select a sprint first.',true);
@@ -515,13 +603,52 @@ async function restoreBoardDraft(){
  const ok=await persist(r=>{const t=r.sprints.find(x=>x.id===sp.id);t.itemIds=[...d.itemIds];t.itemLanes=structuredClone(d.itemLanes||{});t.blockedItems=structuredClone(d.blockedItems||{});t.customLanes=structuredClone(d.customLanes||[]);t.laneMappings=structuredClone(d.laneMappings||{});},false);
  if(ok){await loadAssignedItems();renderSprintFields();renderBoardDrafts();notify('Planning draft restored. No Azure DevOps states changed.');}
 }
-async function deleteBoardDraft(){const d=boardDrafts().find(x=>x.id===$('boardDraftPicker').value),w=activeWorkspace();if(!d||!w)return notify('Choose a draft to delete.',true);if(!confirm(`Delete planning draft "${d.name}"? This does not change any sprint.`))return;const ok=await persist(r=>{const target=r.workspaces.find(x=>x.id===w.id);target.boardDrafts=(target.boardDrafts||[]).filter(x=>x.id!==d.id);},false);if(ok){renderBoardDrafts();notify('Planning draft deleted.');}}
+// Draft deletion must be confirmed against the organization-scoped persisted registry.
+// Do not report success solely because setDocument returned without throwing.
+async function deleteBoardDraft(){
+ const selectedId=$('boardDraftPicker').value;
+ const w=activeWorkspace(),d=boardDrafts().find(x=>x.id===selectedId);
+ if(!d||!w)return notify('Choose a draft to delete.',true);
+ const workspaceId=w.id;
+ if(!confirm(`Delete planning draft "${d.name}"? This does not change any sprint.`))return;
+ const ok=await persist(r=>{
+  const target=r.workspaces?.find(x=>x.id===workspaceId);
+  if(!target)throw Error('The workspace no longer exists.');
+  const before=target.boardDrafts||[];
+  if(!before.some(x=>x.id===selectedId))throw Error('The selected draft no longer exists. Refresh the page.');
+  target.boardDrafts=before.filter(x=>x.id!==selectedId);
+  if(target.boardDrafts.length!==before.length-1)throw Error('Draft deletion did not remove exactly one record.');
+ },false);
+ if(!ok)return;
+ // Successful setDocument updates the local registry. Refresh the picker immediately.
+ renderBoardDrafts();
+ $('boardDraftPicker').value='';
+ try{
+  // Fetch the authoritative stored record instead of relying on the in-memory array.
+  const persisted=await storage.getDocument(COLLECTION,ROOT);
+  const storedWorkspace=persisted?.workspaces?.find(x=>x.id===workspaceId);
+  if(!storedWorkspace)throw Error('Workspace not found in saved registry.');
+  registry=persisted;
+  if((storedWorkspace.boardDrafts||[]).some(x=>x.id===selectedId)){
+   renderBoardDrafts();
+   notify('The draft is still present in saved organization data. Deletion could not be confirmed; refresh and retry.',true);
+   return;
+  }
+  // Rebuild the actual options immediately, without waiting for a page refresh.
+  renderBoardDrafts();
+  $('boardDraftPicker').value='';
+  $('boardDraftCount').textContent=`${(storedWorkspace.boardDrafts||[]).length}/10 workspace drafts`;
+  notify(`Planning draft "${d.name}" deleted and verified in saved organization data.`);
+ }catch(e){
+  notify('Draft deletion could not be verified against saved organization data: '+e.message+'. Refresh to check its status.',true);
+ }
+}
 
 const LANE_PRESETS={'Backlog / Planned':'To Do','Ready to Start':'To Do','Active Work':'In Progress','Blocked':'In Progress','Waiting on Client':'In Progress','Review / Testing':'In Progress','Completed':'Done','Closed / Archived':'Closed'};
 const LANE_CATEGORIES=['To Do','In Progress','Done','Closed'];
 let diagnosticEvents=[];const DIAG_KEY='pnpc-global-sprints-diagnostics-v2';
 const DIAG_LIMIT=600;
-const DIAG_VERSION='0.7.2';
+const DIAG_VERSION='0.9.0';
 let diagnosticSessionId='';
 // Production diagnostic payloads are deliberately numeric/boolean or finite enums.
 // Free-form strings (including messages and exception text) must never be exported.
@@ -537,8 +664,17 @@ function safeDiagnosticDetails(details){
  }
  return out;
 }
+// Revalidate historical browser records before displaying or exporting them.
+// Older releases permitted arbitrary free text in diagnostic details.
+function sanitizedDiagnosticEvent(raw){
+ if(!raw||typeof raw!=='object')return null;
+ const kind=typeof raw.kind==='string'&&/^[a-z][a-z0-9._-]{0,89}$/.test(raw.kind)?raw.kind:'legacy.event';
+ const severity=['info','warn','error'].includes(raw.severity)?raw.severity:'info';
+ const at=typeof raw.at==='string'&&/^\d{4}-\d{2}-\d{2}T/.test(raw.at)&&!Number.isNaN(Date.parse(raw.at))?new Date(raw.at).toISOString():null;
+ return {at,kind,severity,details:safeDiagnosticDetails(raw.details)};
+}
 function diagnostic(kind,details={},severity='info'){
- const event={at:new Date().toISOString(),session:diagnosticSessionId,kind:String(kind).slice(0,90),severity,details:safeDiagnosticDetails(details)};
+ const event={at:new Date().toISOString(),session:diagnosticSessionId,kind:/^[a-z][a-z0-9._-]{0,89}$/.test(String(kind))?String(kind):'app.event',severity:['info','warn','error'].includes(severity)?severity:'info',details:safeDiagnosticDetails(details)};
  diagnosticEvents.push(event);diagnosticEvents=diagnosticEvents.slice(-DIAG_LIMIT);
  try{localStorage.setItem(DIAG_KEY,JSON.stringify(diagnosticEvents));}catch(_){}renderDiagnostics();
 }
@@ -569,12 +705,12 @@ function diagnosticCoverage(){
 function renderDiagnostics(){
  const node=$('diagnosticStatus');if(node)node.textContent=`${diagnosticEvents.length} events (max ${DIAG_LIMIT}) · SDK ${sdk?'ready':'unavailable'} · Storage ${storage?'connected':'unavailable'} · ADO ${token?'authenticated':'unavailable'}`;
  const summary=$('diagnosticAcceptance');if(summary){const a=diagnosticAcceptance();summary.textContent='Current session · '+a.counts.events+' events · '+a.counts.warnings+' warnings · '+a.counts.errors+' errors\n'+a.checks.map(c=>c.status.toUpperCase()+' · '+c.name).join('\n');}
- const view=$('diagnosticRecent');if(view)view.textContent=diagnosticEvents.slice(-20).reverse().map(e=>`${e.at}  ${e.severity.toUpperCase()}  ${e.kind}  ${JSON.stringify(e.details)}`).join('\n')||'No events captured yet.';
+ const view=$('diagnosticRecent');if(view)view.textContent=diagnosticEvents.slice(-20).reverse().map(sanitizedDiagnosticEvent).filter(Boolean).map(e=>`${e.at||'Unknown time'}  ${e.severity.toUpperCase()}  ${e.kind}  ${JSON.stringify(e.details)}`).join('\n')||'No events captured yet.';
 }
 function downloadDiagnostics(){
  diagnosticCoverage();diagnostic('diagnostics.export',{eventCount:diagnosticEvents.length});
- const payload={schema:'pnpc.diagnostics.v3',product:'global-sprints',version:DIAG_VERSION,generatedAt:new Date().toISOString(),session:diagnosticSessionId,capabilities:{sdk:!!sdk,extensionStorage:!!storage,workItemApi:!!token},acceptance:diagnosticAcceptance(),events:diagnosticEvents};
- const url=URL.createObjectURL(new Blob([JSON.stringify(payload,null,2)],{type:'application/json'}));const link=document.createElement('a');link.href=url;link.download=`global-sprints-test-session-${DIAG_VERSION}.json`;link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+ const payload={schema:'pnpc.diagnostics.v4',product:'global-sprints',version:DIAG_VERSION,generatedAt:new Date().toISOString(),capabilities:{sdk:!!sdk,extensionStorage:!!storage,workItemApi:!!token},events:diagnosticEvents.map(sanitizedDiagnosticEvent).filter(Boolean)};
+ const url=URL.createObjectURL(new Blob([JSON.stringify(payload,null,2)],{type:'application/json'}));const link=document.createElement('a');link.href=url;link.download=`global-sprints-support-diagnostics-${DIAG_VERSION}.json`;link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
 }
 function clearDiagnostics(){diagnosticEvents=[];try{localStorage.removeItem(DIAG_KEY);}catch(_){}diagnostic('diagnostics.cleared');}
 function startDiagnosticSession(){diagnosticSessionId='session-'+Date.now().toString(36);diagnostic('diagnostics.session_started',{version:DIAG_VERSION});diagnosticCoverage();}
@@ -1121,17 +1257,19 @@ function renderHistory(){
   });details.append(csv);root.append(details);
  }
 }
-$('historyToggle').addEventListener('click',()=>{const panel=$('historyPanel'),show=panel.classList.contains('hidden');panel.classList.toggle('hidden',!show);$('historyToggle').setAttribute('aria-expanded',String(show));if(show){renderHistory();requestAnimationFrame(()=>{panel.scrollIntoView({behavior:'smooth',block:'start'});panel.focus({preventScroll:true});});}});
+// Keep history with its originating Global Sprint card, rather than a distant panel.
+$('historyToggle').closest('.row')?.after($('historyPanel'));
+$('historyToggle').addEventListener('click',()=>{const panel=$('historyPanel'),show=panel.classList.contains('hidden');panel.classList.toggle('hidden',!show);$('historyToggle').setAttribute('aria-expanded',String(show));if(show)renderHistory();});
 
 // Legacy toolbar movement is retired; lane headers own their controls.
 $('configureLane').onclick=()=>{if(!currentSprint())return notify('Select a sprint first.',true);openLaneMappingList();};
 $('downloadDiagnostics').onclick=downloadDiagnostics;
-$('diagnosticStart').onclick=startDiagnosticSession;
+// Sessions remain internal; production users see only support health and exports.
 $('diagnosticClear').onclick=clearDiagnostics;
 initializeMeetingTimePickers();
 $('auditRunButton').onclick=runAutomatedAudit;
 $('auditExportButton').onclick=exportAutomatedAudit;
-try{const parsed=JSON.parse(localStorage.getItem(DIAG_KEY)||'[]');diagnosticEvents=Array.isArray(parsed)?parsed.slice(-DIAG_LIMIT):[];}catch(_){diagnosticEvents=[];}startDiagnosticSession();
+try{const parsed=JSON.parse(localStorage.getItem(DIAG_KEY)||'[]');diagnosticEvents=Array.isArray(parsed)?parsed.slice(-DIAG_LIMIT).map(sanitizedDiagnosticEvent).filter(Boolean):[];}catch(_){diagnosticEvents=[];}startDiagnosticSession();
 window.addEventListener('error',e=>{if(/ResizeObserver loop (limit exceeded|completed with undelivered notifications)/i.test(String(e.message||'')))return;diagnostic('runtime.error',{message:String(e.message).slice(0,250)},'error');});
 window.addEventListener('unhandledrejection',e=>diagnostic('runtime.rejection',{message:String(e.reason?.message||e.reason).slice(0,250)},'error'));
 $('boardMode').onchange=()=>{rememberContext();renderBoard();};$('addLane').onclick=addLane;$('renameLane').onclick=renameLane;$('removeLane').onclick=removeLane;
@@ -1169,7 +1307,7 @@ $('laneSave').onclick=()=>void commitLaneEditor();$('laneCancel').onclick=closeL
 // v0.3.20: tab navigation and sprint-scoped ceremony records.
 let selectedCeremonyId=null;let selectedWorkspaceMeeting=null;let expandedScheduleId=null;let calendarScheduleId=null;
 const CEREMONY_FIELDS=['ceremonyType','ceremonyTitle','ceremonyDate','ceremonyTime','ceremonyDuration','ceremonyParticipants','ceremonySecondary','ceremonyStatus','ceremonyAgenda','ceremonyOutcome'];
-function activateTab(name){diagnostic('ui.tab.opened',{tab:name});
+function activateTab(name){if(ROOM_ENFORCE_PREVIEW&&roomStatus&&!roomStatus.allowed&&['board','planning','reports','demo'].includes(name))name='configuration';diagnostic('ui.tab.opened',{tab:name});
  if(!['board','planning','reports','demo','configuration','support'].includes(name))name='board';
  document.querySelectorAll('.gs-tab').forEach(b=>{const on=b.dataset.tab===name;b.setAttribute('aria-selected',String(on));b.tabIndex=on?0:-1;});
  document.querySelectorAll('.gs-tab-panel').forEach(p=>p.classList.toggle('hidden',p.id!=='tab-'+name));
@@ -1661,6 +1799,8 @@ function openNewSprintDialog(){
  $('newSprintEnd').value=cadenceDate(nextStart,duration*7-1);
  updateNewSprintPreview();
  $('newSprintDialog').classList.remove('hidden');
+ guideShowIntro(false);
+ $('sprintGuideHide').checked=guideHidden();
  $('newSprintName').focus();
 }
 function closeNewSprintDialog(){$('newSprintDialog').classList.add('hidden');}
@@ -1682,17 +1822,32 @@ async function createNewSprintFromDialog(){
  const id=crypto.randomUUID(),goal=$('newSprintGoal').value.trim();
  const ok=await persist(r=>{r.sprints.push({id,workspaceId:activeWorkspaceId,name,start,end,goal,status:'Planning',itemIds:[],snapshots:[]});},false);
  if(!ok)return;
+ const wasGuided=sprintGuideInUse;
  closeNewSprintDialog();
  renderSprintPicker(id);
  await loadAssignedItems();
  rememberContext();
  notify(`Sprint "${name}" created (${start} to ${end}).`);
+ if(wasGuided)guideNext();
 }
 $('headerNewSprint').addEventListener('click',openNewSprintDialog);
 $('newSprintClose').addEventListener('click',closeNewSprintDialog);
 $('newSprintCancel').addEventListener('click',closeNewSprintDialog);
 $('newSprintCreate').addEventListener('click',()=>void createNewSprintFromDialog());
 for(const id of ['newSprintMethod','newSprintStart','newSprintWeeks','newSprintEnd'])$(id).addEventListener('change',updateNewSprintPreview);
+
+// v0.8.3: Lightweight, repeatable guidance; never creates additional records or changes workflow.
+let sprintGuideInUse=false;
+const sprintGuidePref='pnpc-gs-guide-hide-v1';
+function guideHidden(){try{return localStorage.getItem(sprintGuidePref)==='yes';}catch{return false;}}
+function guideShowIntro(on){sprintGuideInUse=on;$('sprintGuideIntro').classList.toggle('hidden',!on);$('sprintUseGuide').setAttribute('aria-expanded',String(on));$('sprintUseGuide').textContent=on?'Hide Guide':'Use Guide';}
+$('sprintUseGuide').addEventListener('click',()=>guideShowIntro(!sprintGuideInUse));
+$('sprintGuideHide').addEventListener('change',e=>{try{if(e.target.checked)localStorage.setItem(sprintGuidePref,'yes');else localStorage.removeItem(sprintGuidePref);}catch{}});
+function guideNext(){const box=$('sprintGuideNext');box.classList.remove('hidden');$('guideNextHint').textContent='You can do both, in either order. The other option stays here until you dismiss this message.';}
+$('guideAddWork').addEventListener('click',()=>{activateTab('board');$('guideNextHint').textContent='Open Sprint Backlog to browse or search work and add items directly. You can still select Plan Ceremonies here later.';const backlog=$('sprintBacklogPanel')||document.querySelector('.sprint-backlog-panel');if(backlog){backlog.open=true;backlog.scrollIntoView({block:'start'});}});
+$('guideCeremonies').addEventListener('click',()=>{activateTab('planning');$('guideNextHint').textContent='Follow Meeting Schedule Setup to create a proposal. You can return here to add work whenever you like.';$('ceremonyAssistant')?.scrollIntoView({block:'start'});});
+$('guideFinish').addEventListener('click',()=>$('sprintGuideNext').classList.add('hidden'));
+
 
 // Synthetic demo data is deliberately isolated from organization storage and ADO mutation APIs.
 const DEMO_KEY='pnpc-gs-demo-v039';
@@ -1942,6 +2097,10 @@ $('m365Connect').addEventListener('click',()=>void m365Connect());
 $('m365Disconnect').addEventListener('click',()=>void m365Disconnect());
 m365ShowAccount();
 m365RenderCalendars();
+
+for(const [id,op] of [['licenseRoomCheck','entitlement'],['licenseRoomTrial','trial'],['licenseRoomActivate','activate']]){
+ if($(id))$(id).addEventListener('click',()=>void checkRoom(op));
+}
 
 init();
 

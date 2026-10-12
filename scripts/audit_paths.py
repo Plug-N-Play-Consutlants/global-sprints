@@ -12,7 +12,7 @@ checks={
  'Automatic progress snapshots': ['async function autoReportObservation','reports.observation.saved'],
  'Microsoft 365 calendar discovery': ['m365RefreshCalendars','https://graph.microsoft.com/v1.0/me/calendars'],
  'Demo recalculation instrumentation': ['demo.ticket.saved','demo.blocker.changed'],
- 'Diagnostic export version': ['global-sprints-test-session-${DIAG_VERSION}.json'],
+ 'Diagnostic export version': ['global-sprints-support-diagnostics-${DIAG_VERSION}.json'],
 }
 results=[]
 for name,needles in checks.items():

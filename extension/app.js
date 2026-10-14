@@ -6,11 +6,11 @@ window.addEventListener('unhandledrejection',event=>{const el=document.getElemen
 const $=id=>document.getElementById(id);
 // PNPC Global Sprints / Product Command Azure DevOps room client.
 // Browser token is passed only to the configured HTTPS Product Command endpoint.
-// Responses are advisory until production identity verification and paid-license
-// integration are exercised. Never cache bearer tokens or license keys.
+// Product Command verifies identity and issues entitlement decisions.
+// Never cache bearer tokens or license keys.
 const ROOM_API='https://plugnplayconsultants.com/wp-json/pnpc-product-command/v1';
 const ALLOWED=new Set(['licensed','trial_active','trial_expired','unlicensed','expired','suspended','revoked']);
-const ROOM_ENFORCE_PREVIEW=true; // UI-level evaluation only; NOT tamper-resistant commercial enforcement.
+const ROOM_ENFORCE_PREVIEW=true; // Client UI gate only. Product Command remains authoritative; client code is not tamper-resistant.
 function normalizeRoomResponse(raw){
  if(!raw||typeof raw!=='object'||!ALLOWED.has(raw.status)||typeof raw.allowed!=='boolean')throw Error('Unexpected licensing service response.');
  if(raw.allowed!==['licensed','trial_active'].includes(raw.status))throw Error('Inconsistent licensing decision.');
@@ -26,8 +26,10 @@ async function roomRequest({operation,organization,token,licenseKey,signal}){
  const response=await fetch(`${ROOM_API}/ado/${operation}`,{method:'POST',mode:'cors',cache:'no-store',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify(body),signal});
  const payload=await response.json().catch(()=>null);
  if(!response.ok){
-  const error=new Error(response.status===503?'Licensing service temporarily unavailable.':response.status===401?'Azure DevOps authentication was not accepted.':response.status===403?'Organization authorization was denied.':(payload?.message||`Licensing request failed (${response.status}).`));
-  error.status=response.status;throw error;
+  const reason=typeof payload?.data?.reason==='string'&&/^[a-z0-9_]{1,80}$/.test(payload.data.reason)?payload.data.reason:null;
+  const base=response.status===503?'Licensing service temporarily unavailable.':response.status===401?'Azure DevOps authentication was not accepted.':response.status===403?'Organization authorization was denied.':(payload?.message||`Licensing request failed (${response.status}).`);
+  const error=new Error(reason?`${base} Diagnostic: ${reason}.`:base);
+  error.status=response.status;error.code=typeof payload?.code==='string'&&/^[a-z0-9_]{1,80}$/.test(payload.code)?payload.code:null;throw error;
  }
  return normalizeRoomResponse(payload);
 }
@@ -44,9 +46,52 @@ let activeWorkspaceId=DEFAULT_WORKSPACE_ID;
 function activeWorkspace(){return registry?.workspaces?.find(w=>w.id===activeWorkspaceId);}
 function workspaceSprints(){return (registry?.sprints||[]).filter(s=>s.workspaceId===activeWorkspaceId);}
 function workspaceProjectIds(){return activeWorkspace()?.projectIds||[];}
-// License-room requests are opt-in during integration testing. No commercial
-// enforcement is enabled until the server and browser token flows are verified.
+// Access is restricted until the licensing service returns a verified entitlement.
+// A transient error retains only the last decision verified during this page session.
 let roomStatus=null,roomBusy=false,roomCheckPending=false;
+const ROOM_CACHE_PREFIX='pnpc-gs-verified-entitlement-v1:';
+const ROOM_REQUEST_TIMEOUT_MS=12000;
+const ROOM_RETRY_MIN_MS=60000;
+const ROOM_RETRY_MAX_MS=15*60000;
+let roomRetryTimer=null,roomRetryDelay=ROOM_RETRY_MIN_MS;
+function roomCacheKey(){
+ const host=sdk?.getHost?.();
+ const id=String(host?.id||'').toLowerCase();
+ const name=roomOrganization().toLowerCase();
+ // The stable host GUID prevents reusing a cached decision for a renamed or unrelated organization.
+ if(!/^[0-9a-f]{8}-[0-9a-f-]{27,}$/.test(id)||!name)return null;
+ return ROOM_CACHE_PREFIX+id+':'+name;
+}
+function roomStoreVerified(result){
+ const key=roomCacheKey();if(!key)return;
+ try{localStorage.setItem(key,JSON.stringify({schema:1,organizationId:String(sdk.getHost().id).toLowerCase(),organization:roomOrganization().toLowerCase(),decision:result,verifiedAt:new Date().toISOString()}));}
+ catch(error){diagnostic('licensing.cache.write_failed',{reason:String(error?.name||'storage')},'warn');}
+}
+function roomRestoreVerified(){
+ const key=roomCacheKey();if(!key)return false;
+ try{
+  const raw=localStorage.getItem(key);if(!raw)return false;
+  const saved=JSON.parse(raw);
+  if(saved.schema!==1||saved.organizationId!==String(sdk.getHost().id).toLowerCase()||saved.organization!==roomOrganization().toLowerCase())return false;
+  const result=normalizeRoomResponse(saved.decision);
+  // A previously verified trial has a known end date; an outage must not extend it indefinitely.
+  if(result.status==='trial_active'&&result.expiresAt&&Date.parse(result.expiresAt)<=Date.now()){
+   roomStatus={...result,status:'trial_expired',allowed:false};
+  }else roomStatus=result;
+  diagnostic('licensing.cache.restored',{status:roomStatus.status,allowed:roomStatus.allowed});
+  return true;
+ }catch(error){diagnostic('licensing.cache.invalid',{reason:String(error?.name||'invalid')},'warn');return false;}
+}
+function roomScheduleRetry(){
+ if(roomRetryTimer)return;
+ roomRetryTimer=setTimeout(()=>{roomRetryTimer=null;if(!roomBusy&&token&&roomOrganization())void checkRoom('entitlement');},roomRetryDelay);
+ roomRetryDelay=Math.min(roomRetryDelay*2,ROOM_RETRY_MAX_MS);
+}
+function roomClearRetry(){if(roomRetryTimer){clearTimeout(roomRetryTimer);roomRetryTimer=null;}roomRetryDelay=ROOM_RETRY_MIN_MS;}
+function roomAccessAllowed(){
+ if(!roomStatus?.allowed)return false;
+ return !(roomStatus.status==='trial_active'&&roomStatus.expiresAt&&Date.parse(roomStatus.expiresAt)<=Date.now());
+}
 function roomReadableStatus(){
  if(!roomStatus)return 'Entitlement not checked';
  const names={licensed:'Licensed',trial_active:'Trial active',trial_expired:'Trial expired',unlicensed:'Not licensed',expired:'License expired',suspended:'License suspended',revoked:'License revoked'};
@@ -54,7 +99,7 @@ function roomReadableStatus(){
  return `${names[roomStatus.status]||roomStatus.status}${when}`;
 }
 function renderRoomAccess(){
- const denied=ROOM_ENFORCE_PREVIEW&&roomStatus&&!roomStatus.allowed;
+ const denied=ROOM_ENFORCE_PREVIEW&&!roomAccessAllowed();
  const banner=$('licenseAccessNotice');if(banner){banner.classList.toggle('hidden',!denied);banner.textContent=denied?`${roomReadableStatus()}. Global Sprints work areas are unavailable until a trial or paid license is active. Existing sprint data is retained. Open Configuration to manage licensing.`:'';}
  for(const name of ['board','planning','reports','demo']){
   const panel=$('tab-'+name);if(panel){panel.inert=!!denied;panel.setAttribute('aria-disabled',String(!!denied));}
@@ -64,7 +109,13 @@ function renderRoomAccess(){
   const restricted=['board','planning','reports','demo'].includes(b.dataset.tab);
   b.disabled=!!denied&&restricted;
  }
- if(denied){activateTab('configuration');}
+ if(denied){
+  // Licensing is checked asynchronously. Do not persist Configuration as the user's
+  // requested tab while entitlement is unresolved.
+  showTab('configuration',false);
+ }else if(pendingAuthorizedTab){
+  const target=pendingAuthorizedTab;pendingAuthorizedTab=null;showTab(target,false);
+ }
 }
 
 function roomOrganization(){
@@ -73,6 +124,12 @@ function roomOrganization(){
  return /^[A-Za-z0-9][A-Za-z0-9-]{0,99}$/.test(name)?name:'';
 }
 function renderRoomStatus(message){
+ const trialButton=$('licenseRoomTrial');
+ if(trialButton){
+  const trialAvailable=roomStatus?.status==='unlicensed';
+  trialButton.classList.toggle('hidden',!trialAvailable);
+  trialButton.setAttribute('aria-hidden',String(!trialAvailable));
+ }
  const node=$('licenseRoomStatus');if(!node)return;
  node.textContent=message||(roomStatus?`Organization entitlement: ${roomReadableStatus()}.`:'Entitlement has not yet been checked.');
  renderRoomAccess();
@@ -84,26 +141,39 @@ async function checkRoom(operation='entitlement'){
  if(!token)return renderRoomStatus('Azure DevOps access token unavailable.');
  const key=operation==='activate'?$('licenseRoomKey')?.value.trim():undefined;
  if(operation==='activate'&&!key)return renderRoomStatus('Enter a license key to activate.');
+ if(operation==='trial'&&roomStatus&&roomStatus.status!=='unlicensed')return renderRoomStatus('A trial cannot be started from the current entitlement state. '+roomReadableStatus()+'.');
  if(operation==='trial'&&!confirm('Start the 14-day organization-wide Global Sprints trial? This cannot be restarted.'))return;
  roomBusy=true;
  for(const id of ['licenseRoomCheck','licenseRoomTrial','licenseRoomActivate'])if($(id))$(id).disabled=true;
  renderRoomStatus('Contacting Product Command licensing service…');
  try{
-  const result=await roomRequest({operation,organization,token,licenseKey:key});
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),ROOM_REQUEST_TIMEOUT_MS);
+  let result;
+  try{result=await roomRequest({operation,organization,token,licenseKey:key,signal:controller.signal});}
+  finally{clearTimeout(timeout);}
+  roomClearRetry();
   roomStatus=result;
+  roomStoreVerified(result);
+  // An explicit denial may be a short-lived administrator simulation. Recheck without blocking the UI.
+  if(operation==='entitlement'&&!result.allowed)roomScheduleRetry();
   if($('licenseRoomKey'))$('licenseRoomKey').value='';
   renderRoomStatus();
   diagnostic('licensing.room.checked',{operation,status:result.status,allowed:result.allowed});
  }catch(error){
   // A transient service failure must not be confused with an unlicensed decision.
   // Retain the last verified decision, if one exists.
-  renderRoomStatus(`Licensing check failed: ${error.message} ${roomStatus?'Last verified status: '+roomReadableStatus()+'.':'No verified entitlement is available. Access remains available in this integration preview.'}`);
-  diagnostic('licensing.room.unavailable',{operation,status:error.status||'network'},'warn');
+  renderRoomStatus(`Licensing check failed: ${error.name==='AbortError'?'Request timed out.':error.message} ${roomStatus?'Last verified status: '+roomReadableStatus()+'. Service will retry automatically.':'No verified entitlement is available. Work areas remain restricted until verification succeeds.'}`);
+  if(operation==='entitlement')roomScheduleRetry();
+  diagnostic('licensing.room.unavailable',{operation,status:error.status||'network',code:error.code||'unavailable'},'warn');
  }finally{
   roomBusy=false;
   for(const id of ['licenseRoomCheck','licenseRoomTrial','licenseRoomActivate'])if($(id))$(id).disabled=false;
  }
 }
+// Opportunistic recovery in addition to bounded backoff; no blocking startup request.
+window.addEventListener('online',()=>{if(token&&!roomBusy)void checkRoom('entitlement');});
+window.addEventListener('focus',()=>{if(token&&!roomBusy&&roomRetryTimer)void checkRoom('entitlement');});
 function workspaceLabel(){const w=activeWorkspace();return w?`${w.projectIds.length} project(s) · ${workspaceSprints().length} sprint(s)`:'';}
 function renderWorkspacePicker(preferred){
  const picker=$('workspacePicker');const selected=preferred||activeWorkspaceId;
@@ -369,7 +439,7 @@ async function init(){try{
   sdk.notifyLoadSucceeded();notify('Connecting to organization data…');
   // Session recovery is independent of Azure DevOps data initialization.
   void m365RestoreSession();
-  token=await sdk.getAccessToken();if(!token)throw Error('Azure DevOps did not provide an access token.');renderRoomStatus();void checkRoom('entitlement');
+  token=await sdk.getAccessToken();if(!token)throw Error('Azure DevOps did not provide an access token.');roomRestoreVerified();renderRoomStatus();void checkRoom('entitlement');
   const service=await sdk.getService('ms.vss-features.extension-data-service');storage=await service.getExtensionDataManager(sdk.getExtensionContext().id,token);
   try{registry=await storage.getDocument(COLLECTION,ROOT);}catch(e){if(e.status!==404 && !/404|not found/i.test(String(e.message)))throw e;registry={id:ROOT,sprints:[]};}
   await loadProjects();
@@ -456,12 +526,23 @@ async function saveSprint(){
  if(ok){renderSprintPicker(id);syncPlanScope();await loadAssignedItems();notify(`Sprint "${name}" saved successfully.`);}
  return ok;
 }
+// Sprint selection is personal UI context; sprint membership and execution are shared.
+// Always reload the organization registry before switching to another member's sprint.
+async function refreshSharedRegistryForExecution(){
+ const latest=await storage.getDocument(COLLECTION,ROOT);
+ if(!latest||!Array.isArray(latest.sprints)||!Array.isArray(latest.workspaces))throw Error('Shared workspace data is unavailable. No local assignments were changed.');
+ registry=latest;
+ return latest;
+}
 async function switchSprint(){
  if(switchingSprint)return;switchingSprint=true;
  const destination=$('sprintPicker').value;
  $('sprintPicker').value=activeSprintId;
  try{if(!(await guardSprint())){notify('Sprint switch cancelled.');return;}
- $('sprintPicker').value=destination;activeSprintId=destination;renderSprintFields();syncPlanScope();rememberContext();await loadAssignedItems();notify(destination?'Sprint opened.':'Sprint selection cleared.');}
+ await refreshSharedRegistryForExecution();
+ if(destination&&!workspaceSprints().some(s=>s.id===destination))throw Error('That sprint is no longer available in this workspace. Refresh the workspace selection.');
+ $('sprintPicker').value=destination;activeSprintId=destination;renderSprintFields();syncPlanScope();rememberContext();await loadAssignedItems();notify(destination?'Sprint opened with current shared assignments.':'Sprint selection cleared.');
+ }catch(e){$('sprintPicker').value=activeSprintId;notify('Unable to open shared sprint: '+e.message,true);}
  finally{switchingSprint=false;}
 }
 async function toggleProjectManager(){
@@ -571,7 +652,7 @@ async function enrichHierarchy(found,sequence){
  }
  ancestorItems=contextual;
 }
-function normalizeItem(x){const f=x.fields||{};return {id:x.id,rev:x.rev,project:f['System.TeamProject'],title:f['System.Title']||'',state:f['System.State']||'',type:f['System.WorkItemType']||'',assignee:f['System.AssignedTo']?.displayName||'Unassigned',assigneeIdentity:f['System.AssignedTo']?.uniqueName||'',priority:f['Microsoft.VSTS.Common.Priority']??null,effort:f['Microsoft.VSTS.Scheduling.StoryPoints']??f['Microsoft.VSTS.Scheduling.Effort']??null,effortField:f['Microsoft.VSTS.Scheduling.StoryPoints']!==undefined?'Microsoft.VSTS.Scheduling.StoryPoints':f['Microsoft.VSTS.Scheduling.Effort']!==undefined?'Microsoft.VSTS.Scheduling.Effort':null,startDate:String(f['Microsoft.VSTS.Scheduling.StartDate']||'').slice(0,10),targetDate:String(f['Microsoft.VSTS.Scheduling.TargetDate']||'').slice(0,10),dueDate:String(f['Microsoft.VSTS.Scheduling.DueDate']||'').slice(0,10),changedDate:f['System.ChangedDate']||'',url:x._links?.html?.href||''};}
+function normalizeItem(x){const f=x.fields||{};return {id:x.id,rev:x.rev,project:f['System.TeamProject'],title:f['System.Title']||'',state:f['System.State']||'',type:f['System.WorkItemType']||'',assignee:f['System.AssignedTo']?.displayName||'Unassigned',assigneeIdentity:f['System.AssignedTo']?.uniqueName||'',priority:f['Microsoft.VSTS.Common.Priority']??null,effort:f['Microsoft.VSTS.Scheduling.StoryPoints']??f['Microsoft.VSTS.Scheduling.Effort']??null,storyPoints:f['Microsoft.VSTS.Scheduling.StoryPoints']??null,effortField:f['Microsoft.VSTS.Scheduling.StoryPoints']!==undefined?'Microsoft.VSTS.Scheduling.StoryPoints':f['Microsoft.VSTS.Scheduling.Effort']!==undefined?'Microsoft.VSTS.Scheduling.Effort':null,startDate:String(f['Microsoft.VSTS.Scheduling.StartDate']||'').slice(0,10),targetDate:String(f['Microsoft.VSTS.Scheduling.TargetDate']||'').slice(0,10),dueDate:String(f['Microsoft.VSTS.Scheduling.DueDate']||'').slice(0,10),description:f['System.Description']||'',acceptanceCriteria:f['Microsoft.VSTS.Common.AcceptanceCriteria']??null,changedDate:f['System.ChangedDate']||'',url:x._links?.html?.href||''};}
 function currentSprint(){return registry?.sprints.find(x=>x.id===$('sprintPicker').value);}
 // Planning drafts are workspace-owned snapshots of Global Sprints coordination only.
 // They never write work item states or iteration paths back to Azure DevOps.
@@ -648,7 +729,7 @@ const LANE_PRESETS={'Backlog / Planned':'To Do','Ready to Start':'To Do','Active
 const LANE_CATEGORIES=['To Do','In Progress','Done','Closed'];
 let diagnosticEvents=[];const DIAG_KEY='pnpc-global-sprints-diagnostics-v2';
 const DIAG_LIMIT=600;
-const DIAG_VERSION='0.9.0';
+const DIAG_VERSION='0.9.16';
 let diagnosticSessionId='';
 // Production diagnostic payloads are deliberately numeric/boolean or finite enums.
 // Free-form strings (including messages and exception text) must never be exported.
@@ -758,21 +839,16 @@ function auditRender(){
 }
 
 // Outlook-familiar meeting time picker: readable 12-hour options, canonical HH:mm values.
-function populateMeetingTimePicker(select, selected='09:30'){
- const prior=String(selected||'09:30');select.replaceChildren();
- for(let minutes=0;minutes<1440;minutes+=15){
-  const hour=Math.floor(minutes/60),minute=minutes%60;
-  const value=String(hour).padStart(2,'0')+':'+String(minute).padStart(2,'0');
-  const label=String(hour%12||12)+':'+String(minute).padStart(2,'0')+' '+(hour<12?'AM':'PM');
-  select.add(new Option(label,value));
- }
- // Preserve unusual existing meeting times instead of silently rounding them.
- if(/^([01]\d|2[0-3]):[0-5]\d$/.test(prior)&&![...select.options].some(o=>o.value===prior)){
-  const [hh,mm]=prior.split(':').map(Number);select.add(new Option(`${hh%12||12}:${String(mm).padStart(2,'0')} ${hh<12?'AM':'PM'} (custom)`,prior));
- }
- select.value=prior;
+function populateMeetingTimePicker(input,selected='09:30'){
+ // Native time input supports any minute; datalist provides quick quarter-hour choices.
+ const value=String(selected||'09:30');
+ input.value=/^([01]\d|2[0-3]):[0-5]\d$/.test(value)?value:'09:30';
 }
-function initializeMeetingTimePickers(){for(const id of ['planTime','ceremonyTime']){const element=$(id);if(element)populateMeetingTimePicker(element,element.value||'09:30');}}
+function initializeMeetingTimePickers(){
+ for(const id of ['planTime','ceremonyTime']){
+  const input=$(id);if(input)populateMeetingTimePicker(input,input.value||'09:30');
+ }
+}
 
 async function runAutomatedAudit(){
  installActionHelp();
@@ -885,6 +961,13 @@ async function setSprintBlocked(id,blocked){
 async function saveLanes(change,message){
  const id=currentSprint()?.id;
  if(!id){notify('Select a sprint before changing lanes.',true);return false;}
+ // Refresh only the shared registry, not the board's current selection or scroll position.
+ // This prevents a colleague's unrelated save from blocking a normal execution move.
+ try{await refreshSharedRegistryForExecution();}
+ catch(e){notify('Cannot update shared swimlane: '+e.message,true);return false;}
+ if(!registry.sprints.some(s=>s.id===id&&s.workspaceId===activeWorkspaceId)){
+  notify('This sprint is no longer available in the selected workspace.',true);return false;
+ }
  const ok=await persist(r=>{
   const sprint=r.sprints.find(s=>s.id===id);
   if(!sprint)throw new Error('Sprint no longer exists.');
@@ -991,7 +1074,7 @@ function workflowCategory(w,state=w.state){
 async function getStates(w){const key=workflowKey(w);if(workflowStates.has(key))return workflowStates.get(key);
  const result=await api(`/${encodeURIComponent(w.project)}/_apis/wit/workitemtypes/${encodeURIComponent(w.type)}/states?api-version=7.1`);
  const entries=result.value||[];const states=entries.map(x=>x.name);
- const mapping=new Map();const categoryMap={proposed:'To Do',inprogress:'In Progress',resolved:'Done',completed:'Closed'};
+ const mapping=new Map();const categoryMap={proposed:'To Do',inprogress:'In Progress',resolved:'Done',completed:'Done'};
  for(const entry of entries){const label=String(entry.name||'').trim().toLowerCase();if(!label)continue;
   const category=String(entry.category||'').toLowerCase();const normalized=categoryMap[category]||WORKFLOW_MAP[label];
   if(normalized)mapping.set(label,normalized);
@@ -1016,7 +1099,7 @@ const WORKFLOW_COLUMNS=['To Do','In Progress','Done','Closed'];
 const WORKFLOW_MAP={
  'to do':'To Do','new':'To Do','proposed':'To Do','approved':'To Do',
  'in progress':'In Progress','active':'In Progress','committed':'In Progress','doing':'In Progress',
- 'done':'Done','resolved':'Done','development complete':'Done',
+ 'done':'Done','resolved':'Done','completed':'Done','development complete':'Done',
  'closed':'Closed','accepted':'Closed','tested and approved':'Closed'
 };
 function isRemoved(w){return ['removed','cut','cancelled','canceled'].includes((w.state||'').toLowerCase());}
@@ -1037,7 +1120,7 @@ async function updateWorkItemState(w,next){
    body:JSON.stringify([{op:'test',path:'/rev',value:w.rev},{op:'add',path:'/fields/System.State',value:next}])
   });
   for(const item of [w,...assignedItems,...items])if(item.id===w.id){item.state=result.fields['System.State'];item.rev=result.rev;}
-  diagnostic('ado.state_update.success',{workItemId:w.id,revisionBefore,revisionAfter:result.rev,toState:result.fields['System.State'],revisionAdvanced:Number(result.rev)>Number(revisionBefore)});renderBoard();renderSprintHealth();renderTimeline();notify(`Updated #${w.id} to ${result.fields['System.State']} in Azure DevOps.`);
+  diagnostic('ado.state_update.success',{workItemId:w.id,revisionBefore,revisionAfter:result.rev,toState:result.fields['System.State'],revisionAdvanced:Number(result.rev)>Number(revisionBefore)});renderBoard();renderSprintHealth();renderTimeline();void autoReportObservation(currentSprint(),reportWork());notify(`Updated #${w.id} to ${result.fields['System.State']} in Azure DevOps.`);
   return true;
  }catch(e){diagnostic('ado.state_update.failure',{workItemId:w.id,reason:String(e.message||e)},'error');notify(`State update rejected for #${w.id}: ${e.message}`,true);return false;}
 }
@@ -1050,9 +1133,56 @@ async function destinationState(w,column){
  const rank=x=>{const i=preferred[column].findIndex(v=>v.toLowerCase()===x.toLowerCase());return i<0?999:i;};return candidates.sort((x,y)=>rank(x)-rank(y))[0];
 }
 const isPlanningContextType=w=>/^(epic|feature)$/i.test((w.type||'').trim());
+// Board detail stays in the extension. Only the explicit external link leaves this view.
+async function openBoardItemDetail(w){
+ let dialog=document.getElementById('gs-board-item-dialog');
+ if(!dialog){dialog=document.createElement('dialog');dialog.id='gs-board-item-dialog';document.body.append(dialog);}
+ dialog.className='gs-ticket-dialog';dialog.replaceChildren();
+ const el=(tag,cls,text)=>{const n=document.createElement(tag);if(cls)n.className=cls;if(text!==undefined)n.textContent=text;return n;};
+ const head=el('header','gs-ticket-header');const heading=el('div');heading.append(el('small','gs-ticket-eyebrow',w.project+' · '+w.type+' · #'+w.id),el('h2','',w.title));const close=el('button','secondary','Close');close.type='button';close.onclick=()=>dialog.close();head.append(heading,close);dialog.append(head);
+ const form=el('form','gs-ticket-form');form.addEventListener('submit',event=>event.preventDefault());
+ const grid=el('div','gs-ticket-grid');const field=(label,control)=>{const wrap=el('label','gs-ticket-field');wrap.append(el('span','',label),control);grid.append(wrap);return control;};
+ const title=field('Title',el('input'));title.value=w.title;title.required=true;
+ const state=field('Azure DevOps state',el('select'));state.add(new Option(w.state,w.state));
+ const assignee=field('Assigned to (email or identity)',el('input'));assignee.value=w.assigneeIdentity|| (w.assignee==='Unassigned'?'':w.assignee);assignee.placeholder='Name or email';
+ const effort=field('Effort / Story Points',el('input'));effort.type='number';effort.min='0';effort.step='any';effort.value=w.effort??'';
+ const detailSection=el('section','gs-ticket-rich-fields');
+ detailSection.append(el('h3','','Planning details'));
+ const richField=(label,value)=>{const wrapper=el('label','gs-ticket-field gs-ticket-rich-field');wrapper.append(el('span','',label));const area=el('textarea');area.rows=5;area.value=value||'';wrapper.append(area);detailSection.append(wrapper);return area;};
+ // Azure DevOps stores these fields as HTML. Render an editable text representation
+ // and escape on save rather than sending raw user-provided HTML.
+ const plainText=html=>new DOMParser().parseFromString(String(html||''),'text/html').body.textContent||'';
+ const htmlText=value=>String(value).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/\n/g,'<br>');
+ const description=richField('Description',plainText(w.description));
+ const criteria=richField('Acceptance Criteria',plainText(w.acceptanceCriteria));
+ detailSection.append(el('small','gs-ticket-help','Editing these text fields replaces their existing rich-text formatting. Unchanged fields retain their original formatting.')); 
+ const estimateHelp=el('small','gs-ticket-help','Uses the estimation field supported by this work-item type.');grid.append(estimateHelp);
+ const info=el('p','gs-ticket-help','Changes are saved to Azure DevOps. Sprint membership and swimlanes are managed on the board.');
+ const feedback=el('p','gs-ticket-feedback');feedback.setAttribute('role','status');
+ const actions=el('div','gs-ticket-actions');const link=el('a','gs-ticket-external','Open in Azure DevOps ↗');link.href=w.url||`${organizationApiBase()}/${encodeURIComponent(w.project)}/_workitems/edit/${w.id}`;link.target='_blank';link.rel='noopener noreferrer';const save=el('button','','Save Changes');save.type='submit';actions.append(link,save);
+ form.append(grid,detailSection,info,feedback,actions);dialog.append(form);
+ const comments=el('section','gs-ticket-comments');comments.append(el('h3','','Comments'));const history=el('div','gs-ticket-comment-history','Loading comments…');const comment=el('textarea');comment.rows=3;comment.placeholder='Add a comment to this work item';comment.setAttribute('aria-label','New work item comment');const send=el('button','secondary','Add Comment');send.type='button';comments.append(history,comment,send);dialog.append(comments);
+ if(!dialog.open)dialog.showModal();
+ try{const states=await getStates(w);state.replaceChildren(...states.map(v=>new Option(v,v)));state.value=w.state;}catch(e){feedback.textContent='Could not load valid states: '+e.message;}
+ let estimateField=w.effortField;
+ if(!estimateField){try{const type=await api(`/${encodeURIComponent(w.project)}/_apis/wit/workitemtypes/${encodeURIComponent(w.type)}?api-version=7.1`);const fields=(type.fieldInstances||type.fields||[]).map(x=>x.referenceName||x.field?.referenceName);estimateField=fields.includes('Microsoft.VSTS.Scheduling.StoryPoints')?'Microsoft.VSTS.Scheduling.StoryPoints':fields.includes('Microsoft.VSTS.Scheduling.Effort')?'Microsoft.VSTS.Scheduling.Effort':null;}catch{} }
+ if(!estimateField){effort.disabled=true;estimateHelp.textContent='No supported Effort or Story Points field found. Open Azure DevOps to configure estimates.';}
+ // Not every ADO work-item type exposes Acceptance Criteria. Query field metadata
+ // instead of attempting a write that the process would reject.
+ try{const type=await api(`/${encodeURIComponent(w.project)}/_apis/wit/workitemtypes/${encodeURIComponent(w.type)}?api-version=7.1`);const names=(type.fieldInstances||type.fields||[]).map(x=>x.referenceName||x.field?.referenceName);if(!names.includes('Microsoft.VSTS.Common.AcceptanceCriteria')){criteria.disabled=true;criteria.closest('label').querySelector('span').textContent='Acceptance Criteria (not available for this work-item type)';}}catch{if(w.acceptanceCriteria===null){criteria.disabled=true;}}
+ 
+ const loadComments=async()=>{try{const r=await api(`/${encodeURIComponent(w.project)}/_apis/wit/workItems/${w.id}/comments?api-version=7.1-preview.4`);history.replaceChildren();for(const c of (r.comments||[]).slice(-25)){const row=el('div','gs-ticket-comment');row.append(el('strong','',c.createdBy?.displayName||'Team member'),el('p','',String(c.text||'').replace(/<[^>]*>/g,'')));history.append(row);}if(!history.children.length)history.textContent='No comments yet.';}catch(e){history.textContent='Comments unavailable: '+e.message;}};
+ void loadComments();
+ send.onclick=async()=>{if(!comment.value.trim())return;send.disabled=true;try{await api(`/${encodeURIComponent(w.project)}/_apis/wit/workItems/${w.id}/comments?api-version=7.1-preview.4`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:comment.value.trim()})});comment.value='';feedback.textContent='Comment added.';await loadComments();}catch(e){feedback.textContent='Comment was not saved: '+e.message;}finally{send.disabled=false;}};
+ form.onsubmit=async event=>{event.preventDefault();const changes=[];const put=(name,value)=>changes.push({op:'add',path:'/fields/'+name,value});if(title.value.trim()!==w.title)put('System.Title',title.value.trim());
+ if(description.value!==plainText(w.description))put('System.Description',htmlText(description.value));
+ if(!criteria.disabled&&criteria.value!==plainText(w.acceptanceCriteria))put('Microsoft.VSTS.Common.AcceptanceCriteria',htmlText(criteria.value));if(state.value!==w.state)put('System.State',state.value);if(assignee.value.trim()!==(w.assigneeIdentity|| (w.assignee==='Unassigned'?'':w.assignee)))put('System.AssignedTo',assignee.value.trim());if(estimateField&&String(effort.value)!==String(w.effort??'')){if(effort.value!==''&&(!Number.isFinite(Number(effort.value))||Number(effort.value)<0)){feedback.textContent='Estimate must be zero or greater.';return;}changes.push(effort.value===''?{op:'remove',path:'/fields/'+estimateField}:{op:'add',path:'/fields/'+estimateField,value:Number(effort.value)});}
+ if(!changes.length){feedback.textContent='No changes to save.';return;}save.disabled=true;try{const result=await api(`/_apis/wit/workitems/${w.id}?api-version=7.1`,{method:'PATCH',headers:{'Content-Type':'application/json-patch+json'},body:JSON.stringify([{op:'test',path:'/rev',value:w.rev},...changes])});const fresh=normalizeItem(result);for(const item of [w,...items,...assignedItems,...ancestorItems])if(Number(item.id)===Number(w.id))Object.assign(item,fresh);renderBoard();renderSprintHealth();renderTimeline();void autoReportObservation(currentSprint(),reportWork());feedback.textContent='Saved to Azure DevOps.';heading.querySelector('h2').textContent=fresh.title;}catch(e){feedback.textContent='Save failed: '+e.message;}finally{save.disabled=false;}};
+}
+
 function workItemCard(w){
  const card=document.createElement('div');card.className='ticket hybrid-ticket'+(w.contextOnly||isPlanningContextType(w)?' context-item':'');
- const heading=document.createElement('div');heading.className='hybrid-title';heading.append(workItemLink(w));
+ const heading=document.createElement('div');heading.className='hybrid-title';const detailsButton=document.createElement('button');detailsButton.type='button';detailsButton.className='gs-board-detail-trigger';detailsButton.textContent=`#${w.id} · ${w.title}`;detailsButton.setAttribute('aria-label',`View work item #${w.id} details`);detailsButton.onclick=()=>openBoardItemDetail(w);heading.append(detailsButton);
  const meta=document.createElement('small');meta.textContent=`${w.project} · ${w.type||'Work item'} · ${w.assignee}`;
  const status=document.createElement('small');status.textContent=`State: ${w.state||'Unknown'}`;
  card.append(heading,meta,status);if(isSprintBlocked(w.id))card.classList.add('sprint-blocked');if(compactMode())card.classList.add('compact-card');
@@ -1179,7 +1309,7 @@ function renderHybridBoard(){
 }
 function renderBoard(){renderHybridBoard();}
 async function changeState(w,state){await updateWorkItemState(w,state);renderBacklog();renderBoard();}
-async function capture(){let s;try{s=requireSprint();}catch(e){return notify(e.message,true);}const missing=s.itemIds.filter(id=>![...items,...assignedItems].some(w=>w.id===id));if(missing.length)return notify(`Load all committed work items before capturing a baseline. ${missing.length} item(s) are not currently loaded.`,true);const snapshot={at:new Date().toISOString(),items:s.itemIds.map(id=>{const w=[...items,...assignedItems].find(x=>x.id===id);return {id,project:w.project,title:w.title,state:w.state};})};const ok=await persist(r=>{r.sprints.find(x=>x.id===s.id).snapshots.push(snapshot);});if(ok){renderHistory();notify(`Commitment baseline captured with ${snapshot.items.length} work items at ${new Date(snapshot.at).toLocaleString()}. Open History Record to inspect it.`);}}
+async function capture(){let s;try{s=requireSprint();}catch(e){return notify(e.message,true);}const missing=s.itemIds.filter(id=>![...items,...assignedItems].some(w=>w.id===id));if(missing.length)return notify(`Load all committed work items before capturing a baseline. ${missing.length} item(s) are not currently loaded.`,true);const snapshot={at:new Date().toISOString(),items:s.itemIds.map(id=>{const w=[...items,...assignedItems].find(x=>x.id===id);return {id,project:w.project,title:w.title,type:w.type,state:w.state,effort:w.effort,storyPoints:w.storyPoints};})};const ok=await persist(r=>{r.sprints.find(x=>x.id===s.id).snapshots.push(snapshot);});if(ok){renderHistory();notify(`Commitment baseline captured with ${snapshot.items.length} work items at ${new Date(snapshot.at).toLocaleString()}. Open History Record to inspect it.`);}}
 
 // Advisory sprint-readiness checks. No mutations, enforced cadence, or new persisted schema.
 function renderGuidance(){
@@ -1306,21 +1436,171 @@ $('laneSave').onclick=()=>void commitLaneEditor();$('laneCancel').onclick=closeL
 
 // v0.3.20: tab navigation and sprint-scoped ceremony records.
 let selectedCeremonyId=null;let selectedWorkspaceMeeting=null;let expandedScheduleId=null;let calendarScheduleId=null;
+// Optional relevant-people suggestions. People.Read does not grant access to mailbox contents.
+// The Microsoft Search person endpoint requires broader Mail.Read consent; do not request it for autocomplete.
+let peopleLookupEnabled=false,peopleLookupTimer=null,peopleLookupSerial=0;
+const PEOPLE_LOOKUP_PREF='pnpc-gs-people-suggestions-v1';
+function peopleLookupPreferenceKey(){
+ const account=m365Account?.homeAccountId||m365Account?.username;
+ return account?PEOPLE_LOOKUP_PREF+':'+String(account).toLowerCase():null;
+}
+function peopleLookupSetUI(message=''){
+ const button=$('contactLookupEnable');
+ if(button){button.textContent=peopleLookupEnabled?'Remove Permissions':'Enable Outlook Recipient Suggestions';
+  button.setAttribute('aria-pressed',String(peopleLookupEnabled));}
+ if(message)peopleLookupClear(message);
+}
+function peopleLookupClear(message=''){
+ const results=$('contactLookupResults');if(results){results.replaceChildren();results.hidden=true;}
+ if(message)$('contactLookupStatus').textContent=message;
+}
+function peopleLookupTerm(){
+ const input=$('ceremonyParticipants');const part=(input?.value||'').split(/[,;\n]/).pop().trim();
+ return part.length>=2?part:'';
+}
+async function peopleLookupRestore(){
+ peopleLookupEnabled=false;++peopleLookupSerial;
+ const key=peopleLookupPreferenceKey();
+ try{
+  if(key&&localStorage.getItem(key)==='enabled'){
+   await m365Client.acquireTokenSilent({account:m365Account,scopes:['People.Read']});
+   peopleLookupEnabled=true;
+  }
+ }catch(e){diagnostic('m365.people.silent_unavailable',{message:String(e.message||e)},'warn');}
+ peopleLookupSetUI(peopleLookupEnabled?'Recipient suggestions ready.':'Enable suggestions to look up people from Microsoft 365.');
+}
+async function peopleLookupEnable(){
+ if(!m365Client||!m365Account){peopleLookupClear('Connect Microsoft 365 in Configuration first.');return;}
+ const button=$('contactLookupEnable');button.disabled=true;
+ try{
+  const key=peopleLookupPreferenceKey();
+  if(peopleLookupEnabled){
+   // This disables this application's feature and removes its saved preference.
+   // Microsoft tenant/account consent is managed separately in Microsoft account settings.
+   if(key)localStorage.removeItem(key);
+   peopleLookupEnabled=false;++peopleLookupSerial;
+   peopleLookupSetUI('Recipient suggestions disabled locally. To revoke Microsoft consent, manage app permissions in your Microsoft account or tenant.');
+  }else{
+   await m365Client.acquireTokenPopup({account:m365Account,scopes:['People.Read']});
+   peopleLookupEnabled=true;
+   if(key)localStorage.setItem(key,'enabled');
+   peopleLookupSetUI('Recipient suggestions enabled. Type at least two characters.');
+   void peopleLookupSearch();
+  }
+ }catch(e){peopleLookupClear('Recipient suggestions could not be changed. Manual email entry remains available.');}
+ finally{button.disabled=false;}
+}
+async function peopleLookupSearch(){
+ const term=peopleLookupTerm(),seq=++peopleLookupSerial;
+ if(!peopleLookupEnabled||!m365Account||term.length<2){peopleLookupClear(peopleLookupEnabled?'Type at least two characters of a name or email.':'Manual email entry remains available.');return;}
+ $('contactLookupStatus').textContent='Searching relevant people from your Microsoft 365 account…';
+ try{
+  const token=(await m365Client.acquireTokenSilent({account:m365Account,scopes:['People.Read']})).accessToken;
+  const params=new URLSearchParams({'$search':'"'+term.replace(/"/g,'')+'"','$top':'15'});
+  const response=await fetch('https://graph.microsoft.com/v1.0/me/people?'+params.toString(),{headers:{Authorization:'Bearer '+token,Accept:'application/json'}});
+  if(!response.ok)throw Error('Microsoft Graph people request failed ('+response.status+').');
+  const data=await response.json();if(seq!==peopleLookupSerial)return;
+  const results=$('contactLookupResults');results.replaceChildren();const seen=new Set();
+  for(const person of data.value||[]){
+   const addresses=[person.scoredEmailAddresses?.[0]?.address,person.emailAddresses?.[0]?.address,person.emailAddress,person.userPrincipalName];
+   const email=addresses.map(x=>String(x||'').trim()).find(x=>/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(x));
+   if(!email||seen.has(email.toLowerCase()))continue;seen.add(email.toLowerCase());
+   const option=document.createElement('button');option.type='button';option.className='secondary';option.setAttribute('role','option');
+   option.textContent=(person.displayName||email)+' · '+email;
+   option.addEventListener('click',()=>{
+    const input=$('ceremonyParticipants');const pieces=input.value.split(/[,;\n]/).map(x=>x.trim()).filter(Boolean);
+    if(pieces.length&&pieces[pieces.length-1].toLowerCase()===term.toLowerCase())pieces.pop();
+    if(!pieces.some(x=>x.toLowerCase()===email.toLowerCase()))pieces.push(email);
+    input.value=pieces.join(', ')+(pieces.length?', ':'');input.focus();peopleLookupClear('Recipient added. Continue typing to add more.');
+   });results.append(option);
+  }
+  results.hidden=!results.children.length;
+  $('contactLookupStatus').textContent=results.children.length?results.children.length+' suggested recipient(s). Select one to add.':'No relevant people found. You can enter any email address manually.';
+ }catch(e){if(seq===peopleLookupSerial)peopleLookupClear('Recipient suggestions unavailable. Manual email entry still works.');}
+}
+$('contactLookupEnable').addEventListener('click',()=>void peopleLookupEnable());
+$('ceremonyParticipants').addEventListener('input',()=>{
+ clearTimeout(peopleLookupTimer);peopleLookupClear();
+ peopleLookupTimer=setTimeout(()=>void peopleLookupSearch(),350);
+});
 const CEREMONY_FIELDS=['ceremonyType','ceremonyTitle','ceremonyDate','ceremonyTime','ceremonyDuration','ceremonyParticipants','ceremonySecondary','ceremonyStatus','ceremonyAgenda','ceremonyOutcome'];
-function activateTab(name){if(ROOM_ENFORCE_PREVIEW&&roomStatus&&!roomStatus.allowed&&['board','planning','reports','demo'].includes(name))name='configuration';diagnostic('ui.tab.opened',{tab:name});
- if(!['board','planning','reports','demo','configuration','support'].includes(name))name='board';
+const GS_VALID_TABS=['board','planning','reports','demo','configuration','support'];
+let pendingAuthorizedTab=null;
+let requestedTab='board';
+function showTab(name,remember=true){
+ if(!GS_VALID_TABS.includes(name))name='board';
+ diagnostic('ui.tab.opened',{tab:name});
  document.querySelectorAll('.gs-tab').forEach(b=>{const on=b.dataset.tab===name;b.setAttribute('aria-selected',String(on));b.tabIndex=on?0:-1;});
  document.querySelectorAll('.gs-tab-panel').forEach(p=>p.classList.toggle('hidden',p.id!=='tab-'+name));
  if(name==='reports'){renderSprintHealth();renderTimeline();}if(name==='planning'){renderCeremonies();renderSprintHealth();}if(name==='board')renderBoard();
- try{sessionStorage.setItem('pnpc-gs-tab',name);}catch{}
+ if(remember){requestedTab=name;try{sessionStorage.setItem('pnpc-gs-tab',name);}catch{}}
+}
+function activateTab(name){
+ if(!GS_VALID_TABS.includes(name))name='board';
+ requestedTab=name;
+ if(ROOM_ENFORCE_PREVIEW&&!roomAccessAllowed()&&['board','planning','reports','demo'].includes(name)){
+  pendingAuthorizedTab=name;
+  showTab('configuration',false);
+  return;
+ }
+ pendingAuthorizedTab=null;showTab(name,true);
 }
 document.querySelectorAll('.gs-tab').forEach(b=>b.addEventListener('click',()=>activateTab(b.dataset.tab)));
-try{activateTab(sessionStorage.getItem('pnpc-gs-tab')||'board');}catch{activateTab('board');}
-function ceremonyForm(){return {type:$('ceremonyType').value,title:$('ceremonyTitle').value.trim(),date:$('ceremonyDate').value,time:$('ceremonyTime').value,duration:Number($('ceremonyDuration').value)||30,participants:$('ceremonyParticipants').value.trim(),secondary:$('ceremonySecondary').value,status:$('ceremonyStatus').value,agenda:$('ceremonyAgenda').value.trim(),outcome:$('ceremonyOutcome').value.trim()};}
-function resetCeremony(){selectedCeremonyId=null;selectedWorkspaceMeeting=null;for(const id of CEREMONY_FIELDS){const el=$(id);if(el.tagName==='SELECT')el.selectedIndex=0;else el.value='';}$('ceremonyDuration').value='30';$('ceremonyEditStatus').textContent='New meeting record';$('saveCeremony').textContent='Save ceremony';}
-function editCeremony(id,source=null){const s=currentSprint();const w=activeScheduleWorkspace();const found=source?{record:w?.meetingSchedules?.find(x=>x.id===source)?.meetings?.find(x=>x.id===id),scheduleId:source}:((s?.ceremonies||[]).some(x=>x.id===id)?{record:s.ceremonies.find(x=>x.id===id)}:findWorkspaceMeeting(id));const c=found?.record;if(!c)return;selectedCeremonyId=id;selectedWorkspaceMeeting=found.scheduleId||null;const map={ceremonyType:c.type,ceremonyTitle:c.title,ceremonyDate:c.date,ceremonyTime:c.time,ceremonyDuration:c.duration,ceremonyParticipants:c.participants,ceremonySecondary:c.secondary,ceremonyStatus:c.status,ceremonyAgenda:c.agenda,ceremonyOutcome:c.outcome};for(const [key,value] of Object.entries(map)){if(key==='ceremonyTime')populateMeetingTimePicker($(key),value||'09:30');else $(key).value=value??'';}$('ceremonyEditStatus').textContent=selectedWorkspaceMeeting?'Editing workspace schedule meeting':'Editing saved ceremony';$('saveCeremony').textContent=c.outlook?.state==='booked'?'Update ceremony & Outlook':'Update ceremony';$('ceremonyPanel').scrollIntoView({block:'start',behavior:'smooth'});}
+// A fresh hub navigation opens Board; an actual browser reload retains the active tab.
+// The licensing gate must never replace that requested destination with Configuration.
+try{
+ const nav=performance.getEntriesByType('navigation')[0];
+ const reloaded=nav?.type==='reload';
+ const previous=reloaded?sessionStorage.getItem('pnpc-gs-tab'):null;
+ activateTab(GS_VALID_TABS.includes(previous)?previous:'board');
+}catch{activateTab('board');}
+let referenceCalendarMonth='';
+function renderMeetingReferenceCalendar(){
+ const host=$('meetingReferenceCalendar');if(!host)return;
+ const chosen=$('ceremonyDate').value||reportToday();
+ if(!/^\d{4}-\d{2}-\d{2}$/.test(chosen))return;
+ if(!referenceCalendarMonth)referenceCalendarMonth=chosen.slice(0,7);
+ const [year,month]=referenceCalendarMonth.split('-').map(Number);
+ const first=new Date(Date.UTC(year,month-1,1)),offset=(first.getUTCDay()+6)%7,days=new Date(Date.UTC(year,month,0)).getUTCDate();
+ const existing=[...(activeScheduleWorkspace()?.meetingSchedules||[]).flatMap(x=>x.meetings||[]),...(currentSprint()?.ceremonies||[])];
+ const onDate=new Map();for(const m of existing){if(!m.date)continue;onDate.set(m.date,(onDate.get(m.date)||[]).concat(m.title||m.type||'Meeting'));}
+ // Show a preview of the selected native Outlook recurrence without creating events.
+ const repeat=$('ceremonyRepeat')?.value||'none',end=$('ceremonyRepeatEnd')?.value||'',selected=$('ceremonyDate')?.value||'';
+ const weekdays=new Set([...document.querySelectorAll('#ceremonyWeekdays input:checked')].map(x=>x.value));
+ const dayNames=['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
+ const preview=new Set();
+ if(repeat!=='none'&&selected&&end&&end>=selected){const interval=repeat==='weekly'?1:Math.max(1,Number($('ceremonyInterval')?.value)||2);const anchor=new Date(selected+'T12:00:00Z');
+  for(let d=1;d<=days;d++){const date=`${year}-${String(month).padStart(2,'0')}-${String(d).padStart(2,'0')}`;if(date<selected||date>end)continue;const dateObj=new Date(date+'T12:00:00Z');const weeks=Math.floor((dateObj-anchor)/604800000);if(weeks<0||weeks%interval!==0)continue;const dow=dayNames[dateObj.getUTCDay()];if(repeat==='weekly'?weekdays.has(dow):dateObj.getUTCDay()===anchor.getUTCDay())preview.add(date);}
+ }
+ host.replaceChildren();const toolbar=document.createElement('div');toolbar.className='row gs-calendar-toolbar';
+ const prev=document.createElement('button'),next=document.createElement('button'),heading=document.createElement('strong');prev.type=next.type='button';prev.className=next.className='secondary';prev.textContent='‹';next.textContent='›';heading.textContent=first.toLocaleDateString(undefined,{month:'long',year:'numeric',timeZone:'UTC'});toolbar.append(prev,heading,next);host.append(toolbar);
+ const navigate=delta=>{const d=new Date(Date.UTC(year,month-1+delta,1));referenceCalendarMonth=d.toISOString().slice(0,7);renderMeetingReferenceCalendar();};prev.onclick=()=>navigate(-1);next.onclick=()=>navigate(1);
+ const grid=document.createElement('div');grid.className='gs-meeting-calendar-grid';
+ for(const day of ['Mon','Tue','Wed','Thu','Fri','Sat','Sun']){const label=document.createElement('strong');label.textContent=day;grid.append(label);}
+ for(let i=0;i<offset;i++)grid.append(document.createElement('span'));
+ for(let d=1;d<=days;d++){const date=`${year}-${String(month).padStart(2,'0')}-${String(d).padStart(2,'0')}`;const b=document.createElement('button');b.type='button';b.textContent=String(d);b.className='gs-calendar-day'+(date===chosen?' selected':'')+(onDate.has(date)?' has-meeting':'')+(preview.has(date)?' proposed-occurrence':'');b.title=onDate.has(date)?onDate.get(date).join(' · '):preview.has(date)?'Proposed recurring meeting · '+date:'Choose '+date;b.onclick=()=>{$('ceremonyDate').value=date;renderMeetingReferenceCalendar();renderRecurrenceExplanation();};grid.append(b);}
+ host.append(grid);
+ const note=document.createElement('small');note.className='muted';note.textContent='Blue dates contain saved meeting records; outlined dates preview the proposed recurrence. Existing Outlook series occurrences are not fetched.';host.append(note);
+}
+function renderRecurrenceExplanation(){
+ const host=$('ceremonyRecurrenceExplanation');if(!host)return;
+ const mode=$('ceremonyRepeat').value,days=[...document.querySelectorAll('#ceremonyWeekdays input:checked')].map(x=>x.parentElement.textContent.trim());
+ const type=$('ceremonyType').value,standup=/standup/i.test(type);
+ renderMeetingReferenceCalendar();host.textContent=mode==='none'?'One meeting on the selected date.':mode==='weekly'?`Repeats every week${days.length?' on '+days.join(', '):' (choose at least one weekday)'}. One Outlook series, not separate weekly bookings.`:`Repeats every ${Number($('ceremonyInterval').value)||2} week(s) on the selected weekday. Intended for regular sprint ceremonies, not weekly standups.`;
+ const interval=$('ceremonyInterval').closest('div');if(interval)interval.classList.toggle('hidden',mode!=='sprint');
+ const weekdays=$('ceremonyWeekdays').closest('div');if(weekdays)weekdays.classList.toggle('hidden',mode!=='weekly');
+ const end=$('ceremonyRepeatEnd').closest('div');if(end)end.classList.toggle('hidden',mode==='none');
+ if(standup&&mode==='sprint')host.textContent+=' Standups normally repeat weekly; select Weekly on selected days instead.';
+}
+for(const id of ['ceremonyRepeat','ceremonyInterval','ceremonyRepeatEnd'])$(id)?.addEventListener('change',renderRecurrenceExplanation);
+$('ceremonyType')?.addEventListener('change',()=>{if(!selectedCeremonyId&&/standup/i.test($('ceremonyType').value)&&$('ceremonyRepeat').value==='none'){$('ceremonyRepeat').value='weekly';document.querySelectorAll('#ceremonyWeekdays input').forEach(x=>x.checked=['monday','tuesday','wednesday','thursday','friday'].includes(x.value));}renderRecurrenceExplanation();});
+document.querySelectorAll('#ceremonyWeekdays input').forEach(x=>x.addEventListener('change',renderRecurrenceExplanation));
+$('ceremonyDate').addEventListener('change',()=>{referenceCalendarMonth=$('ceremonyDate').value.slice(0,7);renderMeetingReferenceCalendar();renderRecurrenceExplanation();});
+function ceremonyForm(){return {type:$('ceremonyType').value,title:$('ceremonyTitle').value.trim(),date:$('ceremonyDate').value,time:$('ceremonyTime').value,duration:Number($('ceremonyDuration').value)||30,participants:$('ceremonyParticipants').value.trim(),secondary:$('ceremonySecondary').value,status:$('ceremonyStatus').value,agenda:$('ceremonyAgenda').value.trim(),outcome:$('ceremonyOutcome').value.trim(),repeat:$('ceremonyRepeat').value,repeatInterval:Number($('ceremonyInterval').value)||1,repeatDays:[...document.querySelectorAll('#ceremonyWeekdays input:checked')].map(x=>x.value),repeatEnd:$('ceremonyRepeatEnd').value};}
+function resetCeremony(){selectedCeremonyId=null;selectedWorkspaceMeeting=null;for(const id of CEREMONY_FIELDS){const el=$(id);if(el.tagName==='SELECT')el.selectedIndex=0;else el.value='';}$('ceremonyDuration').value='30';$('ceremonyRepeat').value='none';$('ceremonyInterval').value='2';$('ceremonyRepeatEnd').value='';document.querySelectorAll('#ceremonyWeekdays input').forEach(x=>x.checked=false);$('ceremonyEditStatus').textContent='New meeting record';referenceCalendarMonth='';renderMeetingReferenceCalendar();renderRecurrenceExplanation();$('saveCeremony').textContent='Save ceremony';}
+function editCeremony(id,source=null){const s=currentSprint();const w=activeScheduleWorkspace();const found=source?{record:w?.meetingSchedules?.find(x=>x.id===source)?.meetings?.find(x=>x.id===id),scheduleId:source}:((s?.ceremonies||[]).some(x=>x.id===id)?{record:s.ceremonies.find(x=>x.id===id)}:findWorkspaceMeeting(id));const c=found?.record;if(!c)return;selectedCeremonyId=id;selectedWorkspaceMeeting=found.scheduleId||null;const map={ceremonyType:c.type,ceremonyTitle:c.title,ceremonyDate:c.date,ceremonyTime:c.time,ceremonyDuration:c.duration,ceremonyParticipants:c.participants,ceremonySecondary:c.secondary,ceremonyStatus:c.status,ceremonyAgenda:c.agenda,ceremonyOutcome:c.outcome};for(const [key,value] of Object.entries(map)){if(key==='ceremonyTime')populateMeetingTimePicker($(key),value||'09:30');else $(key).value=value??'';}$('ceremonyRepeat').value=c.repeat||'none';$('ceremonyInterval').value=c.repeatInterval||2;$('ceremonyRepeatEnd').value=c.repeatEnd||'';document.querySelectorAll('#ceremonyWeekdays input').forEach(x=>x.checked=(c.repeatDays||[]).includes(x.value));referenceCalendarMonth=(c.date||'').slice(0,7);renderMeetingReferenceCalendar();renderRecurrenceExplanation();$('ceremonyEditStatus').textContent=selectedWorkspaceMeeting?'Editing workspace schedule meeting':'Editing saved ceremony';$('saveCeremony').textContent=c.outlook?.state==='booked'?'Update ceremony & Outlook':'Update ceremony';$('ceremonyPanel').scrollIntoView({block:'start',behavior:'smooth'});}
 function findWorkspaceMeeting(id){for(const sc of activeScheduleWorkspace()?.meetingSchedules||[]){const record=(sc.meetings||[]).find(m=>m.id===id);if(record)return {record,scheduleId:sc.id};}return null;}
-async function saveCeremony(){const linked=selectedCeremonyId?outlookCeremonyRecord(selectedCeremonyId,selectedWorkspaceMeeting):null;if(linked?.outlook?.state==='booked')return outlookUpdateCeremony(selectedCeremonyId,selectedWorkspaceMeeting,ceremonyForm());if(linked?.outlook?.state)return notify('This Outlook operation needs review before editing.',true);const sp=currentSprint(),w=activeScheduleWorkspace();if(!sp&&!selectedWorkspaceMeeting)return notify('Select a sprint or existing meeting.',true);const c=ceremonyForm();if(c.secondary===c.type)return notify('Choose a different secondary ceremony purpose.',true);if(c.duration<5||c.duration>480)return notify('Duration must be 5–480 minutes.',true);if(c.status==='Scheduled externally'&&!c.date)return notify('Enter a date for an externally scheduled meeting.',true);const id=selectedCeremonyId||crypto.randomUUID();const scheduleId=selectedWorkspaceMeeting;const now=new Date().toISOString();const ok=await persist(r=>{if(scheduleId){const target=r.workspaces.find(x=>x.id===w.id)?.meetingSchedules?.find(x=>x.id===scheduleId)?.meetings?.find(x=>x.id===id);if(!target)throw Error('Workspace meeting no longer exists.');Object.assign(target,c,{updatedAt:now,manuallyEdited:true});}else{const target=r.sprints.find(x=>x.id===sp.id);target.ceremonies ||= [];const existing=target.ceremonies.find(x=>x.id===id);if(existing)Object.assign(existing,c,{updatedAt:now});else target.ceremonies.push({...c,id,createdAt:now,updatedAt:now});}},false);if(ok){resetCeremony();renderCeremonies();renderWorkspaceSchedules();renderCeremonyInsights();renderPmAssistance();notify('Meeting record saved. No Outlook event was created.');}}
+async function saveCeremony(){const linked=selectedCeremonyId?outlookCeremonyRecord(selectedCeremonyId,selectedWorkspaceMeeting):null;if(linked?.outlook?.state==='booked')return outlookUpdateCeremony(selectedCeremonyId,selectedWorkspaceMeeting,ceremonyForm());if(linked?.outlook?.state)return notify('This Outlook operation needs review before editing.',true);const sp=currentSprint(),w=activeScheduleWorkspace();if(!sp&&!selectedWorkspaceMeeting)return notify('Select a sprint or existing meeting.',true);const c=ceremonyForm();if(c.date&&c.time){try{outlookLocalTime(c.date,c.time,c.duration);}catch(e){return notify(String(e.message||e),true);}}if(c.secondary===c.type)return notify('Choose a different secondary ceremony purpose.',true);if(c.duration<5||c.duration>480)return notify('Duration must be 5–480 minutes.',true);if(c.status==='Scheduled externally'&&!c.date)return notify('Enter a date for an externally scheduled meeting.',true);const id=selectedCeremonyId||crypto.randomUUID();const scheduleId=selectedWorkspaceMeeting;const now=new Date().toISOString();const ok=await persist(r=>{if(scheduleId){const target=r.workspaces.find(x=>x.id===w.id)?.meetingSchedules?.find(x=>x.id===scheduleId)?.meetings?.find(x=>x.id===id);if(!target)throw Error('Workspace meeting no longer exists.');Object.assign(target,c,{updatedAt:now,manuallyEdited:true});}else{const target=r.sprints.find(x=>x.id===sp.id);target.ceremonies ||= [];const existing=target.ceremonies.find(x=>x.id===id);if(existing)Object.assign(existing,c,{updatedAt:now});else target.ceremonies.push({...c,id,createdAt:now,updatedAt:now});}},false);if(ok){resetCeremony();renderCeremonies();renderWorkspaceSchedules();renderCeremonyInsights();renderPmAssistance();notify('Meeting record saved. No Outlook event was created.');}}
 async function deleteCeremony(id,scheduleId=null){const linked=outlookCeremonyRecord(id,scheduleId);if(linked?.outlook?.state&&linked.outlook.state!=='cancelled')return notify('Cancel the Outlook meeting and confirm cancellation before removing this record. Unresolved Outlook operations must be reviewed first.',true);const sp=currentSprint(),w=activeScheduleWorkspace();if(!confirm(linked?.outlook?.state==='cancelled'?'Remove this cancelled meeting from Global Sprints? Its Outlook event has already been cancelled.':'Remove this meeting record from Global Sprints?'))return;const ok=await persist(r=>{if(scheduleId){const sc=r.workspaces.find(x=>x.id===w.id)?.meetingSchedules?.find(x=>x.id===scheduleId);if(!sc)throw Error('Schedule missing.');const meeting=(sc.meetings||[]).find(x=>x.id===id);if(!meeting)throw Error('Meeting no longer exists.');if(meeting.outlook?.state&&meeting.outlook.state!=='cancelled')throw Error('Outlook event is not cancelled.');sc.meetings=(sc.meetings||[]).filter(x=>x.id!==id);}else{const target=r.sprints.find(x=>x.id===sp?.id);if(!target)throw Error('Sprint missing.');const meeting=(target.ceremonies||[]).find(x=>x.id===id);if(!meeting)throw Error('Meeting no longer exists.');if(meeting.outlook?.state&&meeting.outlook.state!=='cancelled')throw Error('Outlook event is not cancelled.');target.ceremonies=(target.ceremonies||[]).filter(x=>x.id!==id);}},false);if(ok){if(selectedCeremonyId===id)resetCeremony();renderCeremonies();renderWorkspaceSchedules();renderCeremonyInsights();renderPmAssistance();notify('Meeting record removed from Planning.');}}
 
 // Outlook event creation is intentionally explicit. The internal ceremony is saved first.
@@ -1342,19 +1622,51 @@ function outlookAttendees(raw){
 }
 function outlookLocalTime(date,time,duration){
  if(!/^\d{4}-\d{2}-\d{2}$/.test(date||'')||!/^\d{2}:\d{2}$/.test(time||''))throw Error('Enter a meeting date and time.');
+ const hour=Number(time.slice(0,2)),minute=Number(time.slice(3,5));
+ if(hour>23||minute>59)throw Error('Invalid meeting time.');
  const start=new Date(`${date}T${time}:00`);
- if(!Number.isFinite(start.getTime())||start.getFullYear()!==Number(date.slice(0,4))||start.getMonth()+1!==Number(date.slice(5,7))||start.getDate()!==Number(date.slice(8,10)))throw Error('Invalid meeting date or time.');
+ if(!Number.isFinite(start.getTime())||start.getFullYear()!==Number(date.slice(0,4))||start.getMonth()+1!==Number(date.slice(5,7))||start.getDate()!==Number(date.slice(8,10))||start.getHours()!==hour||start.getMinutes()!==minute)throw Error('Invalid or nonexistent local meeting date/time (check daylight saving time).');
  const mins=Number(duration);
  if(!Number.isFinite(mins)||mins<5||mins>480)throw Error('Meeting duration must be 5–480 minutes.');
  const end=new Date(start.getTime()+mins*60000);
  // Graph accepts ISO UTC; the user's browser timezone determines the local meeting time.
  return {start:{dateTime:start.toISOString().replace(/\.\d{3}Z$/,'Z'),timeZone:'UTC'},end:{dateTime:end.toISOString().replace(/\.\d{3}Z$/,'Z'),timeZone:'UTC'}};
 }
+const OUTLOOK_DAYS=['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
+function outlookNativeRecurrence(c){
+ if(!c.repeat||c.repeat==='none')return null;
+ if(!['weekly','sprint'].includes(c.repeat))throw Error('Unsupported Outlook recurrence pattern.');
+ if(!/^\d{4}-\d{2}-\d{2}$/.test(c.repeatEnd||''))throw Error('Choose a recurrence end date.');
+ const first=new Date(c.date+'T12:00:00'),last=new Date(c.repeatEnd+'T12:00:00');
+ if(!Number.isFinite(first.getTime())||!Number.isFinite(last.getTime())||last<first)throw Error('Recurrence end date must be on or after the first meeting.');
+ const interval=c.repeat==='weekly'?1:Number(c.repeatInterval);
+ if(!Number.isInteger(interval)||interval<1||interval>52)throw Error('Repeat interval must be 1–52 weeks.');
+ const days=c.repeat==='weekly'?[...new Set(c.repeatDays||[])]:[OUTLOOK_DAYS[first.getDay()]];
+ if(!days.length||days.some(d=>!OUTLOOK_DAYS.includes(d)))throw Error('Select at least one valid recurring weekday.');
+ if(!days.includes(OUTLOOK_DAYS[first.getDay()]))throw Error('The first meeting date must fall on a selected recurrence weekday.');
+ // Graph recurrence uses the Outlook mailbox timezone; explicit timezone conversion
+ // requires a verified Windows timezone mapping, not an assumed browser locale.
+ const browserTz=Intl.DateTimeFormat().resolvedOptions().timeZone;
+ const windowsTz={'America/Toronto':'Eastern Standard Time','America/New_York':'Eastern Standard Time','America/Detroit':'Eastern Standard Time','America/Chicago':'Central Standard Time','America/Winnipeg':'Central Standard Time','America/Denver':'Mountain Standard Time','America/Edmonton':'Mountain Standard Time','America/Los_Angeles':'Pacific Standard Time','America/Vancouver':'Pacific Standard Time','UTC':'UTC','Etc/UTC':'UTC'};
+ const tz=windowsTz[browserTz];
+ if(!tz)throw Error('Outlook recurrence timezone is not yet mapped for '+(browserTz||'this browser')+'. Choose a supported timezone before scheduling.');
+ return {pattern:{type:'weekly',interval,daysOfWeek:days,firstDayOfWeek:'monday'},range:{type:'endDate',startDate:c.date,endDate:c.repeatEnd,recurrenceTimeZone:tz}};
+}
 function outlookEventPayload(c){
- const times=outlookLocalTime(c.date,c.time,c.duration||30);
+ const recurrence=outlookNativeRecurrence(c);
+ let times=outlookLocalTime(c.date,c.time,c.duration||30);
+ if(recurrence){
+  // A recurring series must retain the selected WALL-CLOCK time through DST.
+  // Sending UTC start/end with a local recurrence zone can shift future instances.
+  const start=new Date(`${c.date}T${c.time}:00`);
+  const end=new Date(start.getTime()+Number(c.duration||30)*60000);
+  const localStamp=d=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}T${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:00`;
+  const zone=recurrence.range.recurrenceTimeZone;
+  times={start:{dateTime:localStamp(start),timeZone:zone},end:{dateTime:localStamp(end),timeZone:zone}};
+ }
  return {subject:(c.title||c.type||'Global Sprints meeting').slice(0,120),
   body:{contentType:'Text',content:[c.agenda||'',c.secondary?'Combined ceremony: '+c.secondary:'','Scheduled from PNPC Global Sprints'].filter(Boolean).join('\n\n')},
-  ...times,attendees:outlookAttendees(c.participants)};
+  ...times,attendees:outlookAttendees(c.participants),...(recurrence?{recurrence}:{})};
 }
 function outlookTarget(r,id,scheduleId,workspaceId,sprintId){
  return scheduleId?r.workspaces.find(x=>x.id===workspaceId)?.meetingSchedules?.find(x=>x.id===scheduleId)?.meetings?.find(x=>x.id===id):r.sprints.find(x=>x.id===sprintId)?.ceremonies?.find(x=>x.id===id);
@@ -1406,7 +1718,7 @@ async function outlookUpdateCeremony(id,scheduleId,c){
  if(!m365Account||o.accountId!==(m365Account.homeAccountId||m365Account.username))return notify('Connect the Microsoft 365 account that owns this booking.',true);
  let payload;try{payload=outlookEventPayload(c);}catch(e){return notify(String(e.message||e),true);}
  if(outlookBookingBusy)return notify('An Outlook operation is in progress.',true);
- if(!confirm('Update this existing Outlook event? Outlook may send updated invitations to attendees.'))return;
+ if(!confirm(o.recurring?'Update the ENTIRE recurring Outlook series? Outlook may send updated invitations for future occurrences.':'Update this existing Outlook event? Outlook may send updated invitations to attendees.'))return;
  outlookBookingBusy=true;
  const w=activeScheduleWorkspace(),sp=currentSprint(),operationId=crypto.randomUUID();
  try{
@@ -1423,7 +1735,7 @@ async function outlookCancelCeremony(id,scheduleId=null){
  if(o?.state!=='booked'||!o.eventId)return notify('Only confirmed Outlook bookings can be cancelled.',true);
  if(!m365Account||o.accountId!==(m365Account.homeAccountId||m365Account.username))return notify('Connect the Microsoft 365 account that owns this booking.',true);
  if(outlookBookingBusy)return notify('An Outlook operation is in progress.',true);
- if(!confirm('Cancel this Outlook meeting and notify attendees? This cannot be undone. The ceremony record will be retained as Cancelled.'))return;
+ if(!confirm(o.recurring?'Cancel the ENTIRE recurring Outlook meeting series and notify attendees? This cancels all remaining occurrences. The workspace ceremony record will be retained as Cancelled.':'Cancel this Outlook meeting and notify attendees? This cannot be undone. The ceremony record will be retained as Cancelled.'))return;
  outlookBookingBusy=true;const w=activeScheduleWorkspace(),sp=currentSprint(),operationId=crypto.randomUUID();
  try{
   const marked=await persist(r=>{const t=outlookTarget(r,id,scheduleId,w?.id,sp?.id);if(t?.outlook?.state!=='booked')throw Error('Meeting changed.');t.outlook={...t.outlook,state:'cancel-pending',operationId};},false);
@@ -1435,6 +1747,13 @@ async function outlookCancelCeremony(id,scheduleId=null){
   if(saved)notify('Outlook meeting cancelled. Ceremony history retained.');else notify('Outlook cancellation succeeded, but registry confirmation failed. Use Review Outlook status.',true);
  }catch(e){notify('Cancellation result uncertain: '+String(e.message||e)+'. Review Outlook status before retrying.',true);}finally{outlookBookingBusy=false;renderCeremonies();renderWorkspaceSchedules();}
 }
+function ceremonyBookingFeedback(id,scheduleId,message){
+ // Keep the error beside the attempted booking control, not in a distant notification.
+ const rows=[...document.querySelectorAll('[data-ceremony-booking-id]')];
+ const row=rows.find(el=>el.dataset.ceremonyBookingId===String(id)&&el.dataset.ceremonyScheduleId===String(scheduleId||''));
+ if(row){let status=row.querySelector('.ceremony-booking-feedback');if(!status){status=document.createElement('p');status.className='ceremony-booking-feedback';status.setAttribute('role','alert');status.style.cssText='color:#a52828;width:100%;margin:4px 0;';row.append(status);}status.textContent=message;}
+ notify(message,true);
+}
 async function scheduleCeremonyInOutlook(id,scheduleId=null){
  if(outlookBookingBusy)return notify('Another Outlook booking is in progress.',true);
  const c=outlookCeremonyRecord(id,scheduleId);
@@ -1443,14 +1762,20 @@ async function scheduleCeremonyInOutlook(id,scheduleId=null){
  if(c.outlook?.state==='pending')return notify('An earlier Outlook request has an unresolved result. Check the selected Outlook calendar before attempting any further booking.',true);
  if(c.status==='Cancelled'||c.status==='Completed')return notify('Cancelled or completed meetings cannot be newly booked.',true);
  const calendarId=m365ReadCalendarPreference();
- if(!m365Account||!calendarId||!m365Calendars.some(x=>x.id===calendarId))
-  return notify('Connect Microsoft 365, load calendars, and save a preferred calendar first.',true);
+ if(!m365Account||!calendarId||!m365Calendars.some(x=>x.id===calendarId)){
+  const reason=!m365Account?'Connect your own Microsoft 365 account in Configuration before scheduling.':
+   !m365Calendars.length?'Your Outlook calendars have not loaded. Open Configuration and select Refresh calendars (this may request Microsoft consent).':
+   !calendarId?'Select and save an Outlook calendar in Configuration for your Microsoft 365 account.':
+   'Your saved Outlook calendar is no longer available to this account. Refresh calendars and save a new selection in Configuration.';
+  diagnostic('m365.booking.preflight',{reason,connected:!!m365Account,calendarsLoaded:m365Calendars.length,calendarPreferencePresent:!!calendarId},'warn');
+  return ceremonyBookingFeedback(id,scheduleId,reason);
+ }
  let payload;
- try{payload=outlookEventPayload(c);}catch(e){return notify(String(e.message||e),true);}
+ try{payload=outlookEventPayload(c);}catch(e){return ceremonyBookingFeedback(id,scheduleId,String(e.message||e));}
  const calendar=m365Calendars.find(x=>x.id===calendarId);
- if(calendar.canEdit===false)return notify('The selected calendar is read-only.',true);
+ if(calendar.canEdit===false)return ceremonyBookingFeedback(id,scheduleId,'The selected Outlook calendar is read-only. Choose a writable calendar in Configuration.');
  const accountId=m365Account.homeAccountId||m365Account.username;
- if(!confirm(`Create "${payload.subject}" in Outlook calendar "${calendar.name}"${payload.attendees.length?' and send invitations to '+payload.attendees.length+' attendee(s)':''}?`))return;
+ if(!confirm(`Create "${payload.subject}"${payload.recurrence?' as ONE recurring Outlook series':''} in Outlook calendar "${calendar.name}"${payload.attendees.length?' and send invitations to '+payload.attendees.length+' attendee(s)':''}?`))return;
  outlookBookingBusy=true;
  const operationId=crypto.randomUUID();
  const sp=currentSprint(),w=activeScheduleWorkspace();
@@ -1476,7 +1801,7 @@ async function scheduleCeremonyInOutlook(id,scheduleId=null){
     ? r.workspaces.find(x=>x.id===w?.id)?.meetingSchedules?.find(x=>x.id===scheduleId)?.meetings?.find(x=>x.id===id)
     : r.sprints.find(x=>x.id===sp?.id)?.ceremonies?.find(x=>x.id===id);
    if(!target||target.outlook?.operationId!==operationId)throw Error('Meeting changed during Outlook booking.');
-   target.outlook={state:'booked',operationId,calendarId,accountId,eventId:event.id,webLink:event.webLink||'',syncedAt:new Date().toISOString()};
+   target.outlook={state:'booked',operationId,calendarId,accountId,eventId:event.id,seriesMasterId:event.seriesMasterId||event.id,recurring:!!payload.recurrence,webLink:event.webLink||'',syncedAt:new Date().toISOString()};
    target.status='Scheduled externally';
   },false);
   if(saved)notify('Outlook event created and linked to the ceremony. Invitations are handled by Microsoft Outlook.');
@@ -1487,14 +1812,14 @@ async function scheduleCeremonyInOutlook(id,scheduleId=null){
   notify('Outlook booking result needs verification: '+String(e.message||e)+'. Check Outlook before retrying. The meeting is marked pending to prevent duplicates.',true);
  }finally{outlookBookingBusy=false;renderCeremonies();renderWorkspaceSchedules();}
 }
-function renderCeremonies(){const list=$('ceremonyList');if(!list)return;list.replaceChildren();const sp=currentSprint(),w=activeScheduleWorkspace();const records=[...(w?.meetingSchedules||[]).flatMap(sc=>(sc.meetings||[]).map(c=>({...c,_scheduleId:sc.id}))),...(sp?.ceremonies||[])].sort((a,b)=>(a.date||'9999').localeCompare(b.date||'9999')||(a.time||'').localeCompare(b.time||''));if(!records.length){list.textContent='No meeting records yet. Use Meeting Schedule Setup or create a meeting above.';return;}for(const c of records){const box=document.createElement('div');box.className='ceremony-record';const h=document.createElement('strong');h.textContent=(c.title||c.type)+(c.secondary?' + '+c.secondary:'');const info=document.createElement('p');info.className='muted';info.textContent=[c.status||'Proposed',c.date,c.time,c.duration?c.duration+' min':'',c.participants,c._scheduleId?'Workspace schedule':'Sprint record'].filter(Boolean).join(' · ');box.append(h,info);for(const [label,key] of [['Agenda','agenda'],['Decisions / follow-up','outcome']])if(c[key]){const p=document.createElement('p');const strong=document.createElement('strong');strong.textContent=label+': ';p.append(strong,document.createTextNode(c[key]));box.append(p);}if(c.secondary){const completion=document.createElement('div');completion.className='row';for(const [purpose,key] of [[c.type,'primary'],[c.secondary,'secondary']]){const label=document.createElement('label');const check=document.createElement('input');check.type='checkbox';check.checked=!!c.ceremonyCompletion?.[key];check.onchange=async()=>{const ok=await persist(r=>{const m=c._scheduleId?r.workspaces.find(x=>x.id===w.id)?.meetingSchedules?.find(x=>x.id===c._scheduleId)?.meetings?.find(x=>x.id===c.id):(r.sprints.find(x=>x.id===sp.id)?.ceremonies||[]).find(x=>x.id===c.id);if(!m)throw Error('Meeting missing.');m.ceremonyCompletion||={primary:false,secondary:false};m.ceremonyCompletion[key]=check.checked;},false);if(!ok)check.checked=!check.checked;else renderCeremonyInsights();};label.append(check,document.createTextNode(' '+purpose+' complete'));completion.append(label);}box.append(completion);}const actions=document.createElement('div');actions.className='row';const edit=document.createElement('button');edit.type='button';edit.textContent='Edit';edit.onclick=()=>editCeremony(c.id,c._scheduleId||null);const remove=document.createElement('button');remove.type='button';remove.className='secondary';remove.textContent='Remove';remove.onclick=()=>void deleteCeremony(c.id,c._scheduleId||null);actions.append(edit);
+function renderCeremonies(){renderMeetingReferenceCalendar();const list=$('ceremonyList');if(!list)return;list.replaceChildren();const sp=currentSprint(),w=activeScheduleWorkspace();const records=[...(w?.meetingSchedules||[]).flatMap(sc=>(sc.meetings||[]).map(c=>({...c,_scheduleId:sc.id}))),...(sp?.ceremonies||[])].sort((a,b)=>(a.date||'9999').localeCompare(b.date||'9999')||(a.time||'').localeCompare(b.time||''));if(!records.length){list.textContent='No meeting records yet. Use Meeting Schedule Setup or create a meeting above.';return;}for(const c of records){const box=document.createElement('div');box.className='ceremony-record';const h=document.createElement('strong');h.textContent=(c.title||c.type)+(c.secondary?' + '+c.secondary:'');const info=document.createElement('p');info.className='muted';info.textContent=[c.status||'Proposed',c.date,c.time,c.duration?c.duration+' min':'',c.repeat&&c.repeat!=='none'?'Repeats '+(c.repeat==='weekly'?(c.repeatDays||[]).join(', '):'every '+(c.repeatInterval||2)+' weeks')+' through '+(c.repeatEnd||'unspecified end'):'One-time',c.participants,c._scheduleId?'Workspace schedule':'Sprint record'].filter(Boolean).join(' · ');box.append(h,info);for(const [label,key] of [['Agenda','agenda'],['Decisions / follow-up','outcome']])if(c[key]){const p=document.createElement('p');const strong=document.createElement('strong');strong.textContent=label+': ';p.append(strong,document.createTextNode(c[key]));box.append(p);}if(c.secondary){const completion=document.createElement('div');completion.className='row';for(const [purpose,key] of [[c.type,'primary'],[c.secondary,'secondary']]){const label=document.createElement('label');const check=document.createElement('input');check.type='checkbox';check.checked=!!c.ceremonyCompletion?.[key];check.onchange=async()=>{const ok=await persist(r=>{const m=c._scheduleId?r.workspaces.find(x=>x.id===w.id)?.meetingSchedules?.find(x=>x.id===c._scheduleId)?.meetings?.find(x=>x.id===c.id):(r.sprints.find(x=>x.id===sp.id)?.ceremonies||[]).find(x=>x.id===c.id);if(!m)throw Error('Meeting missing.');m.ceremonyCompletion||={primary:false,secondary:false};m.ceremonyCompletion[key]=check.checked;},false);if(!ok)check.checked=!check.checked;else renderCeremonyInsights();};label.append(check,document.createTextNode(' '+purpose+' complete'));completion.append(label);}box.append(completion);}const actions=document.createElement('div');actions.className='row';const edit=document.createElement('button');edit.type='button';edit.textContent='Edit';edit.onclick=()=>editCeremony(c.id,c._scheduleId||null);const remove=document.createElement('button');remove.type='button';remove.className='secondary';remove.textContent='Remove';remove.onclick=()=>void deleteCeremony(c.id,c._scheduleId||null);actions.append(edit);
  const outlook=document.createElement('button');outlook.type='button';outlook.className='secondary';
  outlook.textContent=c.outlook?.state==='booked'?'Booked in Outlook':c.outlook?.state==='pending'?'Booking needs review':c.outlook?.state==='cancelled'?'Cancelled in Outlook':c.outlook?.state?'Outlook sync needs review':'Schedule in Outlook';
  outlook.disabled=!!c.outlook?.state||c.status==='Cancelled'||c.status==='Completed';
  outlook.onclick=()=>void scheduleCeremonyInOutlook(c.id,c._scheduleId||null);
  actions.append(outlook);
  if(c.outlook?.state==='booked'){
-  const cancel=document.createElement('button');cancel.type='button';cancel.className='secondary';cancel.textContent='Cancel Outlook meeting';cancel.onclick=()=>void outlookCancelCeremony(c.id,c._scheduleId||null);actions.append(cancel);
+  const cancel=document.createElement('button');cancel.type='button';cancel.className='danger';cancel.textContent='Cancel Outlook meeting';cancel.onclick=()=>void outlookCancelCeremony(c.id,c._scheduleId||null);actions.append(cancel);
  }else if(['pending','sync-pending','cancel-pending'].includes(c.outlook?.state)){
   const review=document.createElement('button');review.type='button';review.className='secondary';review.textContent='Review Outlook status';review.onclick=()=>void outlookReconcile(c.id,c._scheduleId||null);actions.append(review);
  }
@@ -1510,19 +1835,28 @@ const reportWork=()=>{const s=currentSprint();const all=new Map([...items,...ass
 // Every report and PM warning uses the same resolution of assigned sprint IDs.
 function reportCoverage(){const s=currentSprint();const ids=[...new Set((s?.itemIds||[]).map(Number))];const resolved=new Map([...items,...assignedItems].map(w=>[Number(w.id),w]));const missing=ids.filter(id=>!resolved.has(id));const context=ids.filter(id=>resolved.has(id)&&isPlanningContextType(resolved.get(id)));const executable=ids.filter(id=>resolved.has(id)&&!isPlanningContextType(resolved.get(id))&&!isRemoved(resolved.get(id)));return {assigned:ids.length,missing,context,executable};}
 let observationInFlight=false;
+function observationItems(s,found){const byId=new Map(found.map(w=>[Number(w.id),w]));return [...new Set((s.itemIds||[]).map(Number))].map(id=>{const w=byId.get(id);return w&&{id:w.id,project:w.project,title:w.title,type:w.type,state:w.state,effort:w.effort,storyPoints:w.storyPoints};}).filter(Boolean);}
+function observationFingerprint(rows){return JSON.stringify(rows.map(w=>[w.id,w.type,w.state,w.effort,w.storyPoints]));}
 async function autoReportObservation(s,found){
- if(observationInFlight||!s||!found||found.length!==new Set(s.itemIds||[]).size||sprintDirty()||projectsDirty())return;
- const today=reportToday(),snapshots=s.snapshots||[];
- if(snapshots.some(x=>x.automatic&&reportSnapshotTimestamp(x.at).slice(0,10)===today)){diagnostic('reports.observation.already_recorded',{sprintId:s.id,day:today});return;}
+ if(observationInFlight||!s||!found||found.length!==new Set((s.itemIds||[]).map(Number)).size||sprintDirty()||projectsDirty())return;
+ const rows=observationItems(s,found),previous=(s.snapshots||[]).at(-1);
+ if(previous&&observationFingerprint(previous.items||[])===observationFingerprint(rows))return;
  observationInFlight=true;
- try{const saved=await persist(r=>{const sp=r.sprints.find(x=>x.id===s.id);if(!sp)return;sp.snapshots ||= [];if(sp.snapshots.some(x=>x.automatic&&reportSnapshotTimestamp(x.at).slice(0,10)===today))return;sp.snapshots.push({at:new Date().toISOString(),automatic:true,items:found.map(w=>({id:w.id,project:w.project,title:w.title,type:w.type,state:w.state,effort:w.effort}))});if(sp.snapshots.length>150)sp.snapshots=sp.snapshots.slice(-150);},false);diagnostic(saved?'reports.observation.saved':'reports.observation.failed',{sprintId:s.id,workItemCount:found.length,automatic:true},saved?'info':'warn');}catch(e){diagnostic('reports.observation.failed',{reason:String(e.message||e)},'error');}finally{observationInFlight=false;}
+ try{
+  const saved=await persist(r=>{const sp=r.sprints.find(x=>x.id===s.id);if(!sp)throw Error('Sprint no longer exists');sp.snapshots ||= [];
+   const last=sp.snapshots.at(-1);if(last&&observationFingerprint(last.items||[])===observationFingerprint(rows))return;
+   sp.snapshots.push({at:new Date().toISOString(),automatic:true,items:rows});if(sp.snapshots.length>150)sp.snapshots=sp.snapshots.slice(-150);
+  },false);
+  diagnostic(saved?'reports.observation.saved':'reports.observation.failed',{sprintId:s.id,workItemCount:rows.length,automatic:true},saved?'info':'warn');
+  if(saved&&currentSprint()?.id===s.id){renderSprintHealth();renderTimeline();}
+ }catch(e){diagnostic('reports.observation.failed',{reason:String(e.message||e)},'error');}finally{observationInFlight=false;}
 }
 function reportFiltered(){return reportWork().filter(w=>(!reportProjectFilter||w.project===reportProjectFilter)&&(!reportPersonFilter||w.assignee===reportPersonFilter));}
 function reportNode(tag,className,textValue){const n=document.createElement(tag);if(className)n.className=className;if(textValue!==undefined)n.textContent=String(textValue);return n;}
 function reportMetric(parent,label,value,description=''){const n=reportNode('div','gs-metric');n.append(reportNode('span','muted',label),reportNode('strong','',value));if(description)n.append(reportNode('small','muted',description));parent.append(n);}
 function reportVisualBars(parent,rows,labels=['Closed','Done','Open']){const graph=reportNode('div','gs-visual-bars');const max=Math.max(1,...rows.map(r=>r.values.reduce((a,b)=>a+b,0)));const legend=reportNode('div','gs-chart-legend');labels.forEach((label,i)=>{const item=reportNode('span','gs-legend-item');const swatch=reportNode('i','gs-swatch gs-swatch-'+i);item.append(swatch,document.createTextNode(label));legend.append(item);});graph.append(legend);if(!rows.length){graph.append(reportNode('p','muted','No work items match these filters.'));parent.append(graph);return;}for(const row of rows){const line=reportNode('div','gs-visual-row');line.append(reportNode('span','gs-visual-name',row.name));const track=reportNode('div','gs-visual-track');track.setAttribute('role','img');track.setAttribute('aria-label',row.name+': '+row.values.map((n,i)=>n+' '+labels[i]).join(', '));row.values.forEach((n,i)=>{if(n<=0)return;const segment=reportNode('span','gs-visual-segment gs-fill-'+i);segment.style.width=(n/max*100)+'%';segment.title=n+' '+labels[i];track.append(segment);});line.append(track,reportNode('strong','gs-visual-count',String(row.values.reduce((a,b)=>a+b,0))));graph.append(line);}parent.append(graph);}
 function reportEmptyChart(parent,heading,description){const empty=reportNode('div','gs-chart-empty');empty.append(reportNode('div','gs-chart-empty-icon','▥'),reportNode('strong','',heading),reportNode('p','muted',description));parent.append(empty);}
-function reportVelocityChart(parent,rows){const graph=reportNode('div','gs-velocity-chart');const max=Math.max(1,...rows.map(r=>r.value));for(const row of rows){const item=reportNode('div','gs-velocity-column');const area=reportNode('div','gs-velocity-area');const bar=reportNode('div','gs-velocity-bar');bar.style.height=Math.max(row.value?6:0,row.value/max*100)+'%';bar.title=row.name+': '+row.value+' accepted items';area.append(bar);item.append(reportNode('strong','',String(row.value)),area,reportNode('span','',row.name));graph.append(item);}parent.append(graph);}
+function reportVelocityChart(parent,rows){const graph=reportNode('div','gs-velocity-chart');const max=Math.max(1,...rows.map(r=>r.value));for(const row of rows){const item=reportNode('div','gs-velocity-column');const area=reportNode('div','gs-velocity-area');const bar=reportNode('div','gs-velocity-bar');bar.style.height=Math.max(row.value?6:0,row.value/max*100)+'%';bar.title=row.name+': '+row.value+' completed points';area.append(bar);item.append(reportNode('strong','',String(row.value)),area,reportNode('span','',row.name));graph.append(item);}parent.append(graph);}
 function reportDate(v){return v?String(v).slice(0,10):'';}
 // Snapshot timestamps may be ISO strings or legacy numeric epoch values.
 // Normalize before sorting/charting so one legacy record cannot crash Reports.
@@ -1549,11 +1883,37 @@ function renderReportDashboard(){const host=$('reportDashboard');if(!host)return
  const workload=reportNode('section','gs-report-block');workload.append(reportNode('h3','','Team workload'));const table=reportNode('table');table.innerHTML='<thead><tr><th>Assigned to</th><th>Open</th><th>Awaiting validation</th><th>Closed</th></tr></thead>';const tbody=reportNode('tbody');for(const person of [...new Set(work.map(w=>w.assignee||'Unassigned'))].sort()){const list=work.filter(w=>(w.assignee||'Unassigned')===person),tr=reportNode('tr');for(const v of [person,list.filter(w=>!reportIsClosed(w)&&!reportIsDone(w)).length,list.filter(reportIsDone).length,list.filter(reportIsClosed).length])tr.append(reportNode('td','',v));tbody.append(tr);}table.append(tbody);reportVisualBars(workload,[...new Set(work.map(w=>w.assignee||'Unassigned'))].sort().map(person=>{const list=work.filter(w=>(w.assignee||'Unassigned')===person);return {name:person,values:[list.filter(reportIsClosed).length,list.filter(reportIsDone).length,list.filter(w=>!reportIsClosed(w)&&!reportIsDone(w)).length]};}));const teamDetail=reportNode('details','gs-chart-details');teamDetail.append(reportNode('summary','','View workload data table'),table);workload.append(teamDetail,reportNode('p','muted','Assignment counts are not capacity or time estimates.'));host.append(workload);
  const issues=reportNode('section','gs-report-block');issues.append(reportNode('h3','','Management attention'));const attention=[...new Map([...overdue,...blocked,...done].map(w=>[w.id,w])).values()];if(!attention.length)issues.append(reportNode('p','muted','No overdue, blocked or validation-pending work among loaded items.'));for(const w of attention.slice(0,30)){const line=reportNode('div','gs-attention');const link=document.createElement('a');link.href=w.url||`${organizationApiBase()}/${encodeURIComponent(w.project)}/_workitems/edit/${w.id}`;link.target='_blank';link.rel='noopener noreferrer';link.textContent='#'+w.id+' · '+w.title;line.append(link,reportNode('span','muted',w.project+' · '+w.state+(overdue.includes(w)?' · Overdue':'')));issues.append(line);}host.append(issues);
  renderVelocityBurndown();}
-function renderVelocityBurndown(){const velocity=$('reportVelocity'),burn=$('reportBurndown');if(!velocity||!burn)return;velocity.replaceChildren();burn.replaceChildren();const s=currentSprint();if(!s)return;const siblings=workspaceSprints().filter(x=>x.start).sort((a,b)=>a.start.localeCompare(b.start));const table=reportNode('table');table.innerHTML='<thead><tr><th>Sprint</th><th>Baseline</th><th>Closed at last observation</th><th>Velocity (items)</th></tr></thead>';const tb=reportNode('tbody');let any=false;const velocityRows=[];for(const sp of siblings.slice(-8)){const snaps=(sp.snapshots||[]).filter(x=>reportSnapshotTimestamp(x.at)&&Array.isArray(x.items)).sort((a,b)=>reportSnapshotTimestamp(a.at).localeCompare(reportSnapshotTimestamp(b.at)));if(!snaps.length)continue;any=true;const first=snaps[0],last=snaps[snaps.length-1];const baseline=(first.items||[]).filter(w=>!isPlanningContextType(w)),endIds=new Set((last.items||[]).filter(w=>/^(closed|accepted|tested and approved)$/i.test(w.state||'')).map(w=>Number(w.id)));const completed=baseline.filter(w=>endIds.has(Number(w.id))),n=completed.length;velocityRows.push({name:sp.name,value:n});const ignored=0,known=completed.filter(w=>Number.isFinite(Number(w.effort))&&w.effort!==null&&w.effort!=='');const points=known.length===completed.length?known.reduce((sum,w)=>sum+Number(w.effort),0):'Incomplete';const row=reportNode('tr');for(const v of [sp.name,baseline.length,endIds.size,n,points])row.append(reportNode('td','',v));tb.append(row);}table.append(tb);if(velocityRows.length)reportVelocityChart(velocity,velocityRows);else reportEmptyChart(velocity,'Velocity history not yet available','No completed sprint observations have been recorded. This chart will populate as sprint history is captured.');const detail=reportNode('details','gs-chart-details');detail.append(reportNode('summary','','View velocity data table'),table);velocity.append(detail);velocity.append(reportNode('p','muted',any?'Item-count velocity uses recorded commitment snapshots. It is not story-point velocity or inferred historical state.':'Capture a commitment baseline and later observations to establish historical velocity. No history has been invented.'));
- const snaps=(s.snapshots||[]).filter(x=>reportSnapshotTimestamp(x.at)&&Array.isArray(x.items)).sort((a,b)=>reportSnapshotTimestamp(a.at).localeCompare(reportSnapshotTimestamp(b.at)));if(!snaps.length){reportEmptyChart(burn,'Burndown history not yet available','A baseline and subsequent observations are needed to draw a truthful historical line. Current sprint progress is shown above.');return;}const first=snaps[0],baseIds=new Set((first.items||[]).filter(w=>!isPlanningContextType(w)).map(w=>Number(w.id))),data=snaps.map(x=>({day:reportSnapshotTimestamp(x.at).slice(0,10),remaining:(x.items||[]).filter(w=>baseIds.has(Number(w.id))&&!/^(closed|accepted|tested and approved)$/i.test(w.state||'')).length}));const unique=[...new Map(data.map(x=>[x.day,x])).values()];if(unique.length<2){reportEmptyChart(burn,'Waiting for a second observation','A baseline is recorded. The burndown line will appear after another dated observation.');return;}const max=Math.max(baseIds.size,1),start=s.start&&reportSafeDate(s.start)?s.start:unique[0].day,end=s.end&&reportSafeDate(s.end)?s.end:unique[unique.length-1].day,span=Math.max(1,reportDay(end)-reportDay(start));const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 700 220');svg.setAttribute('role','img');svg.setAttribute('aria-label','Actual remaining committed work compared with ideal burndown');svg.style.width='100%';svg.style.maxHeight='270px';const ns='http://www.w3.org/2000/svg';const add=(tag,attrs)=>{const el=document.createElementNS(ns,tag);for(const [k,v] of Object.entries(attrs))el.setAttribute(k,String(v));svg.append(el);return el;};const x=d=>40+Math.max(0,Math.min(1,(reportDay(d)-reportDay(start))/span))*640,y=n=>190-(n/max)*160;add('line',{x1:40,y1:190,x2:680,y2:190,stroke:'currentColor','stroke-opacity':'.4'});add('line',{x1:40,y1:30,x2:40,y2:190,stroke:'currentColor','stroke-opacity':'.4'});add('line',{x1:x(start),y1:y(baseIds.size),x2:x(end),y2:y(0),stroke:'#8a9bab','stroke-dasharray':'7 5','stroke-width':2});add('polyline',{points:unique.map(p=>`${x(p.day)},${y(p.remaining)}`).join(' '),fill:'none',stroke:'#287fc1','stroke-width':3});for(const p of unique)add('circle',{cx:x(p.day),cy:y(p.remaining),r:4,fill:'#287fc1'});burn.append(svg,reportNode('p','muted',`Baseline: ${baseIds.size} executable items. Actual line contains ${unique.length} recorded dates; no interpolation of unobserved work-item states.`));}
-async function reportRefresh(){if(timelineBusy)return;diagnostic('ado.refresh.started',{source:'reports'});const s=currentSprint();if(!s)return notify('Select a sprint.',true);if(sprintDirty()||projectsDirty())return notify('Save or discard unsaved changes before refreshing.',true);await loadAssignedItems();lastReportRefresh=Date.now();diagnostic('ado.refresh.completed',{source:'reports',assigned:currentSprint()?.itemIds?.length||0,loaded:assignedItems.length});notify('Loaded current Azure DevOps work-item revisions.');}
-async function captureReportObservation(){const s=currentSprint();if(!s)return notify('Select a sprint.',true);const all=new Map([...items,...assignedItems].map(w=>[Number(w.id),w]));const missing=(s.itemIds||[]).filter(id=>!all.has(Number(id)));if(missing.length)return notify('Cannot capture incomplete observation: '+missing.length+' work items not loaded.',true);const snap={at:new Date().toISOString(),items:s.itemIds.map(id=>{const w=all.get(Number(id));return {id:w.id,project:w.project,title:w.title,type:w.type,state:w.state,effort:w.effort};})};const ok=await persist(r=>{const target=r.sprints.find(x=>x.id===s.id);target.snapshots||=[];target.snapshots.push(snap);if(target.snapshots.length>150)target.snapshots=target.snapshots.slice(-150);},false);if(ok){renderSprintHealth();notify('Dated work-item observation captured.');}}
-async function updateTimelineTicket(w,changes){if(timelineBusy)return;const entries=Object.entries(changes).filter(([,v])=>v!==undefined);if(!entries.length)return;timelineBusy=true;const button=$('timelineSave');if(button)button.disabled=true;try{diagnostic('ado.timeline_update_attempt',{workItemId:w.id,fieldCount:entries.length,revision:w.rev,fields:entries.map(([path])=>path.split('.').at(-1)).join(',')});const patch=[{op:'test',path:'/rev',value:w.rev},...entries.map(([path,value])=>value?{op:'add',path:'/fields/'+path,value}: {op:'remove',path:'/fields/'+path})];const result=await api(`/_apis/wit/workitems/${w.id}?api-version=7.1`,{method:'PATCH',headers:{'Content-Type':'application/json-patch+json'},body:JSON.stringify(patch)});diagnostic('ado.timeline_update_success',{workItemId:w.id,fieldCount:entries.length,revisionBefore:w.rev,revisionAfter:result.rev,fields:entries.map(([path])=>path.split('.').at(-1)).join(',')});const fresh=normalizeItem(result);for(const item of [...items,...assignedItems,...ancestorItems])if(item.id===w.id)Object.assign(item,fresh);renderBoard();renderSprintHealth();renderTimeline();notify('Saved ticket #'+w.id+' directly to Azure DevOps.');}catch(e){diagnostic('ado.timeline_update_failure',{workItemId:w.id,reason:String(e.message||e)},'error');notify('Ticket update rejected. No local changes saved: '+e.message,true);await reportRefresh();}finally{timelineBusy=false;if(button)button.disabled=false;}}
+function reportCompletedState(w){return /^(done|closed|accepted|tested and approved|completed|resolved)$/i.test(String(w?.state||'').trim());}
+function reportEstimate(w){const raw=w?.effort??w?.storyPoints;return raw!==null&&raw!==undefined&&raw!==''&&Number.isFinite(Number(raw))&&Number(raw)>=0?Number(raw):0;}
+function reportCommittedProgress(baseline,observed){const executable=baseline.filter(w=>!isPlanningContextType(w));const latest=new Map(observed.map(w=>[Number(w.id),w]));let total=0,completed=0,completedItems=0,remaining=0;for(const original of executable){const now=latest.get(Number(original.id));const estimate=reportEstimate(now||original);total+=estimate;if(now&&reportCompletedState(now)){completed+=estimate;completedItems++;}else remaining+=estimate;}return {total,completed,remaining,completedItems,totalItems:executable.length};}
+function renderVelocityBurndown(){
+ const velocity=$('reportVelocity'),burn=$('reportBurndown');if(!velocity||!burn)return;velocity.replaceChildren();burn.replaceChildren();const s=currentSprint();if(!s)return;
+ const siblings=workspaceSprints().filter(x=>x.start).sort((a,b)=>a.start.localeCompare(b.start));const table=reportNode('table');table.innerHTML='<thead><tr><th>Sprint</th><th>Committed items</th><th>Completed items</th><th>Completed points</th><th>Remaining points</th></tr></thead>';const tb=reportNode('tbody');const velocityRows=[];
+ for(const sp of siblings.slice(-8)){
+  const snaps=(sp.snapshots||[]).filter(x=>reportSnapshotTimestamp(x.at)&&Array.isArray(x.items)).sort((a,b)=>reportSnapshotTimestamp(a.at).localeCompare(reportSnapshotTimestamp(b.at)));if(!snaps.length)continue;
+  const progress=reportCommittedProgress(snaps[snaps.length-1].items,snaps[snaps.length-1].items);velocityRows.push({name:sp.name,value:progress.completed});const row=reportNode('tr');for(const v of [sp.name,progress.totalItems,progress.completedItems,progress.completed,progress.remaining])row.append(reportNode('td','',v));tb.append(row);
+ }
+ table.append(tb);if(velocityRows.length)reportVelocityChart(velocity,velocityRows);else reportEmptyChart(velocity,'Velocity history not yet available','No recorded sprint baseline is available yet. Live progress for the selected sprint is shown separately below.');
+ const coverage=reportCoverage(),liveWork=reportWork();
+ if(!coverage.missing.length&&coverage.assigned){const live=reportCommittedProgress(liveWork,liveWork);velocity.append(reportNode('p','gs-health-note',`Selected sprint live completion (${s.name}): ${live.completed} completed points, ${live.remaining} remaining points; ${live.completedItems} of ${live.totalItems} executable items completed. This is not historical velocity.`));}
+ else if(coverage.missing.length)velocity.append(reportNode('p','muted',`${coverage.missing.length} committed items are not loaded; live completion cannot be verified.`));
+ const detail=reportNode('details','gs-chart-details');detail.append(reportNode('summary','','View completed-effort data'),table);velocity.append(detail,reportNode('p','muted','Completed points use normalized Effort or Story Points. Done, Completed and Closed count as completed execution; each item counts once. Each historical bar reflects its last recorded observation, not necessarily its final sprint result.' ));
+ const snaps=(s.snapshots||[]).filter(x=>reportSnapshotTimestamp(x.at)&&Array.isArray(x.items)).sort((a,b)=>reportSnapshotTimestamp(a.at).localeCompare(reportSnapshotTimestamp(b.at)));
+ if(!snaps.length){
+  const live=reportWork(),committed=(s.itemIds||[]).length;
+  if(committed&&!reportCoverage().missing.length){const progress=reportCommittedProgress(live,live);burn.append(reportNode('p','gs-health-note',`Live sprint progress: ${progress.completed} completed points, ${progress.remaining} remaining points (${progress.completedItems}/${progress.totalItems} executable items).`));}
+  reportEmptyChart(burn,'Burndown history not yet available','Live progress is shown above when all committed work items are loaded. A dated historical trend needs a baseline and subsequent observations.');return;
+ }
+ const base=snaps[0].items;const data=snaps.map(x=>({day:reportSnapshotTimestamp(x.at).slice(0,10),...reportCommittedProgress(x.items,x.items)}));const unique=[...new Map(data.map(x=>[x.day,x])).values()];const latest=data[data.length-1];
+ const live=reportWork();if(live.length===new Set((s.itemIds||[]).map(Number)).size || (s.itemIds||[]).every(id=>[...items,...assignedItems].some(w=>Number(w.id)===Number(id)))){const current=reportCommittedProgress(live,live);burn.append(reportNode('p','gs-health-note',`Live sprint progress: ${current.completed} completed points, ${current.remaining} remaining points (${current.completedItems}/${current.totalItems} executable items). Historical charts update only from saved observations.`));}
+ burn.append(reportNode('p','muted',`Last recorded observation: ${latest.completed} completed points, ${latest.remaining} remaining points (${latest.completedItems} of ${latest.totalItems} executable items completed).`));
+ if(data.some(p=>p.total!==data[0].total||p.totalItems!==data[0].totalItems))burn.append(reportNode('p','gs-health-note','Sprint membership or estimates changed between recorded observations. The actual line reflects each dated observation; the ideal line is based on the earliest recorded baseline and is not a fixed-scope comparison.')); 
+ if(unique.length<2){reportEmptyChart(burn,'Waiting for a second observation day','Current completed and remaining effort is shown above. A dated trend line requires observations from at least two days.');return;}
+ const max=Math.max(1,...unique.map(x=>x.total));const start=s.start&&reportSafeDate(s.start)?s.start:unique[0].day,end=s.end&&reportSafeDate(s.end)?s.end:unique[unique.length-1].day,span=Math.max(1,reportDay(end)-reportDay(start));const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 700 220');svg.setAttribute('role','img');svg.setAttribute('aria-label','Remaining estimated effort compared with ideal burndown');svg.style.width='100%';svg.style.maxHeight='270px';const ns='http://www.w3.org/2000/svg';const add=(tag,attrs)=>{const el=document.createElementNS(ns,tag);for(const [k,v] of Object.entries(attrs))el.setAttribute(k,String(v));svg.append(el);return el;};const x=d=>40+Math.max(0,Math.min(1,(reportDay(d)-reportDay(start))/span))*640,y=n=>190-(n/max)*160;add('line',{x1:40,y1:190,x2:680,y2:190,stroke:'currentColor','stroke-opacity':'.4'});add('line',{x1:40,y1:30,x2:40,y2:190,stroke:'currentColor','stroke-opacity':'.4'});add('line',{x1:x(start),y1:y(unique[0].total),x2:x(end),y2:y(0),stroke:'#8a9bab','stroke-dasharray':'7 5','stroke-width':2});add('polyline',{points:unique.map(p=>`${x(p.day)},${y(p.remaining)}`).join(' '),fill:'none',stroke:'#287fc1','stroke-width':3});for(const p of unique)add('circle',{cx:x(p.day),cy:y(p.remaining),r:4,fill:'#287fc1'});burn.append(svg,reportNode('p','muted',`Actual remaining estimated points across ${unique.length} recorded dates. No historical states have been inferred.`));
+}
+
+async function captureReportObservation(){const s=currentSprint();if(!s)return notify('Select a sprint.',true);const all=new Map([...items,...assignedItems].map(w=>[Number(w.id),w]));const missing=(s.itemIds||[]).filter(id=>!all.has(Number(id)));if(missing.length)return notify('Cannot capture incomplete observation: '+missing.length+' work items not loaded.',true);const snap={at:new Date().toISOString(),items:s.itemIds.map(id=>{const w=all.get(Number(id));return {id:w.id,project:w.project,title:w.title,type:w.type,state:w.state,effort:w.effort,storyPoints:w.storyPoints};})};const ok=await persist(r=>{const target=r.sprints.find(x=>x.id===s.id);target.snapshots||=[];target.snapshots.push(snap);if(target.snapshots.length>150)target.snapshots=target.snapshots.slice(-150);},false);if(ok){renderSprintHealth();notify('Dated work-item observation captured.');}}
+async function updateTimelineTicket(w,changes){if(timelineBusy)return;const entries=Object.entries(changes).filter(([,v])=>v!==undefined);if(!entries.length)return;timelineBusy=true;const button=$('timelineSave');if(button)button.disabled=true;try{diagnostic('ado.timeline_update_attempt',{workItemId:w.id,fieldCount:entries.length,revision:w.rev,fields:entries.map(([path])=>path.split('.').at(-1)).join(',')});const patch=[{op:'test',path:'/rev',value:w.rev},...entries.map(([path,value])=>value?{op:'add',path:'/fields/'+path,value}: {op:'remove',path:'/fields/'+path})];const result=await api(`/_apis/wit/workitems/${w.id}?api-version=7.1`,{method:'PATCH',headers:{'Content-Type':'application/json-patch+json'},body:JSON.stringify(patch)});diagnostic('ado.timeline_update_success',{workItemId:w.id,fieldCount:entries.length,revisionBefore:w.rev,revisionAfter:result.rev,fields:entries.map(([path])=>path.split('.').at(-1)).join(',')});const fresh=normalizeItem(result);for(const item of [...items,...assignedItems,...ancestorItems])if(item.id===w.id)Object.assign(item,fresh);renderBoard();renderSprintHealth();renderTimeline();void autoReportObservation(currentSprint(),reportWork());notify('Saved ticket #'+w.id+' directly to Azure DevOps.');}catch(e){diagnostic('ado.timeline_update_failure',{workItemId:w.id,reason:String(e.message||e)},'error');notify('Ticket update rejected. No local changes saved: '+e.message,true);await reportRefresh();}finally{timelineBusy=false;if(button)button.disabled=false;}}
 let timelineSelectedId=null;
 function reportTimelineAxis(min,max){
  const axis=reportNode('div','gs-timeline-row gs-timeline-axis-row');axis.append(reportNode('strong','gs-timeline-axis-title','Calendar dates'));
@@ -1586,6 +1946,18 @@ window.setInterval(()=>void refreshTrackedWorkItemsQuietly(),120000);
 
 $('reportProject')?.addEventListener('change',e=>{reportProjectFilter=e.target.value;renderSprintHealth();renderTimeline();});
 $('reportPerson')?.addEventListener('change',e=>{reportPersonFilter=e.target.value;renderSprintHealth();renderTimeline();});
+async function reportRefresh(){
+ if(sprintDirty()||projectsDirty())return notify('Save or discard unsaved planning changes before refreshing reports.',true);
+ const sprintId=currentSprint()?.id;
+ try{
+  await refreshSharedRegistryForExecution();
+  if(sprintId&&!registry.sprints.some(x=>x.id===sprintId))throw Error('Selected sprint is no longer available.');
+  await loadAssignedItems();
+  renderSprintHealth();renderTimeline();
+  diagnostic('reports.refresh.completed',{sprintId,loaded:assignedItems.length});
+  notify('Reports refreshed from shared sprint membership and Azure DevOps work items.');
+ }catch(e){diagnostic('reports.refresh.failed',{reason:String(e.message||e)},'warn');notify('Report refresh failed: '+String(e.message||e),true);}
+}
 $('reportRefresh')?.addEventListener('click',()=>void reportRefresh());
 $('reportObserve')?.addEventListener('click',()=>void captureReportObservation());
 $('reportExport')?.addEventListener('click',reportExport);
@@ -1629,31 +2001,60 @@ function previewCeremonyPlan(){
  const start=planDate(range.start),end=planDate(range.end),span=Math.round((end-start)/86400000);if(!Number.isFinite(span)||span<0||span>730)return notify('Choose a date range between 1 day and 24 months.',true);
  const checked=id=>$(id).checked,days=new Set([...$('planDays').querySelectorAll('input:checked')].map(x=>Number(x.value))),duration=Number($('planDuration').value);if(!Number.isInteger(duration)||duration<5||duration>120)return notify('Standup duration must be 5–120 minutes.',true);
  const time=$('planTime').value||'09:30',participants=$('planParticipants').value.trim(),existing=scheduleMeetingRecords(w).concat((registry.sprints||[]).filter(s=>s.workspaceId===w.id).flatMap(s=>s.ceremonies||[]));
- const has=(date,type)=>existing.some(c=>c.date===date&&(c.type===type||c.secondary===type)&&c.status!=='Cancelled')||proposedCeremonies.some(c=>c.date===date&&(c.type===type||c.secondary===type));
- const add=(type,date,minutes,secondary='')=>{if(!date||has(date,type)||(secondary&&has(date,secondary)))return;proposedCeremonies.push({type,secondary,title:'',date,time,duration:minutes,participants,status:'Proposed',agenda:planAgenda(type)+(secondary?'\n\n'+planAgenda(secondary):''),outcome:''});};
+ const has=(date,type)=>existing.some(c=>(c.date===date||(c.repeat&&c.repeat!=='none'&&c.date<=date&&c.repeatEnd>=date))&&(c.type===type||c.secondary===type)&&c.status!=='Cancelled')||proposedCeremonies.some(c=>c.date===date&&(c.type===type||c.secondary===type));
+ // Derive a regular sprint cadence from the workspace's actual selected sprint dates.
+ // Irregular or non-whole-week sprints cannot be represented by a native Outlook weekly rule.
+ const sprint=currentSprint();
+ const sprintDays=sprint?.start&&sprint?.end?Math.round((planDate(sprint.end)-planDate(sprint.start))/86400000)+1:0;
+ const sprintWeeks=sprintDays>=7&&sprintDays%7===0?sprintDays/7:0;
+ const cadenceRange=span+1>sprintDays&&sprintWeeks>0;
+ const add=(type,date,minutes,secondary='')=>{
+  if(!date||has(date,type)||(secondary&&has(date,secondary)))return;
+  const meeting={type,secondary,title:'',date,time,duration:minutes,participants,status:'Proposed',agenda:planAgenda(type)+(secondary?'\n\n'+planAgenda(secondary):''),outcome:''};
+  if(cadenceRange&&type!=='Standup')Object.assign(meeting,{repeat:'sprint',repeatInterval:sprintWeeks,repeatEnd:range.end});
+  proposedCeremonies.push(meeting);
+ };
  // Place major ceremonies as a coordinated sequence, leaving room for work between them.
  const weekday=i=>{const d=new Date(start.getTime()+i*86400000).getUTCDay();return d>0&&d<6;};
  const valid=Array.from({length:span+1},(_,i)=>i).filter(weekday);
  const nearest=(target,min=0,max=span)=>{const options=valid.filter(i=>i>=min&&i<=max);return options.sort((a,b)=>Math.abs(a-target)-Math.abs(b-target)||a-b)[0]??Math.max(0,Math.min(span,Math.round(target)));};
  const asDate=i=>planISO(new Date(start.getTime()+i*86400000));
- const planning=nearest(0),review=nearest(span>=10?span-5:span>=7?span-3:span-1,planning+1),retroDay=nearest(span>=7?span-1:span,review+1),refine=nearest(span*0.55,planning+1,Math.max(planning+1,review-1));
+ const cycleSpan=cadenceRange?Math.min(span,sprintDays-1):span;
+ const planning=nearest(0),review=nearest(cycleSpan>=10?cycleSpan-5:cycleSpan>=7?cycleSpan-3:cycleSpan-1,planning+1,cycleSpan),retroDay=nearest(cycleSpan>=7?cycleSpan-1:cycleSpan,review+1,cycleSpan),refine=nearest(cycleSpan*0.55,planning+1,Math.max(planning+1,review-1));
  if(checked('planPlanning'))add('Sprint Planning',asDate(planning),60);
  if(checked('planReview'))add('Sprint Review',asDate(review),45);
  const retro=checked('planRetro'),groom=checked('planGroom');
  if(retro&&groom&&checked('planCombine'))add('Retrospective',asDate(retroDay),60,'Backlog Refinement');
  else{if(retro)add('Retrospective',asDate(retroDay),30);if(groom)add('Backlog Refinement',asDate(refine),30);}
- if(checked('planStandup'))for(let i=0;i<=span;i++){const date=planISO(new Date(start.getTime()+i*86400000)),day=planDate(date).getUTCDay();if(!days.has(day))continue;if($('planCadence').value==='unoccupied'&&existing.some(c=>c.date===date&&c.status!=='Cancelled'))continue;if($('planCadence').value==='unoccupied'&&proposedCeremonies.some(c=>c.date===date))continue;add('Standup',date,duration);}
+ if(checked('planStandup')){
+  // One Outlook weekly series for the selected weekdays, not one meeting per date.
+  // In unoccupied mode, remove weekdays already used by workspace ceremonies.
+  const occupied=new Set(existing.concat(proposedCeremonies).filter(c=>c.type!=='Standup'&&c.status!=='Cancelled').map(c=>planDate(c.date).getUTCDay()));
+  const selected=[...days].filter(d=>d>=1&&d<=5&&($('planCadence').value!=='unoccupied'||!occupied.has(d))).sort((a,b)=>a-b);
+  const first=Array.from({length:span+1},(_,i)=>i).find(i=>selected.includes(new Date(start.getTime()+i*86400000).getUTCDay()));
+  if(first!==undefined){
+   const date=asDate(first);
+   if(!existing.some(c=>c.type==='Standup'&&c.status!=='Cancelled'&&(c.repeatEnd||c.date)>=date)){
+    proposedCeremonies.push({type:'Standup',title:'',date,time,duration,participants,status:'Proposed',agenda:planAgenda('Standup'),outcome:'',repeat:'weekly',repeatDays:selected.map(d=>OUTLOOK_DAYS[d]),repeatEnd:range.end});
+   }
+  }
+ }
  proposedCeremonies.sort((a,b)=>a.date.localeCompare(b.date)||a.time.localeCompare(b.time));proposalWorkspaceId=w.id;proposalRange=range;
  const table=document.createElement('table'),header=document.createElement('tr');for(const label of ['Include','Ceremony','Date','Time','Minutes']){const th=document.createElement('th');th.textContent=label;header.append(th);}table.append(header);
- for(const c of proposedCeremonies){const tr=document.createElement('tr');const cell=()=>{const td=document.createElement('td');tr.append(td);return td;};const include=document.createElement('input');include.type='checkbox';include.checked=true;include.onchange=()=>{c.excluded=!include.checked;proposalCalendar();};cell().append(include);cell().textContent=c.type+(c.secondary?' + '+c.secondary:'');for(const [key,type] of [['date','date'],['time','time'],['duration','number']]){const input=document.createElement(type==='time'?'select':'input');if(type==='time')populateMeetingTimePicker(input,c[key]);else{input.type=type;input.value=c[key];}if(type==='number'){input.min='5';input.max='480';}input.onchange=()=>{c[key]=type==='number'?Number(input.value):input.value;proposalCalendar();};cell().append(input);}table.append(tr);}
- $('ceremonyPreview').replaceChildren(table);$('confirmCeremonies').disabled=!proposedCeremonies.length;$('ceremonyPreviewStatus').textContent=proposedCeremonies.length+' new meetings proposed. Calendar availability has not been checked.';proposalCalendar();
+ for(const c of proposedCeremonies){const tr=document.createElement('tr');const cell=()=>{const td=document.createElement('td');tr.append(td);return td;};const include=document.createElement('input');include.type='checkbox';include.checked=true;include.onchange=()=>{c.excluded=!include.checked;proposalCalendar();};cell().append(include);cell().textContent=c.type+(c.secondary?' + '+c.secondary:'');for(const [key,type] of [['date','date'],['time','time'],['duration','number']]){const input=document.createElement('input');if(type==='time'){input.type='time';input.step='60';input.setAttribute('list','gsTimePresets');populateMeetingTimePicker(input,c[key]);}else{input.type=type;input.value=c[key];}if(type==='number'){input.min='5';input.max='480';}input.onchange=()=>{c[key]=type==='number'?Number(input.value):input.value;proposalCalendar();};cell().append(input);}table.append(tr);}
+ $('ceremonyPreview').replaceChildren(table);$('confirmCeremonies').disabled=!proposedCeremonies.length;const included=proposedCeremonies.filter(c=>!c.excluded);
+ const standups=included.filter(c=>c.type==='Standup');
+ const distinctDays=[...new Set(standups.flatMap(c=>c.repeatDays||[OUTLOOK_DAYS[planDate(c.date).getUTCDay()]]))];
+ const nonStandups=included.length-standups.length;
+ $('ceremonyPreviewStatus').textContent=`${included.length} proposed meeting records (${standups.length} recurring standup series across ${distinctDays.length} selected weekdays; ${nonStandups} other ceremonies). Regular sprint ceremonies use one Outlook series when a whole-week sprint cadence and a longer workspace period are available; irregular dates require manual scheduling. Booking each standup record creates one Outlook series. Calendar availability has not been checked.`;
+ proposalCalendar();
 }
 async function confirmCeremonyPlan(){const w=activeScheduleWorkspace();if(!w||w.id!==proposalWorkspaceId||!proposalRange)return notify('Workspace changed. Regenerate the proposal.',true);const selected=proposedCeremonies.filter(c=>!c.excluded);if(!selected.length)return notify('Select at least one meeting.',true);if(selected.some(c=>!c.date||c.date<proposalRange.start||c.date>proposalRange.end||!c.time||!Number.isInteger(c.duration)||c.duration<5||c.duration>480))return notify('Selected meetings need valid dates, times and durations within the chosen period.',true);
  const keys=new Set();for(const c of selected){const k=[c.date,c.type,c.secondary||''].join('|');if(keys.has(k))return notify('Duplicate meetings in preview.',true);keys.add(k);}
  const existing=scheduleMeetingRecords(w).concat((registry.sprints||[]).filter(s=>s.workspaceId===w.id).flatMap(s=>s.ceremonies||[]));const unique=selected.filter(c=>!existing.some(e=>e.status!=='Cancelled'&&e.date===c.date&&e.type===c.type&&e.secondary===c.secondary));if(!unique.length)return notify('These meetings already exist.',true);
  if(!confirm(`CONFIRM MEETING SCHEDULE\n\nWorkspace: ${w.name}\nPeriod: ${proposalRange.start} to ${proposalRange.end}\nMeetings: ${unique.length}\nParticipants: ${$('planParticipants').value||'Not specified'}\n\nSave this draft schedule and open its overview?\nNo Outlook invitations will be sent.`))return;const now=new Date().toISOString();const scheduleId=crypto.randomUUID();const ok=await persist(r=>{const target=r.workspaces.find(x=>x.id===w.id);target.meetingSchedules||=[];target.meetingSchedules.push({id:scheduleId,name:'Meeting schedule '+proposalRange.start+' – '+proposalRange.end,start:proposalRange.start,end:proposalRange.end,createdAt:now,updatedAt:now,lifecycle:'Draft',preferences:{standupDuration:Number($('planDuration').value),cadence:$('planCadence').value,weekdays:[...$('planDays').querySelectorAll('input:checked')].map(x=>Number(x.value)),time:$('planTime').value,participants:$('planParticipants').value,types:['Planning','Standup','Review','Retro','Groom'].filter((x,i)=>[$('planPlanning'),$('planStandup'),$('planReview'),$('planRetro'),$('planGroom')][i].checked),combine:$('planCombine').checked},meetings:unique.map(c=>{const {excluded,...meeting}=c;return {...meeting,id:crypto.randomUUID(),createdAt:now,updatedAt:now};})});},false);
  if(ok){diagnostic('workspace.schedule.created',{workspaceId:w.id,scheduleId,count:unique.length});clearCeremonyProposal();expandedScheduleId=scheduleId;renderWorkspaceSchedules();renderCeremonies();renderCeremonyInsights();showWizardStep(1);const saved=$('scheduleSavedNotice');if(saved)saved.textContent=`Saved ${unique.length} meetings as an internal schedule. Outlook booking is not connected.`;const section=$('workspaceSchedules');section?.scrollIntoView({behavior:'smooth',block:'start'});notify(`${unique.length} meetings saved as a draft. No Outlook events created.`);}}
-function renderWorkspaceSchedules(){const list=$('workspaceSchedules');if(!list)return;list.replaceChildren();const w=activeScheduleWorkspace();if(!w)return;const schedules=w.meetingSchedules||[];if(!schedules.length){list.textContent='No workspace meeting schedules yet.';return;}for(const sc of schedules){const box=document.createElement('div');box.className='ceremony-record';const heading=document.createElement('strong');heading.textContent=sc.name;const info=document.createElement('p');info.className='muted';info.textContent=`${sc.start} to ${sc.end} · ${(sc.meetings||[]).length} meeting(s) · ${sc.lifecycle||'Draft'} · Not booked in Outlook${sc.retirementReason?' · '+sc.retirementReason:''}`;box.append(heading,info);const actions=document.createElement('div');actions.className='row';const extend=document.createElement('button');extend.textContent='Extend';extend.onclick=()=>{const date=prompt('New end date (YYYY-MM-DD)',sc.end);if(date!==null)void extendWorkspaceSchedule(sc.id,date);};const details=document.createElement('button');details.className='secondary';details.textContent=expandedScheduleId===sc.id?'Hide meetings':'View meetings';details.onclick=()=>{expandedScheduleId=expandedScheduleId===sc.id?null:sc.id;renderWorkspaceSchedules();};actions.append(extend,details);
+function renderWorkspaceSchedules(){const list=$('workspaceSchedules');if(!list)return;list.replaceChildren();const w=activeScheduleWorkspace();if(!w)return;const schedules=w.meetingSchedules||[];if(!schedules.length){list.textContent='No workspace meeting schedules yet.';return;}for(const sc of schedules){const box=document.createElement('div');box.className='ceremony-record';const heading=document.createElement('strong');heading.textContent=sc.name;const info=document.createElement('p');info.className='muted';info.textContent=`${sc.start} to ${sc.end} · ${(sc.meetings||[]).length} meeting record(s) · ${(sc.meetings||[]).filter(m=>m.outlook?.state==='booked').length} Outlook booking(s) · ${sc.lifecycle||'Draft'}${sc.retirementReason?' · '+sc.retirementReason:''}`;box.append(heading,info);const actions=document.createElement('div');actions.className='row';const extend=document.createElement('button');extend.textContent='Extend';extend.onclick=()=>{const date=prompt('New end date (YYYY-MM-DD)',sc.end);if(date!==null)void extendWorkspaceSchedule(sc.id,date);};const details=document.createElement('button');details.className='secondary';details.textContent=expandedScheduleId===sc.id?'Hide meetings':'View meetings';details.onclick=()=>{expandedScheduleId=expandedScheduleId===sc.id?null:sc.id;renderWorkspaceSchedules();};actions.append(extend,details);
  const calendarButton=document.createElement('button');calendarButton.className='secondary';calendarButton.textContent='Calendar';calendarButton.onclick=()=>{expandedScheduleId=sc.id;calendarScheduleId=calendarScheduleId===sc.id?null:sc.id;renderWorkspaceSchedules();};actions.append(calendarButton);
  const lifecycle=sc.lifecycle||'Draft';
  if(lifecycle==='Draft'){const commit=document.createElement('button');commit.textContent='Commit schedule';commit.onclick=()=>void changeScheduleLifecycle(sc.id,'commit');const discard=document.createElement('button');discard.className='secondary';discard.textContent='Discard draft';discard.onclick=()=>void changeScheduleLifecycle(sc.id,'discard');actions.append(commit,discard);}
@@ -1664,8 +2065,9 @@ function renderWorkspaceSchedules(){const list=$('workspaceSchedules');if(!list)
  outlook.textContent=c.outlook?.state==='booked'?'Booked in Outlook':c.outlook?.state==='pending'?'Booking needs review':c.outlook?.state==='cancelled'?'Cancelled in Outlook':c.outlook?.state?'Outlook sync needs review':'Schedule in Outlook';
  outlook.disabled=!!c.outlook?.state||c.status==='Cancelled'||c.status==='Completed';
  outlook.onclick=()=>void scheduleCeremonyInOutlook(c.id,sc.id);
+ line.dataset.ceremonyBookingId=String(c.id);line.dataset.ceremonyScheduleId=String(sc.id);
  line.append(outlook);
- if(c.outlook?.state==='booked'){const cancel=document.createElement('button');cancel.type='button';cancel.className='secondary';cancel.textContent='Cancel Outlook meeting';cancel.onclick=()=>void outlookCancelCeremony(c.id,sc.id);line.append(cancel);}
+ if(c.outlook?.state==='booked'){const cancel=document.createElement('button');cancel.type='button';cancel.className='danger';cancel.textContent='Cancel Outlook meeting';cancel.onclick=()=>void outlookCancelCeremony(c.id,sc.id);line.append(cancel);}
  else if(['pending','sync-pending','cancel-pending'].includes(c.outlook?.state)){const review=document.createElement('button');review.type='button';review.className='secondary';review.textContent='Review Outlook status';review.onclick=()=>void outlookReconcile(c.id,sc.id);line.append(review);}
  panel.append(line);}box.append(panel);}list.append(box);}}
 
@@ -1908,8 +2310,9 @@ function renderDemo(){if(!demoState)return;const m=demoHealth();$('demoStats').t
  demoReportRender();
  const decisions=$('demoDecisions');decisions.replaceChildren();for(const d of demoState.decisions){const p=document.createElement('p');p.textContent=d;decisions.append(p);}
 }
-function setDemoMode(enabled){diagnostic('demo.mode.changed',{enabled});demoActive=enabled;$('demoWorkspace').classList.toggle('hidden',!enabled);document.querySelector('.gs-tabs').classList.toggle('hidden',enabled);document.querySelectorAll('.gs-tab-panel').forEach(el=>el.classList.toggle('demo-hidden',enabled));document.querySelector('.gs-context').classList.toggle('hidden',enabled);$('demoToggle').classList.toggle('hidden',enabled);if(enabled){if(!demoState){try{demoState=JSON.parse(localStorage.getItem(DEMO_KEY));}catch{}if(!demoState||!Array.isArray(demoState.history)||!Array.isArray(demoState.observations))demoState=demoSeed('risk');} $('demoScenario').value=demoState.kind;renderDemo();}else{document.querySelectorAll('.gs-tab-panel').forEach(el=>el.classList.remove('demo-hidden'));activateTab('demo');} }
-$('demoToggle').addEventListener('click',()=>setDemoMode(true));$('demoExit').addEventListener('click',()=>setDemoMode(false));
+function setDemoMode(enabled){diagnostic('demo.mode.changed',{enabled});demoActive=enabled;$('demoWorkspace').classList.toggle('hidden',!enabled);document.querySelector('.gs-tabs').classList.toggle('hidden',enabled);document.querySelectorAll('.gs-tab-panel').forEach(el=>el.classList.toggle('demo-hidden',enabled && el.id!=='tab-demo'));document.querySelector('.gs-context').classList.toggle('hidden',enabled);$('demoToggle').classList.toggle('hidden',enabled);if(enabled){if(!demoState){try{demoState=JSON.parse(localStorage.getItem(DEMO_KEY));}catch{}if(!demoState||!Array.isArray(demoState.history)||!Array.isArray(demoState.observations))demoState=demoSeed('risk');} $('demoScenario').value=demoState.kind;renderDemo();}else{document.querySelectorAll('.gs-tab-panel').forEach(el=>el.classList.remove('demo-hidden'));activateTab('demo');} }
+$('demoToggle').addEventListener('click',()=>setDemoMode(true));
+$('demoExit').addEventListener('click',()=>setDemoMode(false));
 $('demoLoad').addEventListener('click',()=>{if(demoState&&demoState.decisions.length&&!confirm('Replace current demo scenario and its changes?'))return;demoState=demoSeed($('demoScenario').value);saveDemo();diagnostic('demo.scenario.loaded',{scenario:demoState.kind,ticketCount:demoState.work.length,observations:demoState.observations.length});renderDemo();notify('Synthetic demo scenario loaded.');});
 $('demoReset').addEventListener('click',()=>{if(!confirm('Reset demo scenario to its original state? Production data is unaffected.'))return;demoState=demoSeed(demoState.kind);saveDemo();diagnostic('demo.scenario.reset',{scenario:demoState.kind});renderDemo();notify('Demo reset.');});
 $('demoAddDecision').addEventListener('click',()=>{const v=$('demoDecision').value.trim();if(!v)return;demoState.decisions.push(v);$('demoDecision').value='';saveDemo();renderDemo();});
@@ -1983,7 +2386,7 @@ async function m365RestoreSession(){
   await client.acquireTokenSilent({account,scopes:['User.Read']});
   m365Account=account;
   client.setActiveAccount?.(account);
-  m365ShowAccount();m365RenderCalendars('Microsoft 365 session restored. Refreshing Outlook calendars…');
+  m365ShowAccount();void peopleLookupRestore();m365RenderCalendars('Microsoft 365 session restored. Refreshing Outlook calendars…');
   // The MSAL account and the Graph calendar list have separate lifecycles.
   // Restore the calendar list after silent account validation, without a popup.
   void m365RefreshCalendars({silent:true});
@@ -1991,7 +2394,7 @@ async function m365RestoreSession(){
  }catch(e){
   // Silent renewal can require interaction, or the browser may have cleared its
   // session cache. Neither condition should break the ADO hub.
-  m365Account=null;
+  peopleLookupEnabled=false;++peopleLookupSerial;peopleLookupSetUI();m365Account=null;
   m365ShowAccount();m365RenderCalendars('Microsoft 365 session could not be restored silently. Select Connect Microsoft 365 to sign in again.');
   diagnostic('m365.session.restore_unavailable',{message:String(e.message||e)},'warn');
  }
@@ -2004,7 +2407,7 @@ async function m365Connect(){
   const response=await client.loginPopup({scopes:M365_SCOPES,prompt:'select_account'});
   if(!response?.account)throw Error('Microsoft sign-in did not return an account.');
   m365Account=response.account;client.setActiveAccount?.(m365Account);
-  m365ShowAccount();m365RenderCalendars();notify('Microsoft 365 connected as '+(m365Account.username||m365Account.name)+'.');
+  m365ShowAccount();void peopleLookupRestore();m365RenderCalendars();notify('Microsoft 365 connected as '+(m365Account.username||m365Account.name)+'.');
  }catch(e){
   const message=String(e.message||e);diagnostic('m365.signin.failed',{message},'warn');
   $('m365Status').textContent='Microsoft 365 connection unsuccessful: '+message;
@@ -2017,7 +2420,7 @@ async function m365Disconnect(){
  try{
   // Clear the application account and its cached tokens; avoid signing the user out of Microsoft 365 globally.
   await m365Client.clearCache({account:m365Account});
-  m365Account=null;m365Calendars=[];m365ShowAccount();m365RenderCalendars();notify('Global Sprints Microsoft 365 connection cleared.');
+  peopleLookupEnabled=false;++peopleLookupSerial;peopleLookupSetUI('Recipient suggestions unavailable while disconnected.');m365Account=null;m365Calendars=[];m365ShowAccount();m365RenderCalendars();notify('Global Sprints Microsoft 365 connection cleared.');
  }catch(e){$('m365Status').textContent='Disconnect failed: '+String(e.message||e);notify('Disconnect failed. See Configuration.',true);}
  finally{btn.disabled=!m365Account;}
 }

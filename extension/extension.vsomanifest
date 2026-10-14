@@ -4,7 +4,8 @@
     "vso.work",
     "vso.work_write",
     "vso.extension.data",
-    "vso.extension.data_write"
+    "vso.extension.data_write",
+    "vso.graph"
   ],
   "contributions": [
     {
@@ -34,5 +35,5 @@
     }
   ],
   "contributionTypes": [],
-  "version": "0.9.0"
+  "version": "0.9.16"
 }

@@ -34,3 +34,8 @@ print("Microsoft 365 session recovery checks PASS")
 assert 'void m365RefreshCalendars({silent:true})' in app, 'Calendar refresh after session recovery missing'
 assert 'if(m365Account!==accountAtStart)return' in app, 'Stale calendar response guard missing'
 print('Calendar session restoration checks PASS')
+
+assert f"const DIAG_VERSION='{v}'" in app, 'Audit diagnostic version differs from manifest'
+assert 'Access remains available in this integration preview' not in app, 'Legacy fail-open diagnostic remains'
+assert 'const denied=ROOM_ENFORCE_PREVIEW&&!roomAccessAllowed()' in app, 'Initial entitlement check must restrict work areas'
+print('Commercial UI gating and diagnostics version invariants PASS')

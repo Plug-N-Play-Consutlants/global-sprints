@@ -1,0 +1,61 @@
+{
+  "audit": "PNPC Global Sprints static pathway trace",
+  "version": "0.6.1",
+  "generatedAt": "2026-10-14T05:00:05.014751+00:00",
+  "scope": "Source presence and static wiring only; no ADO/Graph runtime access",
+  "checks": [
+    {
+      "check": "State PATCH with revision guard",
+      "status": "SOURCE_PRESENT",
+      "missing": []
+    },
+    {
+      "check": "Project/type-scoped workflow metadata",
+      "status": "SOURCE_PRESENT",
+      "missing": []
+    },
+    {
+      "check": "ADO work-item-type states endpoint",
+      "status": "SOURCE_PRESENT",
+      "missing": []
+    },
+    {
+      "check": "Assigned-item refresh trace",
+      "status": "SOURCE_PRESENT",
+      "missing": []
+    },
+    {
+      "check": "Hierarchy rendering",
+      "status": "SOURCE_PRESENT",
+      "missing": []
+    },
+    {
+      "check": "Automatic progress snapshots",
+      "status": "SOURCE_PRESENT",
+      "missing": []
+    },
+    {
+      "check": "Microsoft 365 calendar discovery",
+      "status": "SOURCE_PRESENT",
+      "missing": []
+    },
+    {
+      "check": "Demo recalculation instrumentation",
+      "status": "SOURCE_PRESENT",
+      "missing": []
+    },
+    {
+      "check": "Diagnostic export version",
+      "status": "SOURCE_PRESENT",
+      "missing": []
+    }
+  ],
+  "runtimeEvidenceRequired": [
+    "Actual Agile/Scrum process ancestry for each participating project",
+    "Customized state names and transitions by work-item type",
+    "Parent/child relationships before and after state update",
+    "Inbound external edit refresh with changed revision",
+    "Persisted progress observations across days and browser reloads",
+    "Outlook invite delivery timing and Graph response IDs"
+  ]
+}

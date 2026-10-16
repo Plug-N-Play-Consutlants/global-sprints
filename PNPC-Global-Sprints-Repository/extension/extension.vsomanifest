@@ -1,0 +1,39 @@
+{
+  "manifestVersion": 1,
+  "scopes": [
+    "vso.work",
+    "vso.work_write",
+    "vso.extension.data",
+    "vso.extension.data_write",
+    "vso.graph"
+  ],
+  "contributions": [
+    {
+      "id": "global-sprints-hub",
+      "type": "ms.vss-web.hub",
+      "targets": [
+        "ms.vss-work-web.work-hub-group"
+      ],
+      "properties": {
+        "name": "Global Sprints",
+        "uri": "index.html",
+        "icon": "images/icon.png"
+      }
+    },
+    {
+      "id": "global-sprints-organization-hub",
+      "type": "ms.vss-web.hub",
+      "targets": [
+        "ms.vss-web.collection-admin-hub-group"
+      ],
+      "properties": {
+        "name": "Global Sprints",
+        "uri": "index.html",
+        "icon": "images/icon.png",
+        "order": 80
+      }
+    }
+  ],
+  "contributionTypes": [],
+  "version": "0.9.23"
+}

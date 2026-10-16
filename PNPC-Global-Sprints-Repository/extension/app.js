@@ -448,6 +448,7 @@ initBulkControls();
 async function init(){try{
   sdk=sdkModule;
   sdk.init({loaded:false,applyTheme:true});await sdk.ready();context=sdk.getHost();m365Identity();
+  const hashTab=await restoreTabFromHostHash();
   // ADO hub readiness must not depend on organization queries or board restoration.
   sdk.notifyLoadSucceeded();notify('Connecting to organization data…');
   // Session recovery is independent of Azure DevOps data initialization.
@@ -458,7 +459,7 @@ async function init(){try{
   await loadProjects();
   await migrateWorkspaces();
   contextKey='pnpc-gs-ui:'+encodeURIComponent(organizationApiBase())+':'+encodeURIComponent(sdk.getUser?.()?.id||'anonymous');
-  const savedWorkspace=readContext().workspace;const restoredTab=readContext().activeTab; if(GS_VALID_TABS.includes(restoredTab)&&restoredTab!==requestedTab){requestedTab=restoredTab;showTab(restoredTab,false);}renderWorkspacePicker(savedWorkspace);syncWorkspaceProjects();renderWorkspaceConfiguration();populateBrowseProjects();const lastSprint=restoreContext();
+  const savedWorkspace=readContext().workspace;const restoredTab=readContext().activeTab; if(!hashTab&&GS_VALID_TABS.includes(restoredTab)&&restoredTab!==requestedTab){requestedTab=restoredTab;showTab(restoredTab,false);writeTabToHostHash(restoredTab);}renderWorkspacePicker(savedWorkspace);syncWorkspaceProjects();renderWorkspaceConfiguration();populateBrowseProjects();const lastSprint=restoreContext();
   renderSprintPicker(lastSprint);document.body.classList.remove('gs-initializing');syncPlanScope();renderWorkspaceSchedules();renderDeletionAudit();renderBoard();renderHistory();notify('Connected. Restoring assigned work items…');
   // Work-item hydration is independent of the extension host load handshake.
   void loadAssignedItems().catch(e=>{diagnostic('startup.board_restore_failed',{message:String(e.message||e)},'error');notify('Board restoration failed: '+e.message,true);});
@@ -1547,8 +1548,30 @@ function showTab(name,remember=true){
  document.querySelectorAll('.gs-tab').forEach(b=>{const on=b.dataset.tab===name;b.setAttribute('aria-selected',String(on));b.tabIndex=on?0:-1;});
  document.querySelectorAll('.gs-tab-panel').forEach(p=>p.classList.toggle('hidden',p.id!=='tab-'+name));
  if(name==='reports'){renderSprintHealth();renderTimeline();}if(name==='planning'){renderCeremonies();renderSprintHealth();}if(name==='board')renderBoard();
- if(remember){requestedTab=name;try{sessionStorage.setItem(GS_TAB_STORAGE,name);localStorage.setItem(GS_TAB_PERSIST,name);}catch{}rememberContext();}
+ if(remember){requestedTab=name;try{sessionStorage.setItem(GS_TAB_STORAGE,name);localStorage.setItem(GS_TAB_PERSIST,name);}catch{}rememberContext();writeTabToHostHash(name);}
  if(contextKey||remember)document.body.classList.remove('gs-initializing');
+}
+// The extension iframe is third-party content; browsers that block third-party
+// storage discard sessionStorage/localStorage across a host refresh. The host page
+// URL hash survives a refresh regardless, so it is the primary record of the tab.
+let hostNavigation=null;
+function tabFromHash(hash){const m=/(?:^|[#&])tab=([a-z]+)/.exec(String(hash||''));return m&&GS_VALID_TABS.includes(m[1])?m[1]:'';}
+function writeTabToHostHash(name){
+ if(!hostNavigation)return;
+ hostNavigation.getHash().then(hash=>{
+  if(tabFromHash(hash)===name)return;
+  const rest=String(hash||'').replace(/^#/,'').split('&').filter(p=>p&&!/^tab=/.test(p));
+  hostNavigation.replaceHash(['tab='+name,...rest].join('&'));
+ }).catch(()=>{});
+}
+async function restoreTabFromHostHash(){
+ try{
+  hostNavigation=await sdk.getService('ms.vss-features.host-navigation-service');
+  const tab=tabFromHash(await hostNavigation.getHash());
+  if(tab){if(tab!==requestedTab){requestedTab=tab;showTab(tab,false);}try{sessionStorage.setItem(GS_TAB_STORAGE,tab);localStorage.setItem(GS_TAB_PERSIST,tab);}catch{}}
+  else writeTabToHostHash(requestedTab);
+  return tab;
+ }catch(e){diagnostic('ui.tab.hash_unavailable',{message:String(e?.message||e)},'warn');hostNavigation=null;return '';}
 }
 function activateTab(name){
  if(!GS_VALID_TABS.includes(name))name='board';

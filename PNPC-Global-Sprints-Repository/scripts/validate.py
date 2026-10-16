@@ -37,5 +37,5 @@ print('Calendar session restoration checks PASS')
 
 assert f"const DIAG_VERSION='{v}'" in app, 'Audit diagnostic version differs from manifest'
 assert 'Access remains available in this integration preview' not in app, 'Legacy fail-open diagnostic remains'
-assert 'const denied=ROOM_ENFORCE_PREVIEW&&!roomAccessAllowed()' in app, 'Initial entitlement check must restrict work areas'
+assert 'const denied=ROOM_ENFORCE_PREVIEW&&!!roomStatus&&!roomAccessAllowed()' in app, 'Verified entitlement must restrict work areas'
 print('Commercial UI gating and diagnostics version invariants PASS')

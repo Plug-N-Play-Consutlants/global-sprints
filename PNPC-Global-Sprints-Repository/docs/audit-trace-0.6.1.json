@@ -1,7 +1,7 @@
 {
   "audit": "PNPC Global Sprints static pathway trace",
   "version": "0.6.1",
-  "generatedAt": "2026-10-14T05:00:05.014751+00:00",
+  "generatedAt": "2026-10-16T09:12:16.759491+00:00",
   "scope": "Source presence and static wiring only; no ADO/Graph runtime access",
   "checks": [
     {

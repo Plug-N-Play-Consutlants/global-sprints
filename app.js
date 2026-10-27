@@ -329,7 +329,26 @@ function serviceHttpError(service,status){
  const category=status===401?'Authentication required':status===403?'Permission denied':status===404?'Resource not found':status===409||status===412?'Concurrent change detected':status===429?'Request throttled':status>=500?'Service temporarily unavailable':'Request failed';
  return Error(`${service}: ${category} (HTTP ${Number(status)||0}). Check Extension Health or contact support if this persists.`);
 }
-async function api(path,options={}){const started=Date.now();const method=options.method||'GET';const response=await fetch(`${organizationApiBase()}${path}`,{...options,headers:{Authorization:`Bearer ${token}`,Accept:'application/json',...options.headers}});if(!response.ok){diagnostic('ado.api_failure',{status:response.status,method,durationMs:Date.now()-started},'error');throw serviceHttpError('Azure DevOps',response.status);}if(method!=='GET')diagnostic('ado.api_write',{status:response.status,method,durationMs:Date.now()-started});return response.status===204?null:response.json();}
+async function api(path,options={}){
+ const started=Date.now(),method=options.method||'GET';
+ const request=async accessToken=>fetch(`${organizationApiBase()}${path}`,{...options,headers:{Authorization:`Bearer ${accessToken}`,Accept:'application/json',...options.headers}});
+ let response=await request(token);
+ // A cached token may expire while the iframe remains open. Retry a read once with the
+ // SDK-issued token; never retry writes or reinterpret a genuine permission denial.
+ if(response.status===401&&method==='GET'){
+  const fresh=await sdk.getAccessToken();
+  if(fresh&&fresh!==token){token=fresh;response=await request(token);}
+ }
+ if(!response.ok){diagnostic('ado.api_failure',{status:response.status,method,durationMs:Date.now()-started},'error');throw serviceHttpError('Azure DevOps',response.status);}
+ if(method!=='GET')diagnostic('ado.api_write',{status:response.status,method,durationMs:Date.now()-started});
+ if(response.status===204)return null;
+ const type=response.headers?.get('content-type')||'';
+ if(!/\bjson\b|\+json\b/i.test(type)){
+  diagnostic('ado.api_non_json',{method,contentType:type.slice(0,90),path:path.split('?')[0]},'error');
+  throw Error('Azure DevOps returned a non-JSON response. The request may have been redirected or the session may need reauthorization.');
+ }
+ return response.json();
+}
 
 // Local UI preferences are scoped to the Azure DevOps user and organization.
 let browserItems=[],browserSequence=0,contextKey='',browserBusy=false,contextHydrating=false;
@@ -351,6 +370,18 @@ function populateBrowseProjects(){
  select.replaceChildren(new Option('Choose a project',''));
  projects.filter(x=>projectVisibility.includes(x.id)).sort((a,b)=>a.name.localeCompare(b.name)).forEach(x=>select.add(new Option(x.name,x.name)));
  if([...select.options].some(x=>x.value===old))select.value=old;
+ updateBrowseProjectLinks();
+}
+function updateBrowseProjectLinks(){
+ const name=$('browseProject').value;
+ const base=organizationApiBase();
+ for(const [id,suffix] of [['browseOpenBacklog','_backlogs/backlog'],['browseOpenWorkItems','_workitems/recentlyupdated']]){
+  const link=$(id);if(!link)continue;
+  const valid=!!(name&&base);
+  link.setAttribute('aria-disabled',String(!valid));
+  if(valid)link.href=base+'/'+encodeURIComponent(name)+'/'+suffix;
+  else link.removeAttribute('href');
+ }
 }
 function browseNotice(message,error=false){$('browseStatus').textContent=message;$('browseStatus').style.color=error?'var(--pn-error,#b42318)':'';}
 async function browseBacklog(){
@@ -374,7 +405,7 @@ async function browseBacklog(){
    }
   }
   if(sequence!==browserSequence)return;
-  browserItems=found;browserSelection.clear();renderBrowser();
+  browserItems=found;renderBrowser();renderSuggestions();
   browseNotice(`Showing ${found.length} recently changed work items from ${project}${(result.workItems||[]).length>=MAX_ITEMS?' (first 200; refine using search for older items)':''}. Add and Remove save immediately.`);
  }catch(e){browseNotice('Unable to browse backlog: '+e.message,true);}
  finally{browserBusy=false;$('browseLoad').disabled=false;}
@@ -400,8 +431,8 @@ function renderBrowser(){
   title.append(a,document.createTextNode(` ${item.title} `));
   const meta=document.createElement('span');meta.className='muted';meta.textContent=`${item.type} · ${item.state}`;
   const btn=document.createElement('button');btn.className='secondary';
-  const included=!!sprint?.itemIds.includes(item.id);btn.textContent=included?'Remove':'Add to sprint';btn.disabled=!sprint;
-  btn.onclick=async()=>{btn.disabled=true;await toggleItem(item.id);renderBrowser();};
+  const included=!!sprint?.itemIds.includes(item.id);btn.textContent=included?'Already on sprint':browserSelection.has(item.id)?'Remove from queue':'Queue now';btn.disabled=!sprint||included;
+  btn.onclick=()=>{if(browserSelection.has(item.id))browserSelection.delete(item.id);else browserSelection.add(item.id);renderBrowser();renderBacklog();};
   row.append(checkbox,title,meta,btn);return row;
  };
  const build=(item,depth,seen)=>{
@@ -424,14 +455,19 @@ function updateBulkToolbar(){
  const n=browserSelection.size,s=currentSprint();
  $('browseSelectedCount').textContent=`${n} selected`;
  for(const id of ['browseBulkAdd','browseBulkRemove','browseClearSelection'])$(id).disabled=bulkBusy||!n||(id!=='browseClearSelection'&&!s);
- $('browseSelectAll').disabled=bulkBusy||!s||!browserItems.length;
+ $('browseSelectAll').disabled=bulkBusy||!s||!browserItems.length;const queue=document.getElementById('gs-search-queue');if(queue)queue.textContent=n+' queued for sprint assignment';const allButton=document.getElementById('gs-add-queued');if(allButton)allButton.disabled=bulkBusy||!n||!s;renderQueuedList();
  bar.setAttribute('aria-busy',String(bulkBusy));
 }
-async function bulkAssign(add){
+function renderQueuedList(){
+ const host=document.getElementById('gs-queued-list');if(!host)return;host.replaceChildren();
+ const all=new Map([...items,...browserItems,...nearbyResults,...assignedItems].map(w=>[Number(w.id),w]));
+ for(const id of browserSelection){const row=document.createElement('div');row.className='row';const item=all.get(Number(id));const label=document.createElement('span');label.textContent='#'+id+(item?' · '+item.title:'');const add=document.createElement('button');add.type='button';add.textContent='Add to board';add.disabled=bulkBusy;add.onclick=()=>bulkAssign(true,[id]);const remove=document.createElement('button');remove.type='button';remove.className='secondary';remove.textContent='Remove from queue';remove.onclick=()=>{browserSelection.delete(id);renderBrowser();renderBacklog();};row.append(label,add,remove);host.append(row);}
+}
+async function bulkAssign(add,onlyIds=null){
  if(bulkBusy||!browserSelection.size)return;
  let sprint;try{sprint=requireSprint();}catch(e){return notify(e.message,true);}
  if(!(await guardSprint()))return;
- const ids=[...browserSelection];bulkBusy=true;updateBulkToolbar();
+ const ids=onlyIds||[...browserSelection];bulkBusy=true;updateBulkToolbar();
  try{
   const changed=ids.filter(id=>add?!sprint.itemIds.includes(id):sprint.itemIds.includes(id));
   if(!changed.length){notify('All selected items already have the requested sprint membership.');return;}
@@ -441,14 +477,14 @@ async function bulkAssign(add){
    if(!target)throw Error('Selected sprint is no longer available.');
    target.itemIds=add?[...new Set([...target.itemIds,...changed])]:target.itemIds.filter(id=>!selected.has(id));
   });
-  if(ok){browserSelection.clear();await loadAssignedItems();notify(`${changed.length} work item(s) ${add?'added to':'removed from'} the sprint.`);}
+  if(ok){for(const id of ids)browserSelection.delete(id);await loadAssignedItems();renderBacklog();renderSuggestions();renderBoard();notify(`${changed.length} work item(s) ${add?'added to':'removed from'} the sprint.`);}
  }catch(e){notify('Unable to update selected work items: '+e.message,true);}
  finally{bulkBusy=false;renderBrowser();}
 }
 function initBulkControls(){
  $('browseSelectAll').onclick=()=>{for(const item of browserItems)browserSelection.add(item.id);renderBrowser();};
- $('browseClearSelection').onclick=()=>{browserSelection.clear();renderBrowser();};
- $('browseBulkAdd').onclick=()=>bulkAssign(true);
+ $('browseClearSelection').onclick=()=>{browserSelection.clear();renderBrowser();renderBacklog();};
+ $('browseBulkAdd').onclick=()=>bulkAssign(true);const queueButton=document.getElementById('gs-add-queued');if(queueButton)queueButton.onclick=()=>bulkAssign(true);
  $('browseBulkRemove').onclick=()=>bulkAssign(false);
  updateBulkToolbar();
 }
@@ -459,7 +495,7 @@ async function init(){try{
  const startupTab=readStartupTab();
  requestedTab=startupTab||'board';
   sdk=sdkModule;
-  sdk.init({loaded:false,applyTheme:true});await sdk.ready();context=sdk.getHost();m365Identity();
+  await Promise.race([Promise.resolve(sdk.init({loaded:false,applyTheme:true})).then(()=>sdk.ready()),new Promise((_,reject)=>setTimeout(()=>reject(new Error('Azure DevOps extension SDK did not become ready within 15 seconds. Check the extension host and reload.')),15000))]);context=sdk.getHost();m365Identity();
   // ADO hub readiness must not depend on organization queries or board restoration.
   sdk.notifyLoadSucceeded();notify('Connecting to organization data…');
   // Session recovery is independent of Azure DevOps data initialization.
@@ -467,7 +503,7 @@ async function init(){try{
   token=await sdk.getAccessToken();if(!token)throw Error('Azure DevOps did not provide an access token.');roomRestoreVerified();renderRoomStatus();void checkRoom('entitlement');
   const service=await sdk.getService('ms.vss-features.extension-data-service');storage=await service.getExtensionDataManager(sdk.getExtensionContext().id,token);
   try{registry=await storage.getDocument(COLLECTION,ROOT);}catch(e){if(e.status!==404 && !/404|not found/i.test(String(e.message)))throw e;registry={id:ROOT,sprints:[]};}
-  await loadProjects();
+  try{await loadProjects();}catch(error){diagnostic('startup.projects_unavailable',{reason:String(error?.name||'api')},'error');notify('Project list unavailable: '+error.message,true);projects=[];}
   await migrateWorkspaces();
   contextKey='pnpc-gs-ui:'+encodeURIComponent(organizationApiBase())+':'+encodeURIComponent(sdk.getUser?.()?.id||'anonymous');
   const savedContext=readContext();const savedWorkspace=savedContext.workspace;
@@ -530,14 +566,25 @@ async function saveProjectPreferences(){
 }
 function renderSprintPicker(preferred){const p=$('sprintPicker');const selected=preferred||p.value;p.replaceChildren(new Option('Select a sprint',''));workspaceSprints().forEach(s=>p.add(new Option(s.name,s.id)));p.value=workspaceSprints().some(s=>s.id===selected)?selected:'';activeSprintId=p.value;renderSprintFields();if($('planScope'))syncPlanScope();rememberContext();}
 function renderSprintFields(){const s=registry.sprints.find(x=>x.id===$('sprintPicker').value);$('sprintName').value=s?.name||'';$('start').value=s?.start||'';$('end').value=s?.end||'';$('goal').value=s?.goal||'';$('status').value=s?.status||'Planning';savedSprintForm=sprintForm();updateDirty();renderGuidance();renderBacklog();renderBrowser();renderBoard();renderHistory();renderCeremonies();renderWorkspaceSchedules();renderSprintHealth();renderPmAssistance();renderDeletionAudit();renderBoardDrafts();}
-async function persist(change,render=true){
+async function persist(change,render=true,announce=true){
  if(busy){notify('An operation is already in progress. Please wait.',true);return false;}
  busy=true;notify('Saving changes…');
  try{
   // Reject stale edits rather than silently replacing another user's registry changes.
   // The extension-data service ETag on setDocument provides the final atomic check.
   let latest;
-  try{latest=await storage.getDocument(COLLECTION,ROOT);}catch(e){if(e.status!==404&&!/404|not found/i.test(String(e.message)))throw e;latest=null;}
+  try{latest=await storage.getDocument(COLLECTION,ROOT);}catch(e){
+   if(e.status===404||/404|not found/i.test(String(e.message)))latest=null;
+   else if(e.status===401||e.status===403||/TF400813|not authorized|unauthorized/i.test(String(e.message||''))){
+    // Retry only the read, before any mutation. Never blindly replay setDocument.
+    diagnostic('registry.save_auth_refresh',{status:e.status||0},'warn');
+    const freshToken=await sdk.getAccessToken();if(!freshToken)throw e;
+    token=freshToken;
+    const service=await sdk.getService('ms.vss-features.extension-data-service');
+    storage=await service.getExtensionDataManager(sdk.getExtensionContext().id,token);
+    latest=await storage.getDocument(COLLECTION,ROOT);
+   }else throw e;
+  }
   if(latest&&registry.__etag!==latest.__etag){
    throw Error('Another team member saved changes since you loaded this page. Refresh Global Sprints to load their changes before saving yours.');
   }
@@ -545,7 +592,7 @@ async function persist(change,render=true){
   const next=structuredClone(registry);await change(next);if(registry.__etag!==undefined)next.__etag=registry.__etag;
   const saved=await storage.setDocument(COLLECTION,next);registry=saved;
  if(render)renderSprintPicker($('sprintPicker').value);
- notify('Changes saved successfully.');return true;
+ if(announce)notify('Changes saved successfully.');return true;
  }catch(e){notify('Save failed: '+e.message+' Reload before retrying if another user changed this record.',true);return false;}
  finally{busy=false;}
 }
@@ -568,7 +615,21 @@ async function saveSprint(){
 // Sprint selection is personal UI context; sprint membership and execution are shared.
 // Always reload the organization registry before switching to another member's sprint.
 async function refreshSharedRegistryForExecution(){
- const latest=await storage.getDocument(COLLECTION,ROOT);
+ let latest;
+ try{latest=await storage.getDocument(COLLECTION,ROOT);}
+ catch(error){
+  // Only refresh the extension-data manager for an explicit authorization failure.
+  // Do not broaden scopes or retry a real access denial indefinitely.
+  const authFailure=error?.status===401||error?.status===403||/TF400813|not authorized|unauthorized/i.test(String(error?.message||''));
+  if(!authFailure)throw error;
+  diagnostic('sprint.switch_auth_retry',{status:error?.status||0},'warn');
+  const refreshed=await sdk.getAccessToken();
+  if(!refreshed)throw error;
+  token=refreshed;
+  const service=await sdk.getService('ms.vss-features.extension-data-service');
+  storage=await service.getExtensionDataManager(sdk.getExtensionContext().id,token);
+  latest=await storage.getDocument(COLLECTION,ROOT);
+ }
  if(!latest||!Array.isArray(latest.sprints)||!Array.isArray(latest.workspaces))throw Error('Shared workspace data is unavailable. No local assignments were changed.');
  registry=latest;
  return latest;
@@ -599,13 +660,13 @@ function searchCandidates(){
  const query=$('search').value.trim().toLowerCase();
  if(!query)return [];
  const digits=/^#?(\d+)$/.exec(query)?.[1];
- const all=new Map([...items,...nearbyResults].map(w=>[w.id,w]));
- return [...all.values()].map(w=>{
+ const all=new Map([...items,...browserItems,...nearbyResults].map(w=>[w.id,w]));const committed=new Set((currentSprint()?.itemIds||[]).map(Number));
+ return [...all.values()].filter(w=>!committed.has(Number(w.id))).map(w=>{
   const title=w.title.toLowerCase(), id=String(w.id);
   const exact=id===digits?0:title===query?1:title.startsWith(query)?2:title.includes(query)?3:id.includes(query)?4:10;
   const distance=digits?Math.abs(w.id-Number(digits)):0;
-  return {w,rank:digits?(distance<=10?distance:exact+20):exact};
- }).filter(x=>x.rank<30).sort((a,b)=>a.rank-b.rank||b.w.id-a.w.id).slice(0,12).map(x=>x.w);
+  return {w,rank:digits?(distance<=12?(w.id>=Number(digits)?distance:distance+12):exact+30):exact};
+ }).filter(x=>x.rank<30).sort((a,b)=>a.rank-b.rank||a.w.id-b.w.id).slice(0,20).map(x=>x.w);
 }
 function renderSuggestions(){
  const target=$('searchSuggestions'),query=$('search').value.trim();target.replaceChildren();
@@ -615,7 +676,7 @@ function renderSuggestions(){
   const b=document.createElement('button');b.type='button';b.setAttribute('role','option');
   const main=document.createElement('span');main.textContent=`#${w.id} · ${w.title}`;
   const sub=document.createElement('span');sub.className='muted';sub.textContent=`${w.project} · ${w.state}`;
-  b.append(main,sub);b.onclick=()=>{if(!items.some(x=>x.id===w.id))items.push(w);$('search').value=String(w.id);nearbyResults=[];renderBacklog();renderBoard();renderSuggestions();target.classList.add('hidden');};target.append(b);
+  b.append(main,sub);b.disabled=!currentSprint()||currentSprint().itemIds.includes(w.id)||browserSelection.has(w.id);b.title=browserSelection.has(w.id)?'Already queued':`Queue #${w.id} immediately`;b.onclick=()=>{if(!currentSprint()||currentSprint().itemIds.includes(w.id)||browserSelection.has(w.id))return;if(!items.some(x=>x.id===w.id))items.push(w);browserSelection.add(w.id);renderBacklog();renderBrowser();renderSuggestions();updateBulkToolbar();};target.append(b);
  }
  if(!matches.length){const hint=document.createElement('div');hint.className='hint';hint.textContent='No matches yet. Load work items or try another term.';target.append(hint);}
  target.classList.remove('hidden');$('search').setAttribute('aria-expanded','true');
@@ -623,7 +684,7 @@ function renderSuggestions(){
 async function lookupNearbyIds(value){
  const match=/^#?(\d{2,8})$/.exec(value.trim());if(!match){nearbyResults=[];renderSuggestions();return;}
  const n=Number(match[1]),sequence=++searchSequence;
- const ids=[];for(let id=Math.max(1,n-5);id<=n+5;id++)ids.push(id);
+ const ids=[];for(let id=Math.max(1,n-5);id<=n+12;id++)ids.push(id);
  try{
   const response=await api(`/_apis/wit/workitems?ids=${ids.join(',')}&fields=System.Id,System.Title,System.TeamProject,System.State,System.AssignedTo,System.WorkItemType&errorPolicy=Omit&api-version=7.1`);
   if(sequence!==searchSequence)return;
@@ -636,8 +697,8 @@ function handleSearch(){
  clearTimeout(searchTimer);searchSequence++;nearbyResults=[];renderBacklog();renderSuggestions();
  if(/^#?\d{2,8}$/.test($('search').value.trim()))searchTimer=setTimeout(()=>lookupNearbyIds($('search').value),350);
 }
-function renderBacklog(){const body=$('backlog');body.replaceChildren();const q=$('search').value.toLowerCase().replace(/^#/,'');const s=registry?.sprints.find(x=>x.id===$('sprintPicker').value);for(const w of items.filter(x=>`${x.id} ${x.title} ${x.project} ${x.assignee}`.toLowerCase().includes(q))){const tr=document.createElement('tr');tr.innerHTML=`<td><a href="${escapeHtml(w.url)}" target="_blank" rel="noopener noreferrer">#${w.id}</a> ${escapeHtml(w.title)}</td><td>${escapeHtml(w.project)}</td><td>${escapeHtml(w.assignee)}</td><td>${escapeHtml(w.state)}</td><td></td>`;const b=document.createElement('button');b.className=s?.itemIds.includes(w.id)?'secondary':'';b.textContent=s?.itemIds.includes(w.id)?'Remove':'Add';b.disabled=!s;b.onclick=()=>toggleItem(w.id);tr.lastElementChild.append(b);body.append(tr);}if(!body.children.length){const tr=document.createElement('tr');tr.innerHTML='<td colspan="5">No matching loaded work items.</td>';body.append(tr);}}
-async function toggleItem(id){let s;try{s=requireSprint();}catch(e){return notify(e.message,true);}if(!(await guardSprint()))return;const wasIncluded=s.itemIds.includes(id);const ok=await persist(r=>{const t=r.sprints.find(x=>x.id===s.id);t.itemIds=t.itemIds.includes(id)?t.itemIds.filter(x=>x!==id):[...t.itemIds,id];});if(ok){await loadAssignedItems();renderBrowser();notify(`Work item #${id} ${wasIncluded?'removed from':'added to'} the sprint.`);}}
+function renderBacklog(){const body=$('backlog');body.replaceChildren();const q=$('search').value.toLowerCase().replace(/^#/,'');const s=registry?.sprints.find(x=>x.id===$('sprintPicker').value);for(const w of items.filter(x=>`${x.id} ${x.title} ${x.project} ${x.assignee}`.toLowerCase().includes(q))){const tr=document.createElement('tr');tr.innerHTML=`<td><a href="${escapeHtml(w.url)}" target="_blank" rel="noopener noreferrer">#${w.id}</a> ${escapeHtml(w.title)}</td><td>${escapeHtml(w.project)}</td><td>${escapeHtml(w.assignee)}</td><td>${escapeHtml(w.state)}</td><td></td>`;const b=document.createElement('button');b.className='secondary';const included=!!s?.itemIds.includes(w.id);b.textContent=included?'Already added':browserSelection.has(w.id)?'Remove from queue':'Queue now';b.disabled=!s||included;b.onclick=()=>{if(browserSelection.has(w.id))browserSelection.delete(w.id);else browserSelection.add(w.id);renderBacklog();renderBrowser();updateBulkToolbar();};tr.lastElementChild.append(b);body.append(tr);}if(!body.children.length){const tr=document.createElement('tr');tr.innerHTML='<td colspan="5">No matching loaded work items.</td>';body.append(tr);}updateBulkToolbar();}
+async function toggleItem(id){let s;try{s=requireSprint();}catch(e){return notify(e.message,true);}if(!(await guardSprint()))return;const wasIncluded=s.itemIds.includes(id);const ok=await persist(r=>{const t=r.sprints.find(x=>x.id===s.id);t.itemIds=t.itemIds.includes(id)?t.itemIds.filter(x=>x!==id):[...t.itemIds,id];});if(ok){await loadAssignedItems();renderBrowser();renderBacklog();renderSuggestions();if(!wasIncluded&&/^#?\d+$/.test($('search').value.trim()))void lookupNearbyIds(String(id));notify(`Work item #${id} ${wasIncluded?'removed from':'added to'} the sprint.`);}}
 async function loadAssignedItems(){
  const seq=++assignedLoadSequence;
  const s=registry?.sprints.find(x=>x.id===$('sprintPicker').value);
@@ -784,7 +845,7 @@ const LANE_PRESETS={'Backlog / Planned':'To Do','Ready to Start':'To Do','Active
 const LANE_CATEGORIES=['To Do','In Progress','Done','Closed'];
 let diagnosticEvents=[];const DIAG_KEY='pnpc-global-sprints-diagnostics-v2';
 const DIAG_LIMIT=600;
-const DIAG_VERSION='1.0.0';
+const DIAG_VERSION='1.0.29';
 let diagnosticSessionId='';
 // Production diagnostic payloads are deliberately numeric/boolean or finite enums.
 // Free-form strings (including messages and exception text) must never be exported.
@@ -912,7 +973,7 @@ async function runAutomatedAudit(){
  const checks=[],startedAt=new Date().toISOString();diagnostic('audit.run.started',{version:DIAG_VERSION});
  try{
   auditCheck(checks,'extension.capabilities',sdk&&storage&&token?'PASS':'WARNING',`SDK ${!!sdk}, storage ${!!storage}, ADO token ${!!token}`,'All capabilities available');
-  const tooltipTargets=[...document.querySelectorAll('#tab-board button,#tab-planning button,#tab-reports button')].filter(b=>!b.classList.contains('hidden')); // Audit inactive tabs too; tab panels are intentionally hidden until selected.
+  const tooltipTargets=[...document.querySelectorAll('#tab-board button,#tab-planning button,#tab-reports button,#tab-gantt button')].filter(b=>!b.classList.contains('hidden')); // Audit inactive tabs too; tab panels are intentionally hidden until selected.
   const missingTooltips=tooltipTargets.filter(b=>!b.title&&!b.getAttribute('aria-label')&&!b.getAttribute('aria-describedby'));
   auditCheck(checks,'ui.action_help',!tooltipTargets.length?'NOT TESTED':missingTooltips.length?'WARNING':'PASS',`${tooltipTargets.length} controls checked; ${missingTooltips.length} missing explanations`,'Visible Board, Planning and Reports buttons have accessible help','Read-only DOM inspection; does not prove tooltip positioning or clarity.');
   const wizardControls=['wizardReset','wizardResetStatus','wizardStepHelp','workspaceSchedules','ceremonyPreview'];
@@ -1124,16 +1185,18 @@ function workflowKey(w){return `${w.project}::${w.type}`;}
 function workflowCategory(w,state=w.state){
  const scoped=workflowCategories.get(workflowKey(w));
  const name=String(state||'').trim().toLowerCase();
- // Preserve the product's explicit Closed lane regardless of ADO Completed category.
- if(WORKFLOW_MAP[name]==='Closed')return 'Closed';
+ // Authoritative project/type metadata overrides generic state-name assumptions.
  return scoped?.get(name)||WORKFLOW_MAP[name]||'Other';
 }
 async function getStates(w){const key=workflowKey(w);if(workflowStates.has(key))return workflowStates.get(key);
  const result=await api(`/${encodeURIComponent(w.project)}/_apis/wit/workitemtypes/${encodeURIComponent(w.type)}/states?api-version=7.1`);
  const entries=result.value||[];const states=entries.map(x=>x.name);
- const mapping=new Map();const categoryMap={proposed:'To Do',inprogress:'In Progress',resolved:'Done',completed:'Done'};
+ const mapping=new Map();const categoryMap={proposed:'To Do',inprogress:'In Progress',resolved:'Done',completed:'Closed'};
+ const hasTerminal=entries.some(x=>String(x.category||'').toLowerCase()==='completed'||['closed','accepted','completed'].includes(String(x.name||'').trim().toLowerCase()));
  for(const entry of entries){const label=String(entry.name||'').trim().toLowerCase();if(!label)continue;
-  const category=String(entry.category||'').toLowerCase();const normalized=WORKFLOW_MAP[label]==='Closed'?'Closed':categoryMap[category]||WORKFLOW_MAP[label];
+  const category=String(entry.category||'').toLowerCase();let normalized=categoryMap[category]||WORKFLOW_MAP[label];
+  if(category==='resolved'&&!hasTerminal)normalized='Closed';
+  if(label==='done'&&category==='completed'&&entries.some(x=>['closed','accepted'].includes(String(x.name||'').trim().toLowerCase())))normalized='Done';
   if(normalized)mapping.set(label,normalized);
   else diagnostic('ado.workflow.unmapped_state',{workItemType:w.type,project:w.project,category});
  }
@@ -1156,15 +1219,16 @@ const WORKFLOW_COLUMNS=['To Do','In Progress','Done','Closed'];
 const WORKFLOW_MAP={
  'to do':'To Do','new':'To Do','proposed':'To Do','approved':'To Do',
  'in progress':'In Progress','active':'In Progress','committed':'In Progress','doing':'In Progress',
- 'done':'Done','resolved':'Done','completed':'Done','development complete':'Done',
+ 'done':'Done','resolved':'Done','completed':'Closed','development complete':'Done',
  'closed':'Closed','accepted':'Closed','tested and approved':'Closed'
 };
 function isRemoved(w){return ['removed','cut','cancelled','canceled'].includes((w.state||'').toLowerCase());}
 function workflowColumn(w){return workflowCategory(w);}
 // Presentation-only exception: an ADO Closed item may be displayed in Done.
 // Never rewrite the underlying terminal ADO state or report it as awaiting validation.
-function boardColumn(w){return workflowColumn(w)==='Closed'&&currentSprint()?.doneDisplayIds?.[w.id]?'Done':workflowColumn(w);}
-async function setDoneDisplay(w,enabled){const id=currentSprint()?.id;if(!id)return false;const ok=await persist(r=>{const sp=r.sprints.find(x=>x.id===id);if(!sp)throw Error('Sprint no longer exists');sp.doneDisplayIds ||= {};if(enabled)sp.doneDisplayIds[w.id]=true;else delete sp.doneDisplayIds[w.id];},false);if(ok){renderBoard();renderSprintHealth();notify(enabled?`#${w.id} displayed in Done; Azure DevOps remains Closed.`:`#${w.id} returned to its native workflow column.`);}return ok;}
+function boardColumn(w){const native=workflowColumn(w);if(native!=='Closed')return native;const override=currentSprint()?.doneDisplayIds?.[w.id];if(override===true)return 'Done';if(override===false)return 'Closed';// A native Done state may be terminal for reporting without implying a Board move.
+ return /^done$/i.test(String(w.state||'').trim())?'Done':'Closed';}
+async function setDoneDisplay(w,enabled){const id=currentSprint()?.id;if(!id)return false;const ok=await persist(r=>{const sp=r.sprints.find(x=>x.id===id);if(!sp)throw Error('Sprint no longer exists');sp.doneDisplayIds ||= {};if(enabled)sp.doneDisplayIds[w.id]=true;else if(/^done$/i.test(String(w.state||'').trim()))sp.doneDisplayIds[w.id]=false;else delete sp.doneDisplayIds[w.id];},false);if(ok){renderBoard();renderSprintHealth();notify(enabled?`#${w.id} displayed in Done; Azure DevOps state remains ${w.state}.`:`#${w.id} displayed in Completed; Azure DevOps state remains ${w.state}.`);}return ok;}
 function compactMode(){return $('boardDensity')?.value==='compact';}
 async function updateWorkItemState(w,next){
  if(next===w.state)return true;
@@ -1249,7 +1313,7 @@ function workItemCard(w){
  }
 
  if(w.contextOnly||isPlanningContextType(w)){const hint=document.createElement('small');hint.textContent=w.contextOnly?'Parent context · not assigned to this sprint':'Planning context · excluded from execution Kanban';card.append(hint);return card;}
- const laneInfo=document.createElement('small');laneInfo.textContent=`Swimlane: ${laneFor(w.id)}${laneConfig(laneFor(w.id))?.override?' (custom mapping)':''}${boardColumn(w)==='Done'&&workflowColumn(w)==='Closed'?' · Closed in Azure DevOps (visual Done exception)':''}`;card.append(laneInfo);const controls=document.createElement('div');controls.className='card-controls';
+ const laneInfo=document.createElement('small');laneInfo.textContent=`Swimlane: ${laneFor(w.id)}${laneConfig(laneFor(w.id))?.override?' (custom mapping)':''}${boardColumn(w)==='Done'&&workflowColumn(w)==='Closed'?' · Terminal in Azure DevOps; displayed in Done for Board review':''}`;card.append(laneInfo);const controls=document.createElement('div');controls.className='card-controls';
  const lane=document.createElement('select');lane.setAttribute('aria-label',`Swimlane for #${w.id}`);
  for(const name of laneNames())lane.add(new Option(name,name));lane.value=laneFor(w.id);
  lane.onchange=async()=>{const destination=lane.value;lane.disabled=true;await moveLaneItem(w.id,destination);lane.disabled=false;};
@@ -1291,7 +1355,7 @@ async function dropOnCell(id,column,lane,cell){
  try{
   if(column!==oldColumn){
    const states=await getStates(w);
-   const nativeDone=states.some(x=>WORKFLOW_MAP[x.trim().toLowerCase()]==='Done');
+   const nativeDone=states.some(x=>workflowCategory(w,x)==='Done');
    if(column==='Done'&&!nativeDone){
     if(workflowColumn(w)!=='Closed'){
      if(!confirm(`This project has no Done state for ${w.type}. Moving #${w.id} to Done will CLOSE the original Azure DevOps ticket. Continue?`))return;
@@ -1300,7 +1364,13 @@ async function dropOnCell(id,column,lane,cell){
     }
     if(!await setDoneDisplay(w,true))return;
    }else if(column==='Closed'&&workflowColumn(w)==='Closed'){
-    if(!await setDoneDisplay(w,false))return;
+    // A native Done state can be terminal for metrics but remains visually Done until explicitly moved.
+    // If the process exposes a distinct Closed state, use it; otherwise persist presentation only.
+    if(/^done$/i.test(String(w.state||'').trim())){
+     const closedStates=states.filter(x=>x.toLowerCase()!=='done'&&workflowCategory(w,x)==='Closed');
+     if(closedStates.length){const target=closedStates.find(x=>/^closed$/i.test(x))||closedStates[0];if(!await updateWorkItemState(w,target))return;}
+     else if(!await setDoneDisplay(w,false))return;
+    }else if(!await setDoneDisplay(w,false))return;
    }else{
     const target=await destinationState(w,column);
     if(!await updateWorkItemState(w,target))return;
@@ -1480,7 +1550,7 @@ $('boardDensity').addEventListener('change',()=>{rememberContext();renderBoard()
 
 $('browseLoad').onclick=browseBacklog;
 $('browseMode').onchange=()=>{rememberContext();renderBrowser();};
-$('browseProject').onchange=()=>{browserItems=[];renderBrowser();rememberContext();browseNotice('Choose Browse backlog to load this project.');};
+$('browseProject').onchange=()=>{updateBrowseProjectLinks();browserItems=[];renderBrowser();rememberContext();browseNotice('Choose Browse backlog to load this project.');};
 $('project').onchange=rememberContext;
 $('kanbanScrollLeft').addEventListener('click',()=>{$('board').scrollBy({left:-Math.max(260,$('board').clientWidth*.65),behavior:'smooth'});});
 $('kanbanScrollRight').addEventListener('click',()=>{$('board').scrollBy({left:Math.max(260,$('board').clientWidth*.65),behavior:'smooth'});});
@@ -1596,7 +1666,7 @@ function saveTabPreference(name){
  }
 }
 const CEREMONY_FIELDS=['ceremonyType','ceremonyTitle','ceremonyDate','ceremonyTime','ceremonyDuration','ceremonyParticipants','ceremonySecondary','ceremonyStatus','ceremonyAgenda','ceremonyOutcome'];
-const GS_VALID_TABS=['board','planning','reports','demo','configuration','support'];
+const GS_VALID_TABS=['board','planning','reports','gantt','demo','configuration','support'];
 let requestedTab='board';
 // Keep the initial navigation shell concealed until the saved tab is applied.
 let startupTabReady=false;
@@ -1605,14 +1675,14 @@ function showTab(name,remember=true){
  diagnostic('ui.tab.opened',{tab:name});
  document.querySelectorAll('.gs-tab').forEach(b=>{const on=b.dataset.tab===name;b.setAttribute('aria-selected',String(on));b.tabIndex=on?0:-1;});
  document.querySelectorAll('.gs-tab-panel').forEach(p=>p.classList.toggle('hidden',p.id!=='tab-'+name));
- if(name==='reports'){renderSprintHealth();renderTimeline();}if(name==='planning'){renderCeremonies();renderSprintHealth();}if(name==='board')renderBoard();
+ if(name==='reports'){renderSprintHealth();renderTimeline();renderGanttHealth();}if(name==='gantt'){ganttSyncProjects();renderGantt();if(ganttLoadedKey!==activeWorkspaceId&&!ganttBusy)void ganttLoad();}if(name==='planning'){renderCeremonies();renderSprintHealth();}if(name==='board')renderBoard();
  if(remember){requestedTab=name;saveTabPreference(name);rememberContext();}
  if(startupTabReady)document.body.classList.remove('gs-initializing');
 }
 function activateTab(name){
  if(!GS_VALID_TABS.includes(name))name='board';
  // Restricted tab buttons are disabled by renderRoomAccess; never redirect.
- if(ROOM_ENFORCE_PREVIEW&&roomStatus&&!roomAccessAllowed()&&['board','planning','reports','demo'].includes(name))return;
+ if(ROOM_ENFORCE_PREVIEW&&roomStatus&&!roomAccessAllowed()&&['board','planning','reports','gantt','demo'].includes(name))return;
  navigationGeneration++;requestedTab=name;showTab(name,true);
 }
 document.querySelectorAll('.gs-tab').forEach(b=>{
@@ -1738,14 +1808,14 @@ function outlookEventPayload(c){
  }
  return {subject:(c.title||c.type||'Global Sprints meeting').slice(0,120),
   body:{contentType:'Text',content:[c.agenda||'',c.secondary?'Combined ceremony: '+c.secondary:'','Scheduled from PNPC Global Sprints'].filter(Boolean).join('\n\n')},
-  ...times,attendees:outlookAttendees(c.participants),...(recurrence?{recurrence}:{})};
+  ...times,attendees:outlookAttendees(c.participants),isOnlineMeeting:true,onlineMeetingProvider:'teamsForBusiness',...(recurrence?{recurrence}:{})};
 }
 function outlookTarget(r,id,scheduleId,workspaceId,sprintId){
  return scheduleId?r.workspaces.find(x=>x.id===workspaceId)?.meetingSchedules?.find(x=>x.id===scheduleId)?.meetings?.find(x=>x.id===id):r.sprints.find(x=>x.id===sprintId)?.ceremonies?.find(x=>x.id===id);
 }
-async function outlookGraph(method,path,body){
+async function outlookGraph(method,path,body,extraHeaders={}){
  const token=await m365GraphToken();
- const response=await fetch('https://graph.microsoft.com/v1.0'+path,{method,headers:{Authorization:'Bearer '+token,Accept:'application/json',...(body?{'Content-Type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{})});
+ const response=await fetch('https://graph.microsoft.com/v1.0'+path,{method,headers:{Authorization:'Bearer '+token,Accept:'application/json',...extraHeaders,...(body?{'Content-Type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{})});
  if(!response.ok)throw serviceHttpError('Microsoft Graph',response.status);
  return response.status===204?null:response.json();
 }
@@ -1919,7 +1989,7 @@ function ceremonyBookingFeedback(id,scheduleId,message){
  }
  if(!row)notify(message,true);
 }
-async function scheduleCeremonyInOutlook(id,scheduleId=null,pastMode=null){
+async function scheduleCeremonyInOutlook(id,scheduleId=null,pastMode=null,bulkApproved=false){
  if(outlookBookingBusy)return notify('Another Outlook booking is in progress.',true);
  const c=outlookCeremonyRecord(id,scheduleId);
  if(!c)return notify('Meeting record is no longer available. Reload before scheduling.',true);
@@ -1955,7 +2025,7 @@ async function scheduleCeremonyInOutlook(id,scheduleId=null,pastMode=null){
  const calendar=m365Calendars.find(x=>x.id===calendarId);
  if(calendar.canEdit===false)return ceremonyBookingFeedback(id,scheduleId,'The selected Outlook calendar is read-only. Choose a writable calendar in Configuration.');
  const accountId=m365Account.homeAccountId||m365Account.username;
- if(!confirm(`Create "${payload.subject}"${payload.recurrence?' as ONE recurring Outlook series':''}${booking.date!==c.date?' beginning '+booking.date+' (past occurrences skipped)':isPast&&pastMode==='original'?' with its original past start date; historical calendar occurrences may be created':''} in Outlook calendar "${calendar.name}"${payload.attendees.length?' and send invitations to '+payload.attendees.length+' attendee(s)':''}?`))return;
+ if(!bulkApproved&&!confirm(`Create "${payload.subject}"${payload.recurrence?' as ONE recurring Outlook series':''}${booking.date!==c.date?' beginning '+booking.date+' (past occurrences skipped)':isPast&&pastMode==='original'?' with its original past start date; historical calendar occurrences may be created':''} in Outlook calendar "${calendar.name}"${payload.attendees.length?' and send invitations to '+payload.attendees.length+' attendee(s)':''}?`))return;
  outlookBookingBusy=true;
  const operationId=crypto.randomUUID();
  const sp=currentSprint(),w=activeScheduleWorkspace();
@@ -1977,6 +2047,29 @@ async function scheduleCeremonyInOutlook(id,scheduleId=null,pastMode=null){
   const event=await response.json();
   if(!event.id)throw Error('Microsoft Graph did not return an event identifier.');
   const recoverySaved=outlookRecoveryRecord({operationId,eventId:event.id,calendarId,accountId,meetingId:id,scheduleId:scheduleId||null,createdAt:new Date().toISOString()});
+  // Graph creates the master first. Remove only the specifically excluded
+  // occurrences; if any step fails, leave the booking pending for reconciliation.
+  if(payload.recurrence&&booking.excludedDates?.length){
+   const exclusions=new Set(booking.excludedDates);
+   const base=`/me/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(event.id)}`;
+   const startDateTime=encodeURIComponent(booking.date+'T00:00:00');
+   const endDateTime=encodeURIComponent(booking.repeatEnd+'T23:59:59');
+   let next=base+`/instances?startDateTime=${startDateTime}&endDateTime=${endDateTime}&$top=100`;
+   const found=new Set();
+   while(next){
+    const result=await outlookGraph('GET',next.startsWith('https://graph.microsoft.com/v1.0')?next.slice('https://graph.microsoft.com/v1.0'.length):next,undefined,{'Prefer':'outlook.timezone="'+payload.recurrence.range.recurrenceTimeZone+'"'});
+    for(const occurrence of result.value||[]){
+     const occurrenceDate=String(occurrence.start?.dateTime||'').slice(0,10);
+     if(exclusions.has(occurrenceDate)){
+      await outlookGraph('DELETE','/me/calendars/'+encodeURIComponent(calendarId)+'/events/'+encodeURIComponent(occurrence.id));
+      found.add(occurrenceDate);
+     }
+    }
+    next=result['@odata.nextLink']||null;
+   }
+   if(found.size!==exclusions.size)throw Error('Outlook series created, but not all excluded ceremony dates were found. Reconcile the series before retrying.');
+  }
+
   if(!recoverySaved)diagnostic('m365.recovery.not_durable',{errorCode:'storage_unavailable',operation:'create'},'warn');
   const saved=await persist(r=>{
    const target=scheduleId
@@ -2042,11 +2135,14 @@ async function autoReportObservation(s,found){
  }catch(e){diagnostic('reports.observation.failed',{reason:String(e.message||e)},'error');}finally{observationInFlight=false;}
 }
 function reportFiltered(){return reportWork().filter(w=>(!reportProjectFilter||w.project===reportProjectFilter)&&(!reportPersonFilter||w.assignee===reportPersonFilter));}
+function reportWorkItemLink(w){const button=reportNode('button','secondary gs-report-work-link','#'+w.id+' · '+w.title);button.type='button';button.title='Open work item details';button.onclick=()=>void openBoardItemDetail(w);return button;}
+function reportWorkItemList(parent,work,heading='View work items'){const detail=reportNode('details','gs-chart-details');detail.append(reportNode('summary','',heading+' ('+work.length+')'));for(const w of work.slice(0,200)){const line=reportNode('div','gs-report-work-row');line.append(reportWorkItemLink(w),reportNode('span','muted',w.project+' · '+w.state));detail.append(line);}parent.append(detail);}
 function reportNode(tag,className,textValue){const n=document.createElement(tag);if(className)n.className=className;if(textValue!==undefined)n.textContent=String(textValue);return n;}
 function reportMetric(parent,label,value,description=''){const n=reportNode('div','gs-metric');n.append(reportNode('span','muted',label),reportNode('strong','',value));if(description)n.append(reportNode('small','muted',description));parent.append(n);}
 function reportVisualBars(parent,rows,labels=['Closed','Done','Open']){const graph=reportNode('div','gs-visual-bars');const max=Math.max(1,...rows.map(r=>r.values.reduce((a,b)=>a+b,0)));const legend=reportNode('div','gs-chart-legend');labels.forEach((label,i)=>{const item=reportNode('span','gs-legend-item');const swatch=reportNode('i','gs-swatch gs-swatch-'+i);item.append(swatch,document.createTextNode(label));legend.append(item);});graph.append(legend);if(!rows.length){graph.append(reportNode('p','muted','No work items match these filters.'));parent.append(graph);return;}for(const row of rows){const line=reportNode('div','gs-visual-row');line.append(reportNode('span','gs-visual-name',row.name));const track=reportNode('div','gs-visual-track');track.setAttribute('role','img');track.setAttribute('aria-label',row.name+': '+row.values.map((n,i)=>n+' '+labels[i]).join(', '));row.values.forEach((n,i)=>{if(n<=0)return;const segment=reportNode('span','gs-visual-segment gs-fill-'+i);segment.style.width=(n/max*100)+'%';segment.title=n+' '+labels[i];track.append(segment);});line.append(track,reportNode('strong','gs-visual-count',String(row.values.reduce((a,b)=>a+b,0))));graph.append(line);}parent.append(graph);}
 function reportEmptyChart(parent,heading,description){const empty=reportNode('div','gs-chart-empty');empty.append(reportNode('div','gs-chart-empty-icon','▥'),reportNode('strong','',heading),reportNode('p','muted',description));parent.append(empty);}
-function reportVelocityChart(parent,rows){const graph=reportNode('div','gs-velocity-chart');const max=Math.max(1,...rows.map(r=>r.value));for(const row of rows){const item=reportNode('div','gs-velocity-column');const area=reportNode('div','gs-velocity-area');const bar=reportNode('div','gs-velocity-bar');bar.style.height=Math.max(row.value?6:0,row.value/max*100)+'%';bar.title=row.name+': '+row.value+' completed points';area.append(bar);item.append(reportNode('strong','',String(row.value)),area,reportNode('span','',row.name));graph.append(item);}parent.append(graph);}
+function reportVelocityChart(parent,rows){const graph=reportNode('div','gs-velocity-chart');const max=Math.max(1,...rows.map(r=>r.value));for(const row of rows){const item=reportNode('div','gs-velocity-column');const area=reportNode('div','gs-velocity-area');const bar=reportNode('div','gs-velocity-bar');bar.style.height=(row.value?Math.max(6,row.value/max*100):0)+'%';bar.title=row.name+': '+row.value+' completed points';area.append(bar);item.append(reportNode('strong','',String(row.value)),area,reportNode('span','',row.name));graph.append(item);}parent.append(graph);}
+function reportBurndownProgress(parent,p,label){const graph=reportNode('div','gs-burndown-progress');const total=Math.max(1,p.total);const completed=reportNode('span','gs-burndown-completed');completed.style.width=(Math.max(0,p.completed)/total*100)+'%';const remaining=reportNode('span','gs-burndown-remaining');remaining.style.width=(Math.max(0,p.remaining)/total*100)+'%';graph.append(completed,remaining);graph.setAttribute('role','img');graph.setAttribute('aria-label',label+': '+p.completed+' completed points, '+p.remaining+' remaining points');parent.append(reportNode('p','muted',label),graph);}
 function reportDate(v){return v?String(v).slice(0,10):'';}
 // Snapshot timestamps may be ISO strings or legacy numeric epoch values.
 // Normalize before sorting/charting so one legacy record cannot crash Reports.
@@ -2068,10 +2164,10 @@ function reportExport(){const s=currentSprint();if(!s)return notify('Select a sp
 function reportSelectors(){const p=$('reportProject'),u=$('reportPerson');if(!p||!u)return;const work=reportWork();const projects=[...new Set(work.map(w=>w.project).filter(Boolean))].sort(),people=[...new Set(work.map(w=>w.assignee).filter(Boolean))].sort();p.replaceChildren(new Option('All projects',''),...projects.map(v=>new Option(v,v)));u.replaceChildren(new Option('All team members',''),...people.map(v=>new Option(v,v)));if(!projects.includes(reportProjectFilter))reportProjectFilter='';if(!people.includes(reportPersonFilter))reportPersonFilter='';p.value=reportProjectFilter;u.value=reportPersonFilter;}
 function renderReportDashboard(){const host=$('reportDashboard');if(!host)return;host.replaceChildren();const sprint=currentSprint();if(!sprint){host.append(reportNode('p','muted','Select a global sprint to view its reports.'));return;}const all=reportWork(),work=reportFiltered(),closed=work.filter(reportIsClosed),done=work.filter(reportIsDone),active=work.filter(w=>!reportIsClosed(w)&&!reportIsDone(w));const today=reportToday(),overdue=active.filter(w=>reportSafeDate(w.dueDate||w.targetDate)&&reportDate(w.dueDate||w.targetDate)<today),blocked=work.filter(w=>sprint.blockedItems?.[w.id]);const coverage=reportCoverage(),missing=coverage.missing.length;
  const title=reportNode('h3','',sprint.name+' · Delivery overview');host.append(title);const cards=reportNode('div','gs-metrics');reportMetric(cards,'Accepted / Closed',closed.length,work.length+' executable items');reportMetric(cards,'Done / Awaiting validation',done.length);reportMetric(cards,'Active or New',active.length);reportMetric(cards,'Overdue',overdue.length);reportMetric(cards,'Blocked',blocked.length);reportMetric(cards,'Not loaded',missing);host.append(cards);host.append(reportNode('p','muted',`${coverage.assigned} assigned · ${coverage.executable.length} executable · ${coverage.context.length} planning context · ${missing} unavailable. Filters apply to the figures above.`));
- const health=reportNode('section','gs-report-block');health.append(reportNode('h3','','Sprint Health'));const total=work.length;const accepted=total?Math.round(closed.length/total*100):0;const tested=total?Math.round(done.length/total*100):0;const bar=reportNode('div','gs-progress');bar.setAttribute('role','progressbar');bar.setAttribute('aria-valuenow',String(accepted));bar.setAttribute('aria-valuemin','0');bar.setAttribute('aria-valuemax','100');bar.setAttribute('aria-label','Accepted work');const a=reportNode('span','gs-progress-closed'),d=reportNode('span','gs-progress-done');a.style.width=accepted+'%';d.style.width=tested+'%';bar.append(a,d);const summary=reportNode('div','gs-health-score');summary.append(reportNode('strong','',accepted+'%'),reportNode('span','muted','Accepted / Closed'));health.append(summary,bar,reportNode('p','muted',`${accepted}% accepted · ${tested}% awaiting validation · ${Math.max(0,100-accepted-tested)}% remaining. Done is not accepted.`));const status=sprintHealthData();const healthState=missing?'Insufficient data':status.label;health.append(reportNode('p','gs-health-note',healthState+' · '+(missing?'Some assigned items could not be loaded. ':status.reason)));if(missing)health.append(reportNode('p','muted','Health and completion are incomplete because '+missing+' assigned items could not be loaded.'));host.append(health);
- const byProject=reportNode('section','gs-report-block');byProject.append(reportNode('h3','','Project delivery'));const projectTable=reportNode('table');projectTable.innerHTML='<thead><tr><th>Project</th><th>Work</th><th>Closed</th><th>Done</th><th>Open</th></tr></thead>';const body=reportNode('tbody');for(const project of [...new Set(work.map(w=>w.project))].sort()){const list=work.filter(w=>w.project===project),row=reportNode('tr');for(const value of [project,list.length,list.filter(reportIsClosed).length,list.filter(reportIsDone).length,list.filter(w=>!reportIsClosed(w)&&!reportIsDone(w)).length])row.append(reportNode('td','',value));body.append(row);}projectTable.append(body);reportVisualBars(byProject,[...new Set(work.map(w=>w.project))].sort().map(project=>{const list=work.filter(w=>w.project===project);return {name:project,values:[list.filter(reportIsClosed).length,list.filter(reportIsDone).length,list.filter(w=>!reportIsClosed(w)&&!reportIsDone(w)).length]};}));const projectDetail=reportNode('details','gs-chart-details');projectDetail.append(reportNode('summary','','View project data table'),projectTable);byProject.append(projectDetail);host.append(byProject);
- const workload=reportNode('section','gs-report-block');workload.append(reportNode('h3','','Team workload'));const table=reportNode('table');table.innerHTML='<thead><tr><th>Assigned to</th><th>Open</th><th>Awaiting validation</th><th>Closed</th></tr></thead>';const tbody=reportNode('tbody');for(const person of [...new Set(work.map(w=>w.assignee||'Unassigned'))].sort()){const list=work.filter(w=>(w.assignee||'Unassigned')===person),tr=reportNode('tr');for(const v of [person,list.filter(w=>!reportIsClosed(w)&&!reportIsDone(w)).length,list.filter(reportIsDone).length,list.filter(reportIsClosed).length])tr.append(reportNode('td','',v));tbody.append(tr);}table.append(tbody);reportVisualBars(workload,[...new Set(work.map(w=>w.assignee||'Unassigned'))].sort().map(person=>{const list=work.filter(w=>(w.assignee||'Unassigned')===person);return {name:person,values:[list.filter(reportIsClosed).length,list.filter(reportIsDone).length,list.filter(w=>!reportIsClosed(w)&&!reportIsDone(w)).length]};}));const teamDetail=reportNode('details','gs-chart-details');teamDetail.append(reportNode('summary','','View workload data table'),table);workload.append(teamDetail,reportNode('p','muted','Assignment counts are not capacity or time estimates.'));host.append(workload);
- const issues=reportNode('section','gs-report-block');issues.append(reportNode('h3','','Management attention'));const attention=[...new Map([...overdue,...blocked,...done].map(w=>[w.id,w])).values()];if(!attention.length)issues.append(reportNode('p','muted','No overdue, blocked or validation-pending work among loaded items.'));for(const w of attention.slice(0,30)){const line=reportNode('div','gs-attention');const link=document.createElement('a');link.href=w.url||`${organizationApiBase()}/${encodeURIComponent(w.project)}/_workitems/edit/${w.id}`;link.target='_blank';link.rel='noopener noreferrer';link.textContent='#'+w.id+' · '+w.title;line.append(link,reportNode('span','muted',w.project+' · '+w.state+(overdue.includes(w)?' · Overdue':'')));issues.append(line);}host.append(issues);
+ const health=reportNode('section','gs-report-block');health.append(reportNode('h3','','Sprint Health'));const total=work.length;const accepted=total?Math.round(closed.length/total*100):0;const tested=total?Math.round(done.length/total*100):0;const bar=reportNode('div','gs-progress');bar.setAttribute('role','progressbar');bar.setAttribute('aria-valuenow',String(accepted));bar.setAttribute('aria-valuemin','0');bar.setAttribute('aria-valuemax','100');bar.setAttribute('aria-label','Accepted work');const a=reportNode('span','gs-progress-closed'),d=reportNode('span','gs-progress-done');a.style.width=accepted+'%';d.style.width=tested+'%';bar.append(a,d);const summary=reportNode('div','gs-health-score');summary.append(reportNode('strong','',accepted+'%'),reportNode('span','muted','Accepted / Closed'));health.append(summary,bar,reportNode('p','muted',`${accepted}% accepted · ${tested}% awaiting validation · ${Math.max(0,100-accepted-tested)}% remaining. Only validation-pending Done states remain unaccepted.`));const status=sprintHealthData();const healthState=missing?'Insufficient data':status.label;health.append(reportNode('p','gs-health-note',healthState+' · '+(missing?'Some assigned items could not be loaded. ':status.reason)));if(missing)health.append(reportNode('p','muted','Health and completion are incomplete because '+missing+' assigned items could not be loaded.'));host.append(health);reportWorkItemList(health,work,'Inspect sprint work items');
+ const byProject=reportNode('section','gs-report-block');byProject.append(reportNode('h3','','Project delivery'));const projectTable=reportNode('table');projectTable.innerHTML='<thead><tr><th>Project</th><th>Work</th><th>Closed</th><th>Done</th><th>Open</th></tr></thead>';const body=reportNode('tbody');for(const project of [...new Set(work.map(w=>w.project))].sort()){const list=work.filter(w=>w.project===project),row=reportNode('tr');for(const value of [project,list.length,list.filter(reportIsClosed).length,list.filter(reportIsDone).length,list.filter(w=>!reportIsClosed(w)&&!reportIsDone(w)).length])row.append(reportNode('td','',value));body.append(row);}projectTable.append(body);reportVisualBars(byProject,[...new Set(work.map(w=>w.project))].sort().map(project=>{const list=work.filter(w=>w.project===project);return {name:project,values:[list.filter(reportIsClosed).length,list.filter(reportIsDone).length,list.filter(w=>!reportIsClosed(w)&&!reportIsDone(w)).length]};}));const projectDetail=reportNode('details','gs-chart-details');projectDetail.append(reportNode('summary','','View project data table'),projectTable);byProject.append(projectDetail);host.append(byProject);reportWorkItemList(byProject,work,'Inspect project work items');
+ const workload=reportNode('section','gs-report-block');workload.append(reportNode('h3','','Team workload'));const table=reportNode('table');table.innerHTML='<thead><tr><th>Assigned to</th><th>Open</th><th>Awaiting validation</th><th>Closed</th></tr></thead>';const tbody=reportNode('tbody');for(const person of [...new Set(work.map(w=>w.assignee||'Unassigned'))].sort()){const list=work.filter(w=>(w.assignee||'Unassigned')===person),tr=reportNode('tr');for(const v of [person,list.filter(w=>!reportIsClosed(w)&&!reportIsDone(w)).length,list.filter(reportIsDone).length,list.filter(reportIsClosed).length])tr.append(reportNode('td','',v));tbody.append(tr);}table.append(tbody);reportVisualBars(workload,[...new Set(work.map(w=>w.assignee||'Unassigned'))].sort().map(person=>{const list=work.filter(w=>(w.assignee||'Unassigned')===person);return {name:person,values:[list.filter(reportIsClosed).length,list.filter(reportIsDone).length,list.filter(w=>!reportIsClosed(w)&&!reportIsDone(w)).length]};}));const teamDetail=reportNode('details','gs-chart-details');teamDetail.append(reportNode('summary','','View workload data table'),table);workload.append(teamDetail,reportNode('p','muted','Assignment counts are not capacity or time estimates.'));host.append(workload);reportWorkItemList(workload,work,'Inspect team work items');
+ const issues=reportNode('section','gs-report-block');issues.append(reportNode('h3','','Management attention'));const attention=[...new Map([...overdue,...blocked,...done].map(w=>[w.id,w])).values()];if(!attention.length)issues.append(reportNode('p','muted','No overdue, blocked or validation-pending work among loaded items.'));for(const w of attention.slice(0,30)){const line=reportNode('div','gs-attention');line.append(reportWorkItemLink(w),reportNode('span','muted',w.project+' · '+w.state+(overdue.includes(w)?' · Overdue':'')));issues.append(line);}host.append(issues);
  renderVelocityBurndown();}
 function reportCompletedState(w){return ['Done','Closed'].includes(w?.completionCategory||workflowColumn(w));}
 function reportEstimate(w){const raw=w?.effort??w?.storyPoints;return raw!==null&&raw!==undefined&&raw!==''&&Number.isFinite(Number(raw))&&Number(raw)>=0?Number(raw):0;}
@@ -2083,7 +2179,7 @@ function renderVelocityBurndown(){
   const snaps=(sp.snapshots||[]).filter(x=>reportSnapshotTimestamp(x.at)&&Array.isArray(x.items)).sort((a,b)=>reportSnapshotTimestamp(a.at).localeCompare(reportSnapshotTimestamp(b.at)));if(!snaps.length)continue;
   const progress=reportCommittedProgress(snaps[snaps.length-1].items,snaps[snaps.length-1].items);velocityRows.push({name:sp.name,value:progress.completed});const row=reportNode('tr');for(const v of [sp.name,progress.totalItems,progress.completedItems,progress.completed,progress.remaining])row.append(reportNode('td','',v));tb.append(row);
  }
- table.append(tb);if(velocityRows.length)reportVelocityChart(velocity,velocityRows);else reportEmptyChart(velocity,'Velocity history not yet available','No recorded sprint baseline is available yet. Live progress for the selected sprint is shown separately below.');
+ table.append(tb);if(velocityRows.length)reportVelocityChart(velocity,velocityRows);else {const current=reportCommittedProgress(reportWork(),reportWork());if(current.totalItems) {reportVelocityChart(velocity,[{name:'Current sprint · live (not historical velocity)',value:current.completed}]);velocity.append(reportNode('p','muted','Historical velocity needs recorded sprint observations; the bar above is live completion only.'));}else reportEmptyChart(velocity,'No velocity data','Assign executable work items to display live completion.');}
  const coverage=reportCoverage(),liveWork=reportWork();
  if(!coverage.missing.length&&coverage.assigned){const live=reportCommittedProgress(liveWork,liveWork);velocity.append(reportNode('p','gs-health-note',`Selected sprint live completion (${s.name}): ${live.completed} completed points, ${live.remaining} remaining points; ${live.completedItems} of ${live.totalItems} executable items completed. This is not historical velocity.`));}
  else if(coverage.missing.length)velocity.append(reportNode('p','muted',`${coverage.missing.length} committed items are not loaded; live completion cannot be verified.`));
@@ -2092,13 +2188,13 @@ function renderVelocityBurndown(){
  if(!snaps.length){
   const live=reportWork(),committed=(s.itemIds||[]).length;
   if(committed&&!reportCoverage().missing.length){const progress=reportCommittedProgress(live,live);burn.append(reportNode('p','gs-health-note',`Live sprint progress: ${progress.completed} completed points, ${progress.remaining} remaining points (${progress.completedItems}/${progress.totalItems} executable items).`));}
-  reportEmptyChart(burn,'Burndown history not yet available','Live progress is shown above when all committed work items are loaded. A dated historical trend needs a baseline and subsequent observations.');return;
+  if(committed&&!reportCoverage().missing.length){const live=reportCommittedProgress(reportWork(),reportWork());reportBurndownProgress(burn,live,'Live remaining effort · no historical trend');}else reportEmptyChart(burn,'Burndown history not yet available','A dated trend needs recorded observations.');return;
  }
  const base=snaps[0].items;const data=snaps.map(x=>({day:reportSnapshotTimestamp(x.at).slice(0,10),...reportCommittedProgress(x.items,x.items)}));const unique=[...new Map(data.map(x=>[x.day,x])).values()];const latest=data[data.length-1];
  const live=reportWork();if(live.length===new Set((s.itemIds||[]).map(Number)).size || (s.itemIds||[]).every(id=>[...items,...assignedItems].some(w=>Number(w.id)===Number(id)))){const current=reportCommittedProgress(live,live);burn.append(reportNode('p','gs-health-note',`Live sprint progress: ${current.completed} completed points, ${current.remaining} remaining points (${current.completedItems}/${current.totalItems} executable items). Historical charts update only from saved observations.`));}
  burn.append(reportNode('p','muted',`Last recorded observation: ${latest.completed} completed points, ${latest.remaining} remaining points (${latest.completedItems} of ${latest.totalItems} executable items completed).`));
  if(data.some(p=>p.total!==data[0].total||p.totalItems!==data[0].totalItems))burn.append(reportNode('p','gs-health-note','Sprint membership or estimates changed between recorded observations. The actual line reflects each dated observation; the ideal line is based on the earliest recorded baseline and is not a fixed-scope comparison.')); 
- if(unique.length<2){reportEmptyChart(burn,'Waiting for a second observation day','Current completed and remaining effort is shown above. A dated trend line requires observations from at least two days.');return;}
+ if(unique.length<2){reportBurndownProgress(burn,latest,'Recorded effort · one observation day (no trend yet)');return;}
  const max=Math.max(1,...unique.map(x=>x.total));const start=s.start&&reportSafeDate(s.start)?s.start:unique[0].day,end=s.end&&reportSafeDate(s.end)?s.end:unique[unique.length-1].day,span=Math.max(1,reportDay(end)-reportDay(start));const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 700 220');svg.setAttribute('role','img');svg.setAttribute('aria-label','Remaining estimated effort compared with ideal burndown');svg.style.width='100%';svg.style.maxHeight='270px';const ns='http://www.w3.org/2000/svg';const add=(tag,attrs)=>{const el=document.createElementNS(ns,tag);for(const [k,v] of Object.entries(attrs))el.setAttribute(k,String(v));svg.append(el);return el;};const x=d=>40+Math.max(0,Math.min(1,(reportDay(d)-reportDay(start))/span))*640,y=n=>190-(n/max)*160;add('line',{x1:40,y1:190,x2:680,y2:190,stroke:'currentColor','stroke-opacity':'.4'});add('line',{x1:40,y1:30,x2:40,y2:190,stroke:'currentColor','stroke-opacity':'.4'});add('line',{x1:x(start),y1:y(unique[0].total),x2:x(end),y2:y(0),stroke:'#8a9bab','stroke-dasharray':'7 5','stroke-width':2});add('polyline',{points:unique.map(p=>`${x(p.day)},${y(p.remaining)}`).join(' '),fill:'none',stroke:'#287fc1','stroke-width':3});for(const p of unique)add('circle',{cx:x(p.day),cy:y(p.remaining),r:4,fill:'#287fc1'});burn.append(svg,reportNode('p','muted',`Actual remaining estimated points across ${unique.length} recorded dates. No historical states have been inferred.`));
 }
 
@@ -2116,8 +2212,147 @@ function reportBlockerList(host,work,onSelect){const blocked=work.filter(w=>w.bl
  const details=reportNode('details','gs-blocker-list');details.append(reportNode('summary','',`${blocked.length} blocked ticket(s) · View affected work`));
  for(const w of blocked){const btn=reportNode('button','secondary gs-blocker-link',`${w.id||'#'+w.id} · ${w.title} (${w.project})`);btn.onclick=()=>onSelect(w);details.append(btn);}host.append(details);
 }
-function renderTimeline(){const host=$('timelineCanvas'),editor=$('timelineEditor');if(!host||!editor)return;host.replaceChildren();editor.replaceChildren();const work=reportFiltered(),s=currentSprint();if(!s){host.append(reportNode('p','muted','Select a sprint.'));return;}const today=reportToday(),dated=work.filter(w=>reportSafeDate(w.startDate||w.targetDate||w.dueDate)&&reportSafeDate(w.dueDate||w.targetDate||w.startDate)),unscheduled=work.filter(w=>!dated.includes(w));const starts=dated.map(w=>reportDay(w.startDate||w.targetDate||w.dueDate)),ends=dated.map(w=>reportDay(w.dueDate||w.targetDate||w.startDate));const min=Math.min(reportSafeDate(s.start)?reportDay(s.start):Infinity,...starts,reportDay(today)),max=Math.max(reportSafeDate(s.end)?reportDay(s.end): -Infinity,...ends,reportDay(today)+1),span=Math.max(1,max-min);const todayLine=((reportDay(today)-min)/span*100).toFixed(2)+'%';const groups=[...new Set(work.map(w=>w.project))].sort();for(const group of groups){const details=reportNode('details','gs-timeline-group');details.open=true;const summary=reportNode('summary','',group+' · '+work.filter(w=>w.project===group).length+' tickets');details.append(summary,reportTimelineAxis(min,max));for(const w of work.filter(x=>x.project===group).sort((a,b)=>(a.parentId||0)-(b.parentId||0)||a.id-b.id)){const row=reportNode('div','gs-timeline-row');const link=reportNode('button','secondary gs-timeline-label','#'+w.id+' '+w.title);link.title=w.title;link.onclick=()=>{timelineSelectedId=w.id;renderTimeline();};row.append(link);const track=reportNode('div','gs-timeline-track');const marker=reportNode('div','gs-today-marker');marker.style.left=todayLine;track.append(marker);if(dated.includes(w)){const begin=reportDay(w.startDate||w.targetDate||w.dueDate),finish=Math.max(begin,reportDay(w.dueDate||w.targetDate||w.startDate));const bar=reportNode('button','gs-timeline-bar'+(reportIsClosed(w)?' gs-timeline-closed':'')+(reportIsDone(w)?' gs-timeline-done':''),'');bar.style.left=((begin-min)/span*100)+'%';bar.style.width=Math.max(1.2,(finish-begin+1)/span*100)+'%';bar.title=`#${w.id}: ${w.startDate||'No start'} to ${w.dueDate||w.targetDate||'No end'} · ${w.state}`;bar.onclick=()=>{timelineSelectedId=w.id;renderTimeline();};track.append(bar);}else{const none=reportNode('span','muted','No scheduling dates');track.append(none);}row.append(track);details.append(row);}host.append(details);}if(unscheduled.length)host.append(reportNode('p','muted',unscheduled.length+' work items have no usable dates. Select a ticket to schedule it.'));const w=work.find(x=>x.id===timelineSelectedId);if(!w){editor.append(reportNode('p','muted','Select a ticket bar or title to edit the original Azure DevOps work item.'));return;}editor.append(reportNode('h3','',`#${w.id} · ${w.title}`));const fields=reportNode('div','gs-timeline-fields');const definitions=[['Start Date','Microsoft.VSTS.Scheduling.StartDate',w.startDate],['Target Date','Microsoft.VSTS.Scheduling.TargetDate',w.targetDate],['Due Date','Microsoft.VSTS.Scheduling.DueDate',w.dueDate]];const inputs=[];for(const [label,path,value] of definitions){const wrapper=reportNode('label','',label),input=document.createElement('input');input.type='date';input.value=value||'';wrapper.append(input);fields.append(wrapper);inputs.push({input,path,original:value||''});}editor.append(fields);const buttons=reportNode('div','row');const save=reportNode('button','','Save dates to Azure DevOps');save.id='timelineSave';save.onclick=async()=>{const values=inputs.map(x=>({...x,value:x.input.value}));const start=values[0].value,end=values[2].value||values[1].value;if(start&&end&&start>end)return notify('Start Date must not follow the final target/due date.',true);const changes=Object.fromEntries(values.filter(x=>x.value!==x.original).map(x=>[x.path,x.value?x.value+'T12:00:00Z':'']));if(!Object.keys(changes).length)return notify('No date changes to save.');await updateTimelineTicket(w,changes);};const open=document.createElement('a');open.href=w.url||`${organizationApiBase()}/${encodeURIComponent(w.project)}/_workitems/edit/${w.id}`;open.target='_blank';open.rel='noopener noreferrer';open.textContent='Open original ticket';buttons.append(save,open);editor.append(buttons,reportNode('p','muted','Date field availability depends on the home project process. Azure DevOps permissions and revision checks apply.'));}
+function renderTimeline(){const host=$('timelineCanvas'),editor=$('timelineEditor');if(!host||!editor)return;host.replaceChildren();editor.replaceChildren();const work=reportFiltered(),s=currentSprint();if(!s){host.append(reportNode('p','muted','Select a sprint.'));return;}const today=reportToday(),dated=work.filter(w=>reportSafeDate(w.startDate||w.targetDate||w.dueDate)&&reportSafeDate(w.dueDate||w.targetDate||w.startDate)),unscheduled=work.filter(w=>!dated.includes(w));const starts=dated.map(w=>reportDay(w.startDate||w.targetDate||w.dueDate)),ends=dated.map(w=>reportDay(w.dueDate||w.targetDate||w.startDate));const min=Math.min(reportSafeDate(s.start)?reportDay(s.start):Infinity,...starts,reportDay(today)),max=Math.max(reportSafeDate(s.end)?reportDay(s.end): -Infinity,...ends,reportDay(today)+1),span=Math.max(1,max-min);const todayLine=((reportDay(today)-min)/span*100).toFixed(2)+'%';const groups=[...new Set(work.map(w=>w.project))].sort();for(const group of groups){const details=reportNode('details','gs-timeline-group');details.open=true;const summary=reportNode('summary','',group+' · '+work.filter(w=>w.project===group).length+' tickets');details.append(summary,reportTimelineAxis(min,max));for(const w of work.filter(x=>x.project===group).sort((a,b)=>(a.parentId||0)-(b.parentId||0)||a.id-b.id)){const row=reportNode('div','gs-timeline-row');const link=reportNode('button','secondary gs-timeline-label','#'+w.id+' '+w.title);link.title=w.title;link.onclick=()=>{timelineSelectedId=w.id;renderTimeline();};row.append(link);const track=reportNode('div','gs-timeline-track');const marker=reportNode('div','gs-today-marker');marker.style.left=todayLine;track.append(marker);if(dated.includes(w)){const begin=reportDay(w.startDate||w.targetDate||w.dueDate),finish=Math.max(begin,reportDay(w.dueDate||w.targetDate||w.startDate));const bar=reportNode('button','gs-timeline-bar'+(reportIsClosed(w)?' gs-timeline-closed':'')+(reportIsDone(w)?' gs-timeline-done':''),'');bar.style.left=((begin-min)/span*100)+'%';bar.style.width=Math.max(1.2,(finish-begin+1)/span*100)+'%';bar.title=`#${w.id}: ${w.startDate||'No start'} to ${w.dueDate||w.targetDate||'No end'} · ${w.state}`;bar.onclick=()=>{timelineSelectedId=w.id;renderTimeline();};track.append(bar);}else{const none=reportNode('span','muted','No scheduling dates');track.append(none);}row.append(track);details.append(row);}host.append(details);}if(unscheduled.length)host.append(reportNode('p','muted',unscheduled.length+' work items have no usable dates. Select a ticket to schedule it.'));const w=work.find(x=>x.id===timelineSelectedId);if(!w){editor.append(reportNode('p','muted','Select a ticket for source details. Gantt planning elements can be edited separately below.'));return;}editor.append(reportNode('h3','',`#${w.id} · ${w.title}`));const link=document.createElement('a');link.href=w.url||`${organizationApiBase()}/${encodeURIComponent(w.project)}/_workitems/edit/${w.id}`;link.target='_blank';link.rel='noopener noreferrer';link.textContent='Open source work item in Azure DevOps';editor.append(link,reportNode('p','muted','This timeline is read-only. Use the Project Gantt below for Global Sprints-only phases and milestones.'));}
 
+// Project Gantt is deliberately independent of sprint assignments and ADO date editing.
+// One workspace-wide timeline; project selection only filters the view.
+let ganttItems=[],ganttLoadedKey='',ganttBusy=false,ganttEditId=null,ganttProjectFilter='';
+const ganttWorkspace=()=>activeWorkspace();
+function ganttProjects(){const w=ganttWorkspace();return projects.filter(p=>w?.projectIds?.includes(p.id));}
+function ganttSelectedProject(){return $('ganttProject')?.value||'';}
+function ganttElements(){return ganttWorkspace()?.ganttElements||[];}
+function ganttElementProjects(e){if(Array.isArray(e.projectNames))return e.projectNames;const legacy=String(e.scopeKey||'');return legacy.startsWith('project:')?[legacy.slice(8)]:[];}
+function ganttVisibleElements(){const project=ganttSelectedProject(),all=ganttElements();if(!project)return all;const byId=new Map(all.map(e=>[e.id,e])),included=new Set();for(const e of all){if(ganttElementProjects(e).includes(project)||!ganttElementProjects(e).length){let cursor=e;const seen=new Set();while(cursor&&!seen.has(cursor.id)){seen.add(cursor.id);included.add(cursor.id);cursor=byId.get(cursor.parentId);}}}return all.filter(e=>included.has(e.id));}
+function ganttSprints(){return (registry?.sprints||[]).filter(s=>s.workspaceId===activeWorkspaceId&&reportSafeDate(s.start)&&reportSafeDate(s.end));}
+function ganttAssignments(){const map=new Map();for(const s of ganttSprints())for(const id of s.itemIds||[]){const key=Number(id);if(!map.has(key))map.set(key,[]);map.get(key).push(s);}return map;}
+function ganttDateInfo(w,assignments){const override=ganttWorkspace()?.ganttDateOverrides?.[String(w.id)];if(override&&reportSafeDate(override.start)&&reportSafeDate(override.end))return {...override,source:'Gantt'};const start=w.startDate||'',end=w.dueDate||w.targetDate||'';if(reportSafeDate(start)&&reportSafeDate(end))return {start,end,source:'ADO'};const windows=assignments||[];const dated=windows.filter(s=>reportSafeDate(s.start)&&reportSafeDate(s.end));if(dated.length)return {start:reportSafeDate(start)?start:dated.map(s=>s.start).sort()[0],end:reportSafeDate(end)?end:dated.map(s=>s.end).sort().at(-1),source:reportSafeDate(start)||reportSafeDate(end)?'ADO + Sprint':'Sprint'};if(reportSafeDate(start)||reportSafeDate(end))return {start:start||end,end:end||start,source:'ADO'};return null;}
+function ganttSyncProjects(){const select=$('ganttProject');if(!select)return;const old=select.value,available=ganttProjects();select.replaceChildren(new Option('All workspace projects',''),...available.map(p=>new Option(p.name,p.name)));select.value=available.some(p=>p.name===old)?old:'';ganttProjectFilter=select.value;}
+function ganttTarget(e){return reportSafeDate(e?.end)?e.end:e?.start||'';}
+function ganttTree(elements){const byId=new Map(elements.map(e=>[e.id,e]));const children=new Map();for(const e of elements){let p=e.parentId;if(p===e.id||!byId.has(p))p=null;const seen=new Set([e.id]);let cursor=p;while(cursor&&byId.has(cursor)){if(seen.has(cursor)){p=null;break;}seen.add(cursor);cursor=byId.get(cursor).parentId;}if(!children.has(p))children.set(p,[]);children.get(p).push(e);}for(const list of children.values())list.sort((a,b)=>String(ganttTarget(a)).localeCompare(String(ganttTarget(b)))||String(a.title).localeCompare(String(b.title)));return {children,byId};}
+function renderGanttHealth(){const host=$('ganttHealthSummary');if(!host)return;const all=ganttElements(),now=reportToday(),milestones=all.filter(e=>e.kind==='milestone');host.textContent=`${all.length} timeline elements · ${milestones.filter(e=>ganttTarget(e)>=now).length} upcoming milestones · ${milestones.filter(e=>ganttTarget(e)<now).length} past targets. Each milestone is counted once regardless of project associations. Dates alone do not establish delivery health. Open Gantt for the shared workspace timeline.`;}
+async function ganttLoad(){if(ganttBusy)return;const names=ganttProjects().map(p=>p.name);if(!names.length){$('ganttStatus').textContent='Select participating projects in Workspace Configuration first.';return;}ganttBusy=true;$('ganttLoad').disabled=true;$('ganttStatus').textContent='Refreshing ADO delivery context…';try{const found=[];let truncated=0;for(const name of names){const escaped=name.replace(/'/g,"''");const q={query:`SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '${escaped}' AND [System.State] <> 'Removed' ORDER BY [System.ChangedDate] DESC`};const result=await api(`/${encodeURIComponent(name)}/_apis/wit/wiql?$top=${MAX_ITEMS}&api-version=7.1`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(q)});const ids=(result.workItems||[]).slice(0,MAX_ITEMS).map(x=>x.id);if(ids.length===MAX_ITEMS)truncated++;for(let i=0;i<ids.length;i+=100){const batch=await api('/_apis/wit/workitemsbatch?api-version=7.1',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids:ids.slice(i,i+100),$expand:'Relations',errorPolicy:'Omit'})});for(const raw of batch.value||[]){const item=normalizeItem(raw);const parent=(raw.relations||[]).find(x=>x.rel==='System.LinkTypes.Hierarchy-Reverse');item.parentId=Number(parent?.url?.match(/\/(\d+)(?:\?.*)?$/)?.[1])||null;found.push(item);}}}ganttItems=found;ganttLoadedKey=activeWorkspaceId;$('ganttStatus').textContent=`Delivery context refreshed: ${found.length} items across ${names.length} project(s).${truncated?' Some projects reached the 200-recent-item retrieval limit; this is not a complete backlog.':''} No ADO work was changed.`;renderGantt();}catch(e){$('ganttStatus').textContent='Gantt refresh failed: '+String(e.message||e);}finally{ganttBusy=false;$('ganttLoad').disabled=false;}}
+function ganttOpenItem(w){const url=w.url||`${organizationApiBase()}/${encodeURIComponent(w.project)}/_workitems/edit/${w.id}`;window.open(url,'_blank','noopener,noreferrer');}
+function ganttEditDates(w,info){const host=$('ganttEditor');host.replaceChildren();host.dataset.creating='yes';host.hidden=false;host.classList.remove('hidden');host.append(reportNode('h3','',`Timeline dates · #${w.id} ${w.title}`),reportNode('p','muted',`Currently inferred from ${info?.source||'no available dates'}. Changes here remain in Global Sprints only.`));const form=reportNode('div','gs-gantt-form');const field=(label,value)=>{const l=reportNode('label','',label),x=document.createElement('input');x.type='date';x.value=value||'';l.append(x);form.append(l);return x;};const start=field('Timeline start',info?.start),end=field('Timeline end',info?.end);const save=reportNode('button','','Save timeline dates');save.type='button';save.onclick=async()=>{if(!reportSafeDate(start.value)||!reportSafeDate(end.value)||end.value<start.value){$('ganttStatus').textContent='Choose valid start and end dates.';return;}const ok=await persist(r=>{const ws=r.workspaces.find(x=>x.id===activeWorkspaceId);ws.ganttDateOverrides||={};ws.ganttDateOverrides[String(w.id)]={start:start.value,end:end.value};},false);if(ok){host.dataset.creating='';host.replaceChildren();renderGantt();$('ganttStatus').textContent='Gantt-only dates saved. ADO ticket unchanged.';}};form.append(save);const reset=reportNode('button','secondary','Use source / sprint dates');reset.type='button';reset.onclick=async()=>{const ok=await persist(r=>{const ws=r.workspaces.find(x=>x.id===activeWorkspaceId);if(ws.ganttDateOverrides)delete ws.ganttDateOverrides[String(w.id)];},false);if(ok){host.dataset.creating='';host.replaceChildren();renderGantt();}};form.append(reset);const cancel=reportNode('button','secondary','Cancel');cancel.type='button';cancel.onclick=()=>{host.dataset.creating='';host.replaceChildren();};form.append(cancel);host.append(form);host.scrollIntoView({block:'center',behavior:'smooth'});start.focus({preventScroll:true});}
+function renderGantt(){
+ const host=$('ganttCanvas'),editor=$('ganttEditor');if(!host||!editor)return;host.replaceChildren();if(!ganttEditId&&!editor.dataset.creating)editor.replaceChildren();
+ const project=ganttSelectedProject(),elements=ganttVisibleElements(),work=ganttLoadedKey===activeWorkspaceId?ganttItems:[],assignments=ganttAssignments();
+ const active=work.filter(w=>(!project||w.project===project)&&!reportIsDone(w)&&!reportIsClosed(w));
+ const scheduled=active.map(w=>({w,windows:(assignments.get(Number(w.id))||[]).filter(s=>!project||w.project===project),info:ganttDateInfo(w,assignments.get(Number(w.id))||[])})).filter(x=>x.info&&reportSafeDate(x.info.start)&&reportSafeDate(x.info.end));
+ const sprintWindows=ganttSprints().filter(s=>(s.itemIds||[]).some(id=>active.some(w=>Number(w.id)===Number(id))));
+ const dated=[...elements.map(e=>({start:e.start,end:ganttTarget(e)})),...scheduled.map(x=>x.info),...sprintWindows.map(s=>({start:s.start,end:s.end}))].filter(x=>reportSafeDate(x.start)&&reportSafeDate(x.end));
+ const today=reportDay(reportToday()),min=Math.min(today-7,...dated.map(x=>reportDay(x.start))),max=Math.max(today+35,...dated.map(x=>reportDay(x.end))),span=Math.max(1,max-min);
+ host.append(reportTimelineAxis(min,max));
+ const projectPalette=['#2866a1','#23856f','#7b59a6','#b05f36','#467b96','#a34f75','#697e37','#6667a8'];
+ const projectColor=name=>{const names=ganttProjects().map(p=>p.name).sort((a,b)=>a.localeCompare(b));return projectPalette[Math.max(0,names.indexOf(name))%projectPalette.length];};
+ const todayPct=(today-min)/span*100;
+ const row=(parent,label,start,end,kind,action,meta='',color='')=>{
+  const wrapper=reportNode('div','gs-gantt-row');const name=reportNode('button','secondary gs-gantt-label',label);name.type='button';name.title=meta||label;name.onclick=action;wrapper.append(name);
+  const track=reportNode('div','gs-gantt-track');
+  if(todayPct>=0&&todayPct<=100){const marker=reportNode('div','gs-gantt-today');marker.style.left=todayPct+'%';marker.title='Today';track.append(marker);}
+  if(reportSafeDate(start)&&reportSafeDate(end)){
+   const startDay=reportDay(start),endDay=Math.max(startDay,reportDay(end));const left=(startDay-min)/span*100;
+   if(kind==='milestone'){
+    // A milestone is one shared delivery event, not a duration bar or a copy per project.
+    const x=(startDay-min)/span*100;
+    if(endDay>startDay){const duration=reportNode('div','gs-gantt-milestone-range');duration.style.left=x+'%';duration.style.width=((endDay-startDay)/span*100)+'%';track.append(duration);}
+    const line=reportNode('div','gs-gantt-milestone-guide');line.style.left=((endDay-min)/span*100)+'%';line.title='Milestone target: '+end;track.append(line);
+    const diamond=reportNode('div','gs-gantt-milestone-diamond');diamond.style.left=((endDay-min)/span*100)+'%';diamond.title=`${label} · target ${end}${meta?' · '+meta:''}`;track.append(diamond);
+   }else{
+    const bar=reportNode('div','gs-gantt-bar'+(kind==='phase'?' gs-gantt-phase':''));bar.style.left=left+'%';bar.style.width=Math.max(1,(endDay-startDay+1)/span*100)+'%';
+    if(color){bar.style.setProperty('--gs-gantt-color',color);bar.style.setProperty('--gs-gantt-light',color+'55');}
+    const elapsedDays=Math.max(0,Math.min(endDay+1,today)-startDay),totalDays=Math.max(1,endDay-startDay+1);
+    const elapsed=reportNode('div','gs-gantt-elapsed');elapsed.style.width=(elapsedDays/totalDays*100)+'%';bar.append(elapsed);
+    bar.title=`${label}: ${start} to ${end} · ${elapsedDays}/${totalDays} calendar days elapsed (not work completed)${meta?' · '+meta:''}`;if(kind==='work'){bar.tabIndex=0;bar.setAttribute('role','button');bar.setAttribute('aria-label','Edit Gantt dates for '+label);bar.onclick=action;bar.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();action();}};}track.append(bar);
+   }
+  }
+  wrapper.append(track);parent.append(wrapper);
+ };
+ const {children,byId}=ganttTree(elements);
+ const projectNames=project?[project]:ganttProjects().map(p=>p.name);
+ const expanded=()=>{const ws=ganttWorkspace();ws.ganttUi||={};return ws.ganttUi;};
+ const ui=expanded();
+ // A project has one presentation owner: its deepest associated milestone/phase.
+ // The ADO parent-child relationships remain untouched.
+ const assignedOwner=new Map();
+ const elementDepth=e=>{let depth=0,cursor=e,seen=new Set();while(cursor?.parentId&&byId.has(cursor.parentId)&&!seen.has(cursor.parentId)){seen.add(cursor.parentId);depth++;cursor=byId.get(cursor.parentId);}return depth;};
+ for(const e of elements)for(const name of ganttElementProjects(e))if(projectNames.includes(name)){
+  const previous=assignedOwner.get(name);
+  if(!previous||elementDepth(e)>elementDepth(previous))assignedOwner.set(name,e);
+ }
+ const projectRows=new Map(projectNames.map(name=>[name,scheduled.filter(x=>x.w.project===name)]));
+ const appendWork=(parent,name,depth)=>{
+  const entries=projectRows.get(name)||[],byWorkId=new Map(entries.map(x=>[Number(x.w.id),x]));
+  const childrenByParent=new Map();
+  for(const x of entries){const parentId=Number(x.w.parentId),key=parentId!==Number(x.w.id)&&byWorkId.has(parentId)?parentId:null;if(!childrenByParent.has(key))childrenByParent.set(key,[]);childrenByParent.get(key).push(x);}
+  const visited=new Set();
+  const renderItem=(x,level)=>{const id=Number(x.w.id);if(visited.has(id))return;visited.add(id);const dates=x.info,kids=childrenByParent.get(id)||[];
+   if(kids.length){const group=makeGroup(parent,`#${id} ${x.w.title}`,'work:'+name+':'+id,level);row(group,`#${id} ${x.w.title}`,dates.start,dates.end,'work',()=>ganttEditDates(x.w,dates),`${dates.source} · ${x.w.state}`,projectColor(name));for(const child of kids)renderItem(child,level+1);}
+   else row(parent,'  '.repeat(level)+`#${id} ${x.w.title}`,dates.start,dates.end,'work',()=>ganttEditDates(x.w,dates),`${dates.source} · ${x.w.state}`,projectColor(name));
+  };
+  for(const x of childrenByParent.get(null)||[])renderItem(x,depth);
+  for(const x of entries)if(!visited.has(Number(x.w.id)))renderItem(x,depth);
+ };
+ const makeGroup=(parent,label,key,depth=0)=>{const group=reportNode('details','gs-timeline-group gs-gantt-hierarchy');group.dataset.ganttKey=key;group.open=ui[key]!==false;const heading=reportNode('summary','',('  '.repeat(depth))+label);group.append(heading);group.addEventListener('toggle',()=>{if(!registry||!ganttWorkspace())return;ganttWorkspace().ganttUi||={};ganttWorkspace().ganttUi[key]=group.open;});parent.append(group);return group;};
+ const renderNode=(e,parent,depth,ancestry)=>{
+  if(depth>20||ancestry.has(e.id))return;
+  const group=makeGroup(parent,(e.kind==='milestone'?'◆ ':'▰ ')+e.title,'element:'+e.id,depth);
+  row(group,'  '.repeat(depth)+(e.kind==='milestone'?'◆ ':'▰ ')+e.title,e.start,ganttTarget(e),e.kind,()=>{ganttEditId=e.id;editor.dataset.creating='';renderGantt();},ganttElementProjects(e).join(', ')||'Workspace-wide');
+  const next=new Set(ancestry);next.add(e.id);
+  for(const child of children.get(e.id)||[])renderNode(child,group,depth+1,next);
+  for(const name of projectNames.filter(n=>assignedOwner.get(n)?.id===e.id)){
+   const pg=makeGroup(group,name,'project:'+e.id+':'+name,depth+1);const swatch=reportNode('span','gs-gantt-project-swatch');swatch.style.backgroundColor=projectColor(name);pg.querySelector('summary').prepend(swatch);appendWork(pg,name,depth+2);
+  }
+ };
+ const roots=children.get(null)||[];
+ if(roots.length){const section=makeGroup(host,'Delivery milestones and phases · '+elements.length,'root');for(const e of roots)renderNode(e,section,0,new Set());}
+ const unassociated=projectNames.filter(name=>!assignedOwner.has(name));
+ if(unassociated.length){const other=makeGroup(host,'Other workspace projects','unassociated');for(const name of unassociated){const pg=makeGroup(other,name,'other:'+name,1);appendWork(pg,name,2);}}
+ const filterHost=$('ganttHierarchyFilter');if(filterHost){const old=filterHost.value;filterHost.replaceChildren(new Option('All milestones and projects',''),...elements.map(e=>new Option(e.title,e.id)));filterHost.value=elements.some(e=>e.id===old)?old:'';const selected=filterHost.value;if(selected){for(const group of [...host.querySelectorAll('[data-gantt-key]')]){if(group.dataset.ganttKey==='root'||group.dataset.ganttKey==='unassociated')continue;const id=group.dataset.ganttKey?.slice(8);if(!group.dataset.ganttKey?.startsWith('element:'))continue;let cursor=byId.get(id),visible=false;const seen=new Set();while(cursor&&!seen.has(cursor.id)){if(cursor.id===selected){visible=true;break;}seen.add(cursor.id);cursor=byId.get(cursor.parentId);}group.hidden=!visible;}const other=host.querySelector('[data-gantt-key="unassociated"]');if(other)other.hidden=true;}}
+ const legend=reportNode('div','gs-gantt-legend');
+ const legendEntry=(sample,label)=>{const entry=reportNode('span','gs-gantt-legend-entry');entry.append(sample,reportNode('span','',label));legend.append(entry);};
+ legendEntry(reportNode('span','gs-gantt-legend-diamond'),'Milestone');
+ const duration=reportNode('span','gs-gantt-legend-duration');duration.append(reportNode('span','gs-gantt-legend-elapsed'));legendEntry(duration,'Calendar span');
+ legendEntry(reportNode('span','gs-gantt-legend-today'),'Today');
+ const swatch=reportNode('span','gs-gantt-project-swatch');swatch.style.backgroundColor=projectColor(projectNames[0]||'');legendEntry(swatch,'Project');
+ legend.append(reportNode('small','muted','Dark = elapsed calendar time, not completed work.'));host.append(legend);
+ if(!elements.length&&!scheduled.length)host.append(reportNode('p','muted','Your workspace timeline is ready. Add a launch milestone or refresh project context to show existing sprint work automatically. No ADO work-item scheduling is required.'));
+ if(work.length){const hidden=work.filter(w=>(!project||w.project===project)).length-scheduled.length;host.append(reportNode('p','muted',`${scheduled.length} active dated items shown; ${Math.max(0,hidden)} completed, closed or undated items not displayed. Click a work-item row to refine its dates in Gantt only.`));}
+ const selected=ganttElements().find(e=>e.id===ganttEditId);if(selected)ganttShowEditor(selected);
+}
+function ganttShowEditor(existing=null){
+ const host=$('ganttEditor');host.replaceChildren();host.dataset.creating=existing?'':'yes';host.append(reportNode('h3','',existing?'Edit timeline element':'Add milestone or phase'),reportNode('p','muted','Define a date first or choose the associated project first. Both are optional until you save. These records never change ADO work items.'));
+ const form=reportNode('div','gs-gantt-form');const field=(label,type,value)=>{const l=reportNode('label','',label),x=document.createElement('input');x.type=type;x.value=value||'';l.append(x);form.append(l);return x;};
+ const title=field('Name','text',existing?.title),kind=document.createElement('select');kind.add(new Option('Milestone (target date)','milestone'));kind.add(new Option('Phase (date range)','phase'));kind.value=existing?.kind||'milestone';const kl=reportNode('label','','Type');kl.append(kind);form.append(kl);
+ const start=field('Target / start date','date',existing?.start),end=field('End date / deadline (optional for milestones)','date',existing?.end||'');const description=field('Optional description','text',existing?.description);
+ const projectLabel=reportNode('label','','Associate with projects (optional; leave empty for workspace-wide)');const projectSelect=document.createElement('select');projectSelect.multiple=true;projectSelect.size=Math.min(5,Math.max(2,ganttProjects().length));for(const p of ganttProjects()){const option=new Option(p.name,p.name);option.selected=(existing?ganttElementProjects(existing):ganttSelectedProject()?[ganttSelectedProject()]:[]).includes(p.name);projectSelect.add(option);}projectLabel.append(projectSelect);form.append(projectLabel);
+ const parent=document.createElement('select');parent.add(new Option('No parent (top-level)',''));const descendants=new Set();const visit=id=>{for(const e of ganttElements().filter(x=>x.parentId===id&&!descendants.has(x.id))){descendants.add(e.id);visit(e.id);}};if(existing)visit(existing.id);for(const e of ganttElements().filter(e=>e.id!==existing?.id&&!descendants.has(e.id)))parent.add(new Option(e.title,e.id));parent.value=existing?.parentId||'';const pl=reportNode('label','','Optional parent milestone / phase');pl.append(parent);form.append(pl);
+ const save=reportNode('button','','Save milestone / phase');save.type='button';save.onclick=async()=>{const t=title.value.trim(),st=start.value,en=end.value||st;if(!t||!reportSafeDate(st)||!reportSafeDate(en)||en<st){$('ganttStatus').textContent='Provide a name and valid date(s). Provide a start date; the optional end date must not precede it.';return;}const id=existing?.id||crypto.randomUUID(),record={id,scopeKey:'workspace:'+activeWorkspaceId,projectNames:[...projectSelect.selectedOptions].map(o=>o.value),title:t,kind:kind.value,start:st,end:en,description:description.value.trim(),parentId:parent.value||null};const ok=await persist(r=>{const w=r.workspaces.find(x=>x.id===activeWorkspaceId);if(!w)throw Error('Workspace unavailable');w.ganttElements=w.ganttElements||[];const index=w.ganttElements.findIndex(e=>e.id===id);if(index>=0)w.ganttElements[index]=record;else w.ganttElements.push(record);},false,false);
+ if(ok){
+  const sameProjects=(a,b)=>JSON.stringify([...new Set(a)].sort())===JSON.stringify([...new Set(b)].sort());
+  let confirmed=null,actual=null,lastError=null;
+  // Azure DevOps extension-data reads can lag a successful setDocument response.
+  // Retry a bounded read-back; never declare success from the optimistic local copy.
+  for(let attempt=0;attempt<4;attempt++){
+   try{
+    confirmed=await storage.getDocument(COLLECTION,ROOT);
+    const ws=confirmed?.workspaces?.find(x=>x.id===activeWorkspaceId);
+    actual=ws?.ganttElements?.find(e=>e.id===id);
+    if(actual&&actual.start===record.start&&ganttTarget(actual)===record.end&&(actual.parentId||null)===(record.parentId||null)&&sameProjects(ganttElementProjects(actual),record.projectNames))break;
+    actual=null;
+   }catch(error){lastError=error;}
+   if(attempt<3)await new Promise(resolve=>setTimeout(resolve,250*(attempt+1)));
+  }
+  if(actual){registry=confirmed;ganttEditId=null;host.dataset.creating='';renderGantt();renderGanttHealth();$('ganttStatus').textContent='Milestone saved and verified. Azure DevOps unchanged.';notify('Milestone saved and verified.');}
+  else{
+   const message=lastError?'Storage read-back failed: '+String(lastError.message||lastError):'Saved data was not yet visible in shared storage.';
+   $('ganttStatus').textContent='Milestone verification pending: '+message+' Keep this editor open; refresh to confirm before saving again.';
+   notify('Milestone verification pending: '+message,true);
+  }
+ }else{$('ganttStatus').textContent='Milestone save failed. Check the message above and retry.';}};form.append(save);
+ const cancel=reportNode('button','secondary','Cancel');cancel.type='button';cancel.onclick=()=>{ganttEditId=null;host.dataset.creating='';host.replaceChildren();};form.append(cancel);
+ if(existing){const del=reportNode('button','secondary','Remove timeline element');del.type='button';del.onclick=async()=>{if(!confirm('Remove this Global Sprints timeline element? Azure DevOps is unaffected.'))return;const ok=await persist(r=>{const w=r.workspaces.find(x=>x.id===activeWorkspaceId);w.ganttElements=(w.ganttElements||[]).filter(e=>e.id!==existing.id).map(e=>e.parentId===existing.id?{...e,parentId:existing.parentId||null}:e);},false);if(ok){ganttEditId=null;host.dataset.creating='';renderGantt();renderGanttHealth();}};form.append(del);}host.append(form);title.focus();
+}
+$('ganttHierarchyFilter')?.addEventListener('change',()=>{renderGantt();});$('ganttProject')?.addEventListener('change',()=>{ganttEditId=null;renderGantt();});$('ganttLoad')?.addEventListener('click',()=>void ganttLoad());$('ganttAdd')?.addEventListener('click',()=>{ganttEditId=null;ganttShowEditor();$('ganttEditor').scrollIntoView({block:'nearest',behavior:'smooth'});});
 async function refreshTrackedWorkItemsQuietly(){
  if(!registry||busy||timelineBusy||sprintDirty()||projectsDirty()||document.hidden)return;
  const selected=currentSprint();if(!selected?.itemIds?.length)return;
@@ -2167,6 +2402,38 @@ $('planningHealthDetails')?.addEventListener('click',()=>openReport('health'));$
 let proposedCeremonies=[];let proposedSprintId='';
 const planDate=(date)=>{const [y,m,d]=date.split('-').map(Number);return new Date(Date.UTC(y,m-1,d));};
 const planISO=d=>d.toISOString().slice(0,10);
+// One date-only scheduling authority for ceremony recommendations and previews.
+// A sprint's next turnover is based on its cadence, while end ceremonies fall on
+// the final WORKING day before turnover (never the first day of the next sprint).
+function gsCeremonyCycle(startISO, sprintEndISO, repeatEndISO, repeating){
+ const start=planDate(startISO),last=planDate(sprintEndISO);
+ if(!Number.isFinite(start.getTime())||!Number.isFinite(last.getTime())||last<start)throw Error('Select valid sprint dates.');
+ const observedDays=Math.round((last-start)/86400000)+1;
+ const weeks=Math.ceil(observedDays/7);
+ const cycleDays=weeks*7;
+ const horizon=planDate(repeatEndISO||sprintEndISO);
+ if(!Number.isFinite(horizon.getTime())||horizon<start)throw Error('Select a valid schedule end date.');
+ const cycles=[];
+ for(let index=0;;index++){
+  const cycleStart=new Date(start.getTime()+index*cycleDays*86400000);
+  if(cycleStart>horizon)break;
+  const boundary=new Date(cycleStart.getTime()+cycleDays*86400000);
+  const finalWorkday=new Date(boundary.getTime()-86400000);
+  while([0,6].includes(finalWorkday.getUTCDay()))finalWorkday.setUTCDate(finalWorkday.getUTCDate()-1);
+  const iso=planISO(finalWorkday);
+  if(iso>planISO(horizon))break; // Never book a closing ceremony beyond the approved horizon.
+  cycles.push({start:planISO(cycleStart),end:iso,boundary:planISO(boundary),weeks});
+  if(!repeating)break;
+ }
+ return cycles;
+}
+function gsTimeAfter(time,minutes){
+ const [hour,min]=String(time||'09:30').split(':').map(Number);
+ const total=hour*60+min+minutes;
+ if(total>=1440)throw Error('Review and Retrospective cannot fit on the final day. Choose an earlier meeting time.');
+ return `${String(Math.floor(total/60)).padStart(2,'0')}:${String(total%60).padStart(2,'0')}`;
+}
+
 function planAgenda(type){return ({'Sprint Planning':'Review goals, capacity, candidate work, dependencies and commitments.','Standup':'Progress since last check-in; next steps; blockers requiring action.','Sprint Review':'Review delivered work, outcomes, feedback and remaining commitments.','Retrospective':'What worked, what did not, and improvement actions.','Backlog Refinement':'Review carryovers, clarify candidates, acceptance criteria and priorities.'})[type]||'';}
 function clearCeremonyProposal(){proposedCeremonies=[];proposedSprintId='';proposalWorkspaceId='';proposalRange=null;const el=$('ceremonyPreview');if(el)el.replaceChildren();if($('proposalCalendar'))$('proposalCalendar').replaceChildren();if($('confirmCeremonies'))$('confirmCeremonies').disabled=true;if($('ceremonyPreviewStatus'))$('ceremonyPreviewStatus').textContent='';}
 let wizardStep=1;let proposalWorkspaceId='';let proposalRange=null;
@@ -2179,17 +2446,86 @@ function renderOutlookPlanningReadiness(){
  const detail=document.createElement('span');detail.textContent=!m365Account?' · You can save a plan without Outlook. Reconnect before booking.':!saved?' · Select a calendar before booking.':!calendar?' · Saved calendar selection retained; checking calendar access.':!m365CalendarsVerified?' · Saved calendar restored; verifying current access.':' · Ready for Outlook booking.';status.append(detail);
  if(!m365Account){const button=document.createElement('button');button.type='button';button.className='secondary';button.style.marginLeft='8px';button.textContent='Reconnect Outlook';button.onclick=()=>void m365Connect();status.append(button);}
  else if(!calendar){const button=document.createElement('button');button.type='button';button.className='secondary';button.style.marginLeft='8px';button.textContent='Check calendars';button.onclick=()=>void m365RefreshCalendars();status.append(button);}
+ syncCeremonySetupChoice();
 }
-function showWizardStep(n){renderOutlookPlanningReadiness();if(n===1&&wizardStep===1)restoreSavedMeetingPreferences();wizardStep=Math.max(1,Math.min(4,n));for(let i=1;i<=4;i++)$('wizardStep'+i).classList.toggle('hidden',i!==wizardStep);$('wizardStepLabel').textContent='Step '+wizardStep+' of 4';const hint=$('wizardStepHelp');if(hint)hint.textContent=['','Choose the sprint or project period. Past dates remain part of the plan, but must not be invited retroactively.','Choose ceremonies to include. Previously saved ceremonies remain in the schedule below and are never silently replaced.','Select weekdays and Outlook recurrence separately. Add recipients once, then check the resolved booking summary before continuing.','Review the proposed dates and recurrence. Save a draft first, then open its meetings to book Outlook invitations explicitly.'][wizardStep];$('wizardBack').disabled=wizardStep===1;$('wizardNext').classList.toggle('hidden',wizardStep===4);$('wizardNext').textContent=wizardStep===1?'Start':'Continue';$('wizardNext').classList.toggle('gs-start-action',wizardStep===1);if(wizardStep===3){renderPlanResolvedSummary();$('planContactEnable').textContent=peopleLookupEnabled?'Disable Outlook recipient suggestions':'Enable Outlook recipient suggestions';$('planContactEnable').setAttribute('aria-pressed',String(peopleLookupEnabled));}if(wizardStep===4)previewCeremonyPlan();}
+let ceremonySetupUserSelected=false;let ceremonySetupAutoExternal=false;
+function ceremonySetupMode(){return document.querySelector('input[name="ceremonySetupMode"]:checked')?.value||'recommended';}
+function ceremonyOutlookReady(){const saved=m365ReadCalendarPreference();return !!(m365Account&&saved&&m365CalendarsVerified&&m365Calendars.some(c=>c.id===saved));}
+function syncCeremonySetupChoice(){
+ const ready=ceremonyOutlookReady();
+ for(const radio of document.querySelectorAll('input[name="ceremonySetupMode"]'))if(radio.value!=='external')radio.disabled=!ready;
+ if(!ready&&ceremonySetupMode()!=='external'){document.querySelector('input[name="ceremonySetupMode"][value="external"]').checked=true;ceremonySetupAutoExternal=true;}
+ if(ready&&ceremonySetupAutoExternal&&!ceremonySetupUserSelected){document.querySelector('input[name="ceremonySetupMode"][value="recommended"]').checked=true;ceremonySetupAutoExternal=false;}
+ const mode=ceremonySetupMode();
+ $('ceremonyOutlookRequired').classList.toggle('hidden',ready);
+ $('ceremonyExternalComplete').classList.toggle('hidden',mode!=='external');
+ for(let i=1;i<=4;i++)$('wizardStep'+i).classList.toggle('hidden',mode==='external'||i!==wizardStep);
+ $('wizardNext').disabled=mode==='external';$('wizardBack').disabled=mode==='external'||wizardStep===1;
+ $('ceremonyAdvancedBooking').classList.toggle('hidden',mode==='recommended');
+ if(mode==='recommended'){$('planCadence').value='unoccupied';$('planStandupRepeat').value='weekly';$('planOtherRepeat').value=$('planRepeatSprints').checked?'sprint':'single';syncPlanManualStandups();}
+ const w=activeScheduleWorkspace();const status=w?.ceremonySetup?.mode==='external'?'Ceremonies are marked as managed outside Global Sprints. No Outlook meetings were created.':'';
+ $('ceremonyExternalStatus').textContent=status;
+}
+$('ceremonyGoConfiguration').addEventListener('click',()=>showTab('configuration'));
+for(const radio of document.querySelectorAll('input[name="ceremonySetupMode"]'))radio.addEventListener('change',()=>{if(radio.checked){ceremonySetupUserSelected=true;ceremonySetupAutoExternal=false;wizardStep=1;showWizardStep(1);syncCeremonySetupChoice();}});
+$('ceremonyExternalComplete').addEventListener('click',async()=>{
+ if(ceremonySetupMode()!=='external')return;
+ const w=activeScheduleWorkspace();if(!w)return notify('Choose a workspace before marking ceremony setup complete.',true);
+ const now=new Date().toISOString();
+ const ok=await persist(r=>{const target=r.workspaces.find(x=>x.id===w.id);if(!target)throw Error('Workspace no longer exists.');target.ceremonySetup={mode:'external',status:'complete',updatedAt:now};},false);
+ if(ok!==false){syncCeremonySetupChoice();notify('Ceremony setup marked complete. No Outlook meetings were booked.');}
+});
+function renderStep3Calendar(){
+ const host=$('step3Calendar'),status=$('step3CalendarStatus');
+ if(!host||!status)return;
+ host.replaceChildren();status.textContent='';
+ const range=scheduleRange();
+ if(!range.start||!range.end||range.end<range.start){status.textContent='Select valid dates in Step 1, and an end date if recurrence is enabled.';return;}
+ if(!activeScheduleWorkspace()){status.textContent='Choose a workspace to preview ceremonies.';return;}
+ try{
+  // Generate once, then render directly into Step 3. Never clone Step 4's
+  // calendar: cloning drops its event handlers and couples both wizard steps.
+  previewCeremonyPlan();
+  if(!proposedCeremonies.length){status.textContent='No meetings proposed. Check ceremony selections in Step 2.';return;}
+  renderMeetingCalendar(host,proposedCeremonies.filter(m=>!m.excluded),range.start);
+  status.textContent='Showing '+proposedCeremonies.length+' proposed meeting record(s) from '+range.start+' through '+range.end+'. Continue to Step 4 to review and adjust.';
+ }catch(e){status.textContent='Calendar preview unavailable: '+String(e.message||e);diagnostic('wizard.step3.preview_error',{message:String(e.message||e)},'warn');}
+}
+function wizardStepError(message){
+ const target=$('step3CalendarStatus');
+ if(target){target.textContent=message;target.scrollIntoView({block:'nearest'});}
+ else notify(message,true);
+}
+function showWizardStep(n){renderOutlookPlanningReadiness();if(n===1&&wizardStep===1)restoreSavedMeetingPreferences();wizardStep=Math.max(1,Math.min(4,n));for(let i=1;i<=4;i++)$('wizardStep'+i).classList.toggle('hidden',i!==wizardStep);$('wizardStepLabel').textContent='Step '+wizardStep+' of 4';const hint=$('wizardStepHelp');if(hint)hint.textContent=['','Choose the sprint or project period. Past dates remain part of the plan, but must not be invited retroactively.','Choose ceremonies to include. Previously saved ceremonies remain in the schedule below and are never silently replaced.','Configure standups and attendees. Choose whether to repeat all ceremonies through consecutive sprints, then set the end date.','Review the proposed dates and recurrence. Save a draft first, then open its meetings to book Outlook invitations explicitly.'][wizardStep];$('wizardBack').disabled=wizardStep===1;$('wizardBack').classList.remove('gs-review-back-hidden');$('wizardNext').classList.toggle('hidden',wizardStep===4);$('previewCeremonies').classList.toggle('hidden',wizardStep!==4);$('confirmCeremonies').classList.toggle('hidden',wizardStep!==4);$('wizardReset').classList.remove('hidden');$('wizardNext').textContent=wizardStep===1?'Start':'Continue';$('wizardNext').classList.toggle('gs-start-action',wizardStep===1);if(wizardStep===3){syncRepeatSprints();syncPlanManualStandups();$('planContactEnable').textContent=peopleLookupEnabled?'Disable Outlook recipient suggestions':'Enable Outlook recipient suggestions';$('planContactEnable').setAttribute('aria-pressed',String(peopleLookupEnabled));renderStep3Calendar();}if(wizardStep===4&&ceremonySetupMode()!=='external')previewCeremonyPlan();syncCeremonySetupChoice();}
 function activeScheduleWorkspace(){return registry?.workspaces?.find(w=>w.id===activeWorkspaceId);}
 function scheduleRange(){
  const scope=$('planScope').value;
- if(scope==='sprint'){
-  const s=currentSprint();
-  return {start:s?.start||'',end:s?.end||''};
- }
- return {start:$('planStart').value,end:$('planEnd').value};
+ const base=scope==='sprint'?{start:currentSprint()?.start||'',end:currentSprint()?.end||''}:{start:$('planStart').value,end:$('planEnd').value};
+ if($('planRepeatSprints')?.checked)return {start:base.start,end:$('planRepeatEnd').value||''};
+ return base;
 }
+function syncRepeatSprints(){
+ const checked=$('planRepeatSprints').checked,wrap=$('planRepeatEndWrap');
+ wrap.classList.toggle('hidden',!checked);
+ const sprint=currentSprint(),baseEnd=$('planScope').value==='sprint'?sprint?.end:$('planEnd').value;
+ if(checked&&!$('planRepeatEnd').value&&baseEnd){
+  // Default to one additional sprint, not the current sprint end. The old
+  // default immediately failed Step 3's end-date validation.
+  const end=planDate(baseEnd),sprintStart=sprint?.start?planDate(sprint.start):null;
+  const length=sprintStart?Math.round((end-sprintStart)/86400000)+1:14;
+  if(Number.isFinite(end.getTime())){end.setUTCDate(end.getUTCDate()+Math.max(7,length));$('planRepeatEnd').value=planISO(end);}
+ }
+ const days=sprint?.start&&sprint?.end?Math.round((planDate(sprint.end)-planDate(sprint.start))/86400000)+1:0;
+ const weeks=days>=7?Math.ceil(days/7):0;
+ $('planRepeatHint').textContent=weeks?`Sprint cadence: every ${weeks} week(s). Meetings will continue through the selected end date.`:'To repeat sprint ceremonies, select a saved sprint with a whole-week cadence.';
+ if(checked)$('planOtherRepeat').value='sprint';else $('planOtherRepeat').value='single';
+ $('planStandupRepeat').value='weekly';
+ renderPlanResolvedSummary();
+}
+$('planRepeatSprints').addEventListener('change',()=>{syncRepeatSprints();clearCeremonyProposal();});
+$('planRepeatEnd').addEventListener('change',()=>{renderPlanResolvedSummary();clearCeremonyProposal();});
+$('planScope').addEventListener('change',syncRepeatSprints);
+
 function syncPlanScope(){
  const s=currentSprint(),sprintMode=$('planScope').value==='sprint';
  if(sprintMode){$('planStart').value=s?.start||'';$('planEnd').value=s?.end||'';}
@@ -2207,24 +2543,59 @@ function restoreSavedMeetingPreferences(){
  if(p.standupDuration)$('planDuration').value=p.standupDuration;
  if(p.time)populateMeetingTimePicker($('planTime'),p.time);
  if(p.participants!==undefined)$('planParticipants').value=p.participants;
- if(Array.isArray(p.weekdays))$('planDays').querySelectorAll('input[type=checkbox]').forEach(el=>el.checked=p.weekdays.includes(Number(el.value)));
+ if(Array.isArray(p.manualWeekdays||p.weekdays))$('planDays').querySelectorAll('input[type=checkbox]').forEach(el=>el.checked=(p.manualWeekdays||p.weekdays).includes(Number(el.value)));
  if(Array.isArray(p.types))for(const [id,type] of [['planPlanning','Planning'],['planStandup','Standup'],['planReview','Review'],['planRetro','Retro'],['planGroom','Groom']])$(id).checked=p.types.includes(type);
  if(p.combine!==undefined)$('planCombine').checked=!!p.combine;
+ syncPlanManualStandups();
+ if(ceremonySetupMode()==='recommended'){$('planCadence').value='unoccupied';$('planStandupRepeat').value='weekly';$('planOtherRepeat').value=$('planRepeatSprints').checked?'sprint':'single';}
  const note=$('wizardSavedPreferences');if(note)note.textContent='Restored choices from '+sc.name+'. Existing meetings are listed below; they will not be duplicated.';
 }
-function resolvePlanStandupDays(range,existing=[],proposed=[]){
- const checked=[...$('planDays').querySelectorAll('input:checked')].map(x=>Number(x.value)).filter(d=>d>=1&&d<=5);
- const mode=$('planCadence').value;
- if(mode!=='unoccupied')return checked.sort((a,b)=>a-b);
- // Only actual occupied dates within the selected period matter. A review on one Friday
- // must not eliminate every Friday in a multi-week standup series.
- const occupied=new Set(existing.concat(proposed).filter(c=>c.type!=='Standup'&&c.status!=='Cancelled'&&c.date>=range.start&&c.date<=range.end).map(c=>c.date));
- const start=planDate(range.start),end=planDate(range.end),counts=new Map();
- for(let d=new Date(start);d<=end;d.setUTCDate(d.getUTCDate()+1)){
-  const day=d.getUTCDay(),date=planISO(d);
-  if(checked.includes(day)&&!occupied.has(date))counts.set(day,(counts.get(day)||0)+1);
+function planOccupiedCeremonyDates(range,existing=[],proposed=[]){
+ const occupied=new Set();
+ for(const c of existing.concat(proposed)){
+  if(c.type==='Standup'||c.status==='Cancelled'||c.excluded)continue;
+  if(!c.date)continue;
+  const first=planDate(c.date),last=planDate(c.repeatEnd||c.date);
+  if(!Number.isFinite(first.getTime()))continue;
+  if(c.repeat==='sprint'&&Number(c.repeatInterval)>0){
+   const step=Number(c.repeatInterval)*7;
+   for(let d=new Date(first);d<=last&&planISO(d)<=range.end;d.setUTCDate(d.getUTCDate()+step)){
+    const day=planISO(d);if(day>=range.start)occupied.add(day);
+   }
+  }else if(c.repeat==='weekly'&&Array.isArray(c.repeatDays)){
+   for(let d=new Date(first);d<=last&&planISO(d)<=range.end;d.setUTCDate(d.getUTCDate()+1)){
+    const day=planISO(d),name=OUTLOOK_DAYS[d.getUTCDay()];
+    if(day>=range.start&&c.repeatDays.includes(name)&&!c.excludedDates?.includes(day))occupied.add(day);
+   }
+  }else if(c.date>=range.start&&c.date<=range.end)occupied.add(c.date);
  }
- return checked.filter(day=>counts.has(day)).sort((a,b)=>a-b);
+ return occupied;
+}
+function resolvePlanStandupDays(range,existing=[],proposed=[]){
+ const mode=$('planCadence').value;
+ const manual=[...$('planDays').querySelectorAll('input:checked')].map(x=>Number(x.value)).filter(d=>d>=1&&d<=5);
+ if(mode==='selected')return manual.sort((a,b)=>a-b);
+ if(mode==='daily')return [1,2,3,4,5];
+ // Automatic mode must evaluate each date independently; do not eliminate an entire weekday.
+ return [1,2,3,4,5];
+}
+function planEligibleStandupDates(range,existing=[],proposed=[]){
+ const selected=resolvePlanStandupDays(range,existing,proposed);
+ const occupied=planOccupiedCeremonyDates(range,existing,proposed);
+ const automatic=$('planCadence').value==='unoccupied';
+ const dates=[];
+ for(let d=planDate(range.start);d<=planDate(range.end);d.setUTCDate(d.getUTCDate()+1)){
+  const date=planISO(d);
+  if(selected.includes(d.getUTCDay())&&(!automatic||!occupied.has(date)))dates.push(date);
+ }
+ return dates;
+}
+function syncPlanManualStandups(){
+ const manual=$('planCadence').value==='selected';
+ $('planManualStandups').open=manual||$('planManualStandups').open;
+ $('planUseManualStandups').textContent=manual?'Manual weekdays selected':'Use manual weekdays';
+ $('planDays').querySelectorAll('input').forEach(el=>el.disabled=!manual);
+ renderPlanResolvedSummary();
 }
 function renderPlanResolvedSummary(){
  const node=$('planResolvedSummary');if(!node)return;
@@ -2232,9 +2603,10 @@ function renderPlanResolvedSummary(){
  const w=activeScheduleWorkspace(),existing=scheduleMeetingRecords(w);
  const days=resolvePlanStandupDays(range,existing),names=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
  const enabled=$('planStandup').checked;
- const dates=[];for(let d=planDate(range.start);d<=planDate(range.end);d.setUTCDate(d.getUTCDate()+1))if(days.includes(d.getUTCDay()))dates.push(planISO(d));
+ const mode=$('planCadence').value;
+ const dates=planEligibleStandupDates(range,existing);
  const count=dates.length,repeat=$('planStandupRepeat').value;
- node.textContent=enabled?(count?`Standups: ${days.map(d=>names[d]).join(', ')} · ${$('planTime').value} · ${$('planDuration').value} minutes · ${repeat==='weekly'?'one recurring Outlook series':count+' individual Outlook meetings'} · ${count} eligible occurrence(s) in this period. The preview excludes dates occupied by saved ceremonies when using Unoccupied weekdays.`:'No eligible standup weekdays. Select weekdays or change cadence before continuing.'):'Standups are not selected in Step 2. Other ceremonies follow their selected recurrence setting.';
+ node.textContent=enabled?(count?`Standups: ${mode==='unoccupied'?'every available weekday':days.map(d=>names[d]).join(', ')} · ${$('planTime').value} · ${$('planDuration').value} minutes · ${repeat==='weekly'?'one recurring Outlook series with date-specific exceptions':count+' individual Outlook meetings'} · ${count} eligible occurrence(s) in this period. ${mode==='unoccupied'?'Automatic mode skips only the specific dates occupied by ceremonies.':mode==='selected'?'Manual weekdays selected.':'Every weekday selected.'}`:'No eligible standup dates. Change the schedule or open Manual Standups to choose weekdays.'):'Standups are not selected in Step 2. Other ceremonies follow their selected recurrence setting.';
 }
 let planLookupTimer=null,planLookupSequence=0;
 async function planRecipientSearch(){
@@ -2268,7 +2640,10 @@ $('planContactEnable')?.addEventListener('click',async()=>{
  finally{button.disabled=false;}
 });
 $('planParticipants')?.addEventListener('input',()=>{clearTimeout(planLookupTimer);planLookupTimer=setTimeout(()=>void planRecipientSearch(),350);});
-for(const id of ['planCadence','planDuration','planTime','planStandupRepeat','planOtherRepeat','planStandup'])$(id)?.addEventListener('change',renderPlanResolvedSummary);
+for(const id of ['planDuration','planTime','planStandupRepeat','planOtherRepeat','planStandup'])$(id)?.addEventListener('change',renderPlanResolvedSummary);
+$('planCadence').addEventListener('change',syncPlanManualStandups);
+$('planUseManualStandups').addEventListener('click',()=>{$('planCadence').value='selected';syncPlanManualStandups();});
+$('planDays').querySelectorAll('input').forEach(el=>el.addEventListener('change',renderPlanResolvedSummary));
 $('planDays')?.addEventListener('change',renderPlanResolvedSummary);
 function scheduleMeetingRecords(w){return (w?.meetingSchedules||[]).flatMap(sc=>sc.meetings||[]);}
 function previewCeremonyPlan(){
@@ -2276,63 +2651,98 @@ function previewCeremonyPlan(){
  const start=planDate(range.start),end=planDate(range.end),span=Math.round((end-start)/86400000);if(!Number.isFinite(span)||span<0||span>730)return notify('Choose a date range between 1 day and 24 months.',true);
  const checked=id=>$(id).checked,duration=Number($('planDuration').value);if(!Number.isInteger(duration)||duration<5||duration>120)return notify('Standup duration must be 5–120 minutes.',true);
  const time=$('planTime').value||'09:30',participants=$('planParticipants').value.trim(),existing=scheduleMeetingRecords(w).concat((registry.sprints||[]).filter(s=>s.workspaceId===w.id).flatMap(s=>s.ceremonies||[]));
- const has=(date,type)=>existing.some(c=>(c.date===date||(c.repeat&&c.repeat!=='none'&&c.date<=date&&c.repeatEnd>=date))&&(c.type===type||c.secondary===type)&&c.status!=='Cancelled')||proposedCeremonies.some(c=>c.date===date&&(c.type===type||c.secondary===type));
+ const has=(date,type)=>existing.some(c=>{if(c.status==='Cancelled'||(c.type!==type&&c.secondary!==type))return false;return planOccupiedCeremonyDates({start:date,end:date},[c]).has(date);})||proposedCeremonies.some(c=>c.date===date&&(c.type===type||c.secondary===type));
  // Derive a regular sprint cadence from the workspace's actual selected sprint dates.
  // Irregular or non-whole-week sprints cannot be represented by a native Outlook weekly rule.
  const sprint=currentSprint();
  const sprintDays=sprint?.start&&sprint?.end?Math.round((planDate(sprint.end)-planDate(sprint.start))/86400000)+1:0;
- const sprintWeeks=sprintDays>=7&&sprintDays%7===0?sprintDays/7:0;
- const cadenceRange=span+1>sprintDays&&sprintWeeks>0;
- const add=(type,date,minutes,secondary='')=>{
+ const sprintWeeks=sprintDays>0?Math.ceil(sprintDays/7):0;
+ const cadenceRange=$('planRepeatSprints').checked&&span+1>sprintDays&&sprintWeeks>0;
+ const add=(type,date,minutes,secondary='',atTime=time)=>{
   if(!date||has(date,type)||(secondary&&has(date,secondary)))return;
-  const meeting={type,secondary,title:'',date,time,duration:minutes,participants,status:'Proposed',agenda:planAgenda(type)+(secondary?'\n\n'+planAgenda(secondary):''),outcome:''};
+  const meeting={type,secondary,title:'',date,time:atTime,duration:minutes,participants,status:'Proposed',agenda:planAgenda(type)+(secondary?'\n\n'+planAgenda(secondary):''),outcome:''};
   if(type!=='Standup'&&$('planOtherRepeat').value!=='single'&&cadenceRange)Object.assign(meeting,{repeat:'sprint',repeatInterval:sprintWeeks,repeatEnd:range.end});
   proposedCeremonies.push(meeting);
  };
- // Place major ceremonies as a coordinated sequence, leaving room for work between them.
- const weekday=i=>{const d=new Date(start.getTime()+i*86400000).getUTCDay();return d>0&&d<6;};
- const valid=Array.from({length:span+1},(_,i)=>i).filter(weekday);
- const nearest=(target,min=0,max=span)=>{const options=valid.filter(i=>i>=min&&i<=max);return options.sort((a,b)=>Math.abs(a-target)-Math.abs(b-target)||a-b)[0]??Math.max(0,Math.min(span,Math.round(target)));};
+ // Derive each closing ceremony from the sprint turnover, not a mid-sprint offset.
+ // For Monday-start two-week sprints: final Friday. Tuesday-start: final Monday.
  const asDate=i=>planISO(new Date(start.getTime()+i*86400000));
- const cycleSpan=cadenceRange?Math.min(span,sprintDays-1):span;
- const planning=nearest(0),review=nearest(cycleSpan>=10?cycleSpan-5:cycleSpan>=7?cycleSpan-3:cycleSpan-1,planning+1,cycleSpan),retroDay=nearest(cycleSpan>=7?cycleSpan-1:cycleSpan,review+1,cycleSpan),refine=nearest(cycleSpan*0.55,planning+1,Math.max(planning+1,review-1));
- if(checked('planPlanning'))add('Sprint Planning',asDate(planning),60);
- if(checked('planReview'))add('Sprint Review',asDate(review),45);
+ const weekdaysBetween=(from,to)=>{const days=[];for(let d=planDate(from);d<=planDate(to);d.setUTCDate(d.getUTCDate()+1))if(d.getUTCDay()>0&&d.getUTCDay()<6)days.push(planISO(d));return days;};
+ const baseEnd=sprint?.end||range.end;
+ const cycles=gsCeremonyCycle(range.start,baseEnd,range.end,cadenceRange);
+ if(!cycles.length)throw Error('No complete sprint ends within the selected schedule. Extend the end date or review sprint dates.');
+ const firstCycle=cycles[0];
+ const firstWorkdays=weekdaysBetween(firstCycle.start,firstCycle.end);
+ const planning=firstWorkdays[0];
+ const review=firstCycle.end;
+ const refine=firstWorkdays[Math.min(firstWorkdays.length-1,Math.max(1,Math.floor(firstWorkdays.length*.55)))];
+ if(checked('planPlanning'))add('Sprint Planning',planning,60);
+ if(checked('planReview'))add('Sprint Review',review,45);
  const retro=checked('planRetro'),groom=checked('planGroom');
- if(retro&&groom&&checked('planCombine'))add('Retrospective',asDate(retroDay),60,'Backlog Refinement');
- else{if(retro)add('Retrospective',asDate(retroDay),30);if(groom)add('Backlog Refinement',asDate(refine),30);}
+ const retroTime=checked('planReview')?gsTimeAfter(time,45):time;
+ if(retro&&groom&&checked('planCombine'))add('Retrospective',review,60,'Backlog Refinement',retroTime);
+ else{if(retro)add('Retrospective',review,30,'',retroTime);if(groom)add('Backlog Refinement',refine,30);}
  if(checked('planStandup')){
   const selected=resolvePlanStandupDays(range,existing,proposedCeremonies);
-  const dates=Array.from({length:span+1},(_,i)=>asDate(i)).filter(date=>selected.includes(planDate(date).getUTCDay()));
+  const dates=planEligibleStandupDates(range,existing,proposedCeremonies);
   const previous=existing.filter(c=>c.type==='Standup'&&c.status!=='Cancelled'&&c.date<=range.end&&(c.repeatEnd||c.date)>=range.start);
   if($('planStandupRepeat').value==='weekly'){
-   // One native Graph series, not an event per weekday.
-   const first=dates.find(date=>!previous.some(c=>c.repeat==='weekly'&&c.date<=date&&c.repeatEnd>=date));
-   if(first)proposedCeremonies.push({type:'Standup',title:'',date:first,time,duration,participants,status:'Proposed',agenda:planAgenda('Standup'),outcome:'',repeat:'weekly',repeatDays:selected.map(d=>OUTLOOK_DAYS[d]),repeatEnd:range.end});
-  }else{
-   for(const date of dates){if(previous.some(c=>c.repeat==='weekly'&&c.date<=date&&c.repeatEnd>=date)||has(date,'Standup'))continue;
-    proposedCeremonies.push({type:'Standup',title:'',date,time,duration,participants,status:'Proposed',agenda:planAgenda('Standup'),outcome:'',repeat:'none'});
+   // One native multi-weekday Outlook series, with explicit date-specific
+   // exceptions. Never silently replace the intended series with appointments.
+   const candidates=dates.filter(date=>!has(date,'Standup'));
+   if(candidates.length){
+    const first=candidates[0];
+    const days=[...new Set(selected.map(day=>OUTLOOK_DAYS[day]))];
+    const excluded=[];
+    const occupied=planOccupiedCeremonyDates(range,existing,proposedCeremonies);
+    for(let d=planDate(first);d<=planDate(range.end);d.setUTCDate(d.getUTCDate()+1)){
+     const date=planISO(d);
+     if(selected.includes(d.getUTCDay())&&(occupied.has(date)||has(date,'Standup')))excluded.push(date);
+    }
+    proposedCeremonies.push({type:'Standup',title:'',date:first,time,duration,participants,status:'Proposed',agenda:planAgenda('Standup'),outcome:'',repeat:'weekly',repeatDays:days,repeatEnd:range.end,excludedDates:excluded});
    }
+  }else{
+   for(const date of dates){if(has(date,'Standup'))continue;proposedCeremonies.push({type:'Standup',title:'',date,time,duration,participants,status:'Proposed',agenda:planAgenda('Standup'),outcome:'',repeat:'none'});}
   }
-  if(!dates.length){$('ceremonyPreviewStatus').textContent='No eligible standup weekdays. Return to Step 3 and adjust cadence or selected weekdays.';}
+  if(!dates.length){$('ceremonyPreviewStatus').textContent='No eligible standup weekdays. Return to Step 3 or use Manual Standups.';}
 
  }
  proposedCeremonies.sort((a,b)=>a.date.localeCompare(b.date)||a.time.localeCompare(b.time));proposalWorkspaceId=w.id;proposalRange=range;
  const table=document.createElement('table'),header=document.createElement('tr');for(const label of ['Include','Ceremony','Outlook booking','Date','Time','Minutes']){const th=document.createElement('th');th.textContent=label;header.append(th);}table.append(header);
- for(const c of proposedCeremonies){const tr=document.createElement('tr');const cell=()=>{const td=document.createElement('td');tr.append(td);return td;};const include=document.createElement('input');include.type='checkbox';include.checked=true;include.onchange=()=>{c.excluded=!include.checked;proposalCalendar();};cell().append(include);cell().textContent=c.type+(c.secondary?' + '+c.secondary:'');cell().textContent=c.repeat==='weekly'?'One weekly series · '+(c.repeatDays||[]).join(', '):c.repeat==='sprint'?'One series · every '+c.repeatInterval+' weeks':'One-time event';for(const [key,type] of [['date','date'],['time','time'],['duration','number']]){const input=document.createElement('input');if(type==='time'){input.type='time';input.step='60';input.setAttribute('list','gsTimePresets');populateMeetingTimePicker(input,c[key]);}else{input.type=type;input.value=c[key];}if(type==='number'){input.min='5';input.max='480';}input.onchange=()=>{c[key]=type==='number'?Number(input.value):input.value;proposalCalendar();};cell().append(input);}table.append(tr);}
+ for(const c of proposedCeremonies){const tr=document.createElement('tr');const cell=()=>{const td=document.createElement('td');tr.append(td);return td;};const include=document.createElement('input');include.type='checkbox';include.checked=true;include.onchange=()=>{c.excluded=!include.checked;proposalCalendar();};cell().append(include);cell().textContent=c.type+(c.secondary?' + '+c.secondary:'');cell().textContent=c.repeat==='weekly'?'One weekly series · '+(c.repeatDays||[]).join(', ')+(c.excludedDates?.length?' · '+c.excludedDates.length+' excluded dates':''):c.repeat==='sprint'?'One series · every '+c.repeatInterval+' weeks':'One-time event';for(const [key,type] of [['date','date'],['time','time'],['duration','number']]){const input=document.createElement('input');if(type==='time'){input.type='time';input.step='60';input.setAttribute('list','gsTimePresets');populateMeetingTimePicker(input,c[key]);}else{input.type=type;input.value=c[key];}if(type==='number'){input.min='5';input.max='480';}const update=()=>{c[key]=type==='number'?Number(input.value):input.value;proposalCalendar();};input.oninput=update;input.onchange=update;cell().append(input);}table.append(tr);}
  $('ceremonyPreview').replaceChildren(table);$('confirmCeremonies').disabled=!proposedCeremonies.length;const included=proposedCeremonies.filter(c=>!c.excluded);
  const standups=included.filter(c=>c.type==='Standup'&&c.repeat==='weekly');const existingStandups=scheduleMeetingRecords(w).filter(c=>c.type==='Standup'&&c.status!=='Cancelled'&&c.repeatEnd>=range.start&&c.date<=range.end);
  const distinctDays=[...new Set(standups.flatMap(c=>c.repeatDays||[OUTLOOK_DAYS[planDate(c.date).getUTCDay()]]))];
  const nonStandups=included.length-standups.length;
- $('ceremonyPreviewStatus').textContent=`${existingStandups.length} existing standup series retained; ${included.length} proposed meeting records (${standups.length} recurring standup series across ${distinctDays.length} selected weekdays; ${included.filter(c=>c.type==='Standup'&&c.repeat!=='weekly').length} individual standups; ${included.filter(c=>c.type!=='Standup').length} other ceremonies). Regular sprint ceremonies use one Outlook series when a whole-week sprint cadence and a longer workspace period are available; irregular dates require manual scheduling. Booking each standup record creates one Outlook series. Calendar availability has not been checked.`;
+ $('ceremonyPreviewStatus').textContent=`${existingStandups.length} existing standup series retained; ${included.length} proposed meeting records (${standups.length} recurring standup series across ${distinctDays.length} selected weekdays; ${included.filter(c=>c.type==='Standup'&&c.repeat!=='weekly').length} individual standups; ${included.filter(c=>c.type!=='Standup').length} other ceremonies). Sprint ceremonies follow the selected sprint cadence and Review/Retrospective fall on its final working day. Verify Outlook recurrence and exceptions before sending invitations. Booking each standup record creates one Outlook series. Calendar availability has not been checked.`;
  proposalCalendar();
 }
 async function confirmCeremonyPlan(){const w=activeScheduleWorkspace();if(!w||w.id!==proposalWorkspaceId||!proposalRange)return notify('Workspace changed. Regenerate the proposal.',true);const selected=proposedCeremonies.filter(c=>!c.excluded);if(!selected.length)return notify('Select at least one meeting.',true);if(selected.some(c=>!c.date||c.date<proposalRange.start||c.date>proposalRange.end||!c.time||!Number.isInteger(c.duration)||c.duration<5||c.duration>480))return notify('Selected meetings need valid dates, times and durations within the chosen period.',true);
  const keys=new Set();for(const c of selected){const k=[c.date,c.type,c.secondary||''].join('|');if(keys.has(k))return notify('Duplicate meetings in preview.',true);keys.add(k);}
  const existing=scheduleMeetingRecords(w).concat((registry.sprints||[]).filter(s=>s.workspaceId===w.id).flatMap(s=>s.ceremonies||[]));const unique=selected.filter(c=>!existing.some(e=>e.status!=='Cancelled'&&e.date===c.date&&e.type===c.type&&e.secondary===c.secondary));if(!unique.length)return notify('These meetings already exist.',true);
- if(!confirm(`CONFIRM MEETING SCHEDULE\n\nWorkspace: ${w.name}\nPeriod: ${proposalRange.start} to ${proposalRange.end}\nMeetings: ${unique.length}\nParticipants: ${$('planParticipants').value||'Not specified'}\n\nSave this draft schedule and open its overview?\nNo Outlook invitations will be sent.`))return;const now=new Date().toISOString();const scheduleId=crypto.randomUUID();const ok=await persist(r=>{const target=r.workspaces.find(x=>x.id===w.id);target.meetingSchedules||=[];target.meetingSchedules.push({id:scheduleId,name:'Meeting schedule '+proposalRange.start+' – '+proposalRange.end,start:proposalRange.start,end:proposalRange.end,createdAt:now,updatedAt:now,lifecycle:'Draft',preferences:{standupDuration:Number($('planDuration').value),cadence:$('planCadence').value,standupRepeat:$('planStandupRepeat').value,otherRepeat:$('planOtherRepeat').value,weekdays:[...$('planDays').querySelectorAll('input:checked')].map(x=>Number(x.value)),time:$('planTime').value,participants:$('planParticipants').value,types:['Planning','Standup','Review','Retro','Groom'].filter((x,i)=>[$('planPlanning'),$('planStandup'),$('planReview'),$('planRetro'),$('planGroom')][i].checked),combine:$('planCombine').checked},meetings:unique.map(c=>{const {excluded,...meeting}=c;return {...meeting,id:crypto.randomUUID(),createdAt:now,updatedAt:now};})});},false);
+ if(!confirm(`CONFIRM MEETING SCHEDULE\n\nWorkspace: ${w.name}\nPeriod: ${proposalRange.start} to ${proposalRange.end}\nMeetings: ${unique.length}\nParticipants: ${$('planParticipants').value||'Not specified'}\n\nSave this draft schedule and open its overview?\nNo Outlook invitations will be sent.`))return;const now=new Date().toISOString();const scheduleId=crypto.randomUUID();const ok=await persist(r=>{const target=r.workspaces.find(x=>x.id===w.id);target.meetingSchedules||=[];target.meetingSchedules.push({id:scheduleId,name:'Meeting schedule '+proposalRange.start+' – '+proposalRange.end,start:proposalRange.start,end:proposalRange.end,createdAt:now,updatedAt:now,lifecycle:'Draft',preferences:{repeatSprints:$('planRepeatSprints').checked,repeatEnd:$('planRepeatSprints').checked?$('planRepeatEnd').value:null,standupDuration:Number($('planDuration').value),cadence:$('planCadence').value,standupRepeat:$('planStandupRepeat').value,otherRepeat:$('planOtherRepeat').value,weekdays:resolvePlanStandupDays(proposalRange,scheduleMeetingRecords(w),proposedCeremonies),manualWeekdays:[...$('planDays').querySelectorAll('input:checked')].map(x=>Number(x.value)),time:$('planTime').value,participants:$('planParticipants').value,types:['Planning','Standup','Review','Retro','Groom'].filter((x,i)=>[$('planPlanning'),$('planStandup'),$('planReview'),$('planRetro'),$('planGroom')][i].checked),combine:$('planCombine').checked},meetings:unique.map(c=>{const {excluded,...meeting}=c;return {...meeting,id:crypto.randomUUID(),createdAt:now,updatedAt:now};})});},false);
  if(ok){diagnostic('workspace.schedule.created',{workspaceId:w.id,scheduleId,count:unique.length});clearCeremonyProposal();expandedScheduleId=scheduleId;renderWorkspaceSchedules();renderCeremonies();renderCeremonyInsights();showWizardStep(1);const saved=$('scheduleSavedNotice');if(saved)saved.textContent=`Saved ${unique.length} meetings as an internal schedule. Review saved meetings below, then select Schedule in Outlook for each meeting or series. No invitations have been sent.`;const section=$('workspaceSchedules');section?.scrollIntoView({behavior:'smooth',block:'start'});notify(`${unique.length} meetings saved as a draft. No Outlook events created.`);}}
-function renderWorkspaceSchedules(){const list=$('workspaceSchedules');if(!list)return;list.replaceChildren();const w=activeScheduleWorkspace();if(!w)return;const schedules=w.meetingSchedules||[];if(!schedules.length){list.textContent='No workspace meeting schedules yet.';return;}for(const sc of schedules){const box=document.createElement('div');box.className='ceremony-record';const heading=document.createElement('strong');heading.textContent=sc.name;const info=document.createElement('p');info.className='muted';info.textContent=`${sc.start} to ${sc.end} · ${(sc.meetings||[]).length} meeting record(s) · ${(sc.meetings||[]).filter(m=>m.outlook?.state==='booked').length} Outlook booking(s) · ${sc.lifecycle||'Draft'}${sc.retirementReason?' · '+sc.retirementReason:''}`;box.append(heading,info);const actions=document.createElement('div');actions.className='row';const extend=document.createElement('button');extend.textContent='Extend';extend.onclick=()=>{const date=prompt('New end date (YYYY-MM-DD)',sc.end);if(date!==null)void extendWorkspaceSchedule(sc.id,date);};const details=document.createElement('button');details.className='secondary';details.textContent=expandedScheduleId===sc.id?'Hide meetings':'View meetings';details.onclick=()=>{expandedScheduleId=expandedScheduleId===sc.id?null:sc.id;renderWorkspaceSchedules();};actions.append(extend,details);
+let bulkOutlookBooking=false;
+async function bookScheduleMeetings(sc){
+ if(bulkOutlookBooking||outlookBookingBusy)return notify('An Outlook booking is already running.',true);
+ const pending=(sc.meetings||[]).filter(c=>!c.outlook?.state&&c.status!=='Cancelled'&&c.status!=='Completed');
+ const now=new Date();const today=[now.getFullYear(),String(now.getMonth()+1).padStart(2,'0'),String(now.getDate()).padStart(2,'0')].join('-');
+ const eligible=pending.filter(c=>c.date>today||(c.date===today&&c.time>`${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`));
+ if(!eligible.length)return notify('No future, unbooked meetings are available in this schedule.',true);
+ if(!confirm('Book '+eligible.length+' future meeting record(s) sequentially in your selected Outlook calendar? Invitations will be sent. Already booked and past meetings are excluded. Stop if any result is uncertain.'))return;
+ bulkOutlookBooking=true;let completed=0;const status=document.getElementById('bulkScheduleStatus-'+sc.id);
+ try{for(const c of eligible){if(!activeScheduleWorkspace()?.meetingSchedules?.some(x=>x.id===sc.id))break;
+  if(status)status.textContent='Booking '+(completed+1)+' of '+eligible.length+'…';
+  await scheduleCeremonyInOutlook(c.id,sc.id,null,true);
+  const current=outlookCeremonyRecord(c.id,sc.id);
+  if(current?.outlook?.state!=='booked'){if(status)status.textContent='Stopped: meeting '+c.id+' needs review. '+completed+' booked.';return;}
+  completed++;
+  if(completed<eligible.length)await new Promise(resolve=>setTimeout(resolve,15000));
+ }
+ if(status)status.textContent=completed+' of '+eligible.length+' meetings booked.';
+ }finally{bulkOutlookBooking=false;renderWorkspaceSchedules();}
+}
+function renderWorkspaceSchedules(){const list=$('workspaceSchedules');if(!list)return;list.replaceChildren();const w=activeScheduleWorkspace();if(!w)return;const schedules=w.meetingSchedules||[];renderFinalSprintScheduleWarning();if(!schedules.length){list.textContent='No workspace meeting schedules yet.';return;}for(const sc of schedules){const box=document.createElement('div');box.className='ceremony-record';const heading=document.createElement('strong');heading.textContent=sc.name;const info=document.createElement('p');info.className='muted';info.textContent=`${sc.start} to ${sc.end} · ${(sc.meetings||[]).length} meeting record(s) · ${(sc.meetings||[]).filter(m=>m.outlook?.state==='booked').length} Outlook booking(s) · ${sc.lifecycle||'Draft'}${sc.retirementReason?' · '+sc.retirementReason:''}`;box.append(heading,info);const actions=document.createElement('div');actions.className='row';const extend=document.createElement('button');extend.textContent='Extend';extend.onclick=()=>{const date=prompt('New end date (YYYY-MM-DD)',sc.end);if(date!==null)void extendWorkspaceSchedule(sc.id,date);};const details=document.createElement('button');details.className='secondary';details.textContent=expandedScheduleId===sc.id?'Hide meetings':'View meetings';details.onclick=()=>{expandedScheduleId=expandedScheduleId===sc.id?null:sc.id;renderWorkspaceSchedules();};actions.append(extend,details);const bulk=document.createElement('button');bulk.className='secondary';bulk.textContent='Book all in Outlook';bulk.disabled=bulkOutlookBooking||!(sc.meetings||[]).some(c=>!c.outlook?.state&&c.status!=='Cancelled'&&c.status!=='Completed');bulk.onclick=()=>void bookScheduleMeetings(sc);actions.append(bulk);const bulkStatus=reportNode('span','muted');bulkStatus.id='bulkScheduleStatus-'+sc.id;actions.append(bulkStatus);
  const calendarButton=document.createElement('button');calendarButton.className='secondary';calendarButton.textContent='Calendar';calendarButton.onclick=()=>{expandedScheduleId=sc.id;calendarScheduleId=calendarScheduleId===sc.id?null:sc.id;renderWorkspaceSchedules();};actions.append(calendarButton);
  const lifecycle=sc.lifecycle||'Draft';
  if(lifecycle==='Draft'){const commit=document.createElement('button');commit.textContent='Commit schedule';commit.onclick=()=>void changeScheduleLifecycle(sc.id,'commit');const discard=document.createElement('button');discard.className='secondary';discard.textContent='Discard draft';discard.onclick=()=>void changeScheduleLifecycle(sc.id,'discard');actions.append(commit,discard);}
@@ -2380,7 +2790,7 @@ function meetingOccurrencesInMonth(meetings,year,month){
   const interval=meeting.repeat==='sprint'?Number(meeting.repeatInterval):1;
   const weekdays=meeting.repeat==='weekly'?(meeting.repeatDays||[]):[OUTLOOK_DAYS[start.getUTCDay()]];
   for(let day=new Date(first);day<=last;day.setUTCDate(day.getUTCDate()+1)){
-   if(day<start||day>end)continue;
+   if(day<start||day>end||meeting.excludedDates?.includes(planISO(day)))continue;
    if(!recurring&&day.getTime()!==start.getTime())continue;
    if(recurring){
     if(!Number.isInteger(interval)||interval<1||!weekdays.includes(OUTLOOK_DAYS[day.getUTCDay()]))continue;
@@ -2392,14 +2802,77 @@ function meetingOccurrencesInMonth(meetings,year,month){
  }
  return result;
 }
-function renderMeetingCalendar(host,meetings,initialDate){host.replaceChildren();const dates=meetings.map(m=>m.date).filter(Boolean).sort();let anchor=initialDate||dates[0]||new Date().toISOString().slice(0,10);let [yy,mm]=anchor.split('-').map(Number);let view=new Date(Date.UTC(yy,mm-1,1));const toolbar=document.createElement('div');toolbar.className='row';const prev=document.createElement('button'),next=document.createElement('button'),label=document.createElement('strong');prev.className=next.className='secondary';prev.textContent='‹';next.textContent='›';toolbar.append(prev,label,next);const grid=document.createElement('div');grid.className='meeting-calendar-grid';host.append(toolbar,grid);
- const draw=()=>{label.textContent=view.toLocaleDateString('en-CA',{month:'long',year:'numeric',timeZone:'UTC'});grid.replaceChildren();for(const name of ['Sun','Mon','Tue','Wed','Thu','Fri','Sat']){const h=document.createElement('div');h.className='meeting-calendar-heading';h.textContent=name;grid.append(h);}const y=view.getUTCFullYear(),m=view.getUTCMonth(),occurrences=meetingOccurrencesInMonth(meetings,y,m),first=new Date(Date.UTC(y,m,1)).getUTCDay(),days=new Date(Date.UTC(y,m+1,0)).getUTCDate();for(let i=0;i<first;i++){const blank=document.createElement('div');blank.className='meeting-calendar-day empty';grid.append(blank);}for(let d=1;d<=days;d++){const iso=planISO(new Date(Date.UTC(y,m,d))),cell=document.createElement('div');cell.className='meeting-calendar-day';const num=document.createElement('strong');num.textContent=d;cell.append(num);for(const item of occurrences.filter(x=>x.date===iso)){const entry=document.createElement('div');entry.className='meeting-calendar-entry';entry.textContent=`${item.time||''} ${item.title||item.type}${item.secondary?' + '+item.secondary:''}`;entry.title=`${item.duration||30} min · ${item.status||'Proposed'}`;cell.append(entry);}grid.append(cell);}};
+function renderMeetingCalendar(host,meetings,initialDate){const remembered=host.dataset.calendarMonth;host.replaceChildren();const dates=meetings.map(m=>m.date).filter(Boolean).sort();let anchor=remembered||initialDate||dates[0]||new Date().toISOString().slice(0,10);let [yy,mm]=anchor.split('-').map(Number);let view=new Date(Date.UTC(yy,mm-1,1));const toolbar=document.createElement('div');toolbar.className='row';const prev=document.createElement('button'),next=document.createElement('button'),label=document.createElement('strong');prev.className=next.className='secondary';prev.textContent='‹';next.textContent='›';toolbar.append(prev,label,next);const grid=document.createElement('div');grid.className='meeting-calendar-grid';host.append(toolbar,grid);
+ const draw=()=>{host.dataset.calendarMonth=planISO(view);label.textContent=view.toLocaleDateString('en-CA',{month:'long',year:'numeric',timeZone:'UTC'});grid.replaceChildren();for(const name of ['Sun','Mon','Tue','Wed','Thu','Fri','Sat']){const h=document.createElement('div');h.className='meeting-calendar-heading';h.textContent=name;grid.append(h);}const y=view.getUTCFullYear(),m=view.getUTCMonth(),occurrences=meetingOccurrencesInMonth(meetings,y,m),first=new Date(Date.UTC(y,m,1)).getUTCDay(),days=new Date(Date.UTC(y,m+1,0)).getUTCDate();for(let i=0;i<first;i++){const blank=document.createElement('div');blank.className='meeting-calendar-day empty';grid.append(blank);}for(let d=1;d<=days;d++){const iso=planISO(new Date(Date.UTC(y,m,d))),cell=document.createElement('div');cell.className='meeting-calendar-day';const num=document.createElement('strong');num.textContent=d;cell.append(num);for(const item of occurrences.filter(x=>x.date===iso)){const entry=document.createElement('div');entry.className='meeting-calendar-entry';entry.textContent=`${item.time||''} ${item.title||item.type}${item.secondary?' + '+item.secondary:''}`;entry.title=`${item.duration||30} min · ${item.status||'Proposed'}`;cell.append(entry);}grid.append(cell);}};
  prev.onclick=()=>{view=new Date(Date.UTC(view.getUTCFullYear(),view.getUTCMonth()-1,1));draw();};next.onclick=()=>{view=new Date(Date.UTC(view.getUTCFullYear(),view.getUTCMonth()+1,1));draw();};draw();}
 function proposalCalendar(){const host=$('proposalCalendar');if(host)renderMeetingCalendar(host,proposedCeremonies.filter(m=>!m.excluded),proposalRange?.start);}
 async function editWorkspaceMeeting(scheduleId,meetingId){editCeremony(meetingId,scheduleId);}
-async function extendWorkspaceSchedule(id,newEnd){const w=activeScheduleWorkspace(),sc=w?.meetingSchedules?.find(x=>x.id===id);if(!sc)return;if(!/^\d{4}-\d{2}-\d{2}$/.test(newEnd)||!Number.isFinite(planDate(newEnd).getTime())||newEnd<=sc.end||Math.round((planDate(newEnd)-planDate(sc.start))/86400000)>730)return notify('Choose a later valid end date, within 24 months of the start.',true);
- const p=sc.preferences||{},days=new Set(p.weekdays||[1,2,3,4,5]),existing=scheduleMeetingRecords(w),extra=[];const begin=planDate(sc.end),end=planDate(newEnd);for(let i=1;i<=Math.round((end-begin)/86400000);i++){const date=planISO(new Date(begin.getTime()+i*86400000));if(!days.has(planDate(date).getUTCDay())||!p.types?.includes('Standup'))continue;if(p.cadence==='unoccupied'&&existing.some(c=>c.date===date&&c.status!=='Cancelled'))continue;extra.push({id:crypto.randomUUID(),type:'Standup',secondary:'',title:'',date,time:p.time||'09:30',duration:p.standupDuration||15,participants:p.participants||'',status:'Proposed',agenda:planAgenda('Standup'),outcome:'',createdAt:new Date().toISOString()});}
- if(!confirm(`Extend to ${newEnd} and add ${extra.length} new standup(s)? Existing meetings remain unchanged. Other ceremony types can be added individually.`))return;const ok=await persist(r=>{const target=r.workspaces.find(x=>x.id===w.id).meetingSchedules.find(x=>x.id===id);target.end=newEnd;target.meetings.push(...extra);target.updatedAt=new Date().toISOString();},false);if(ok){renderWorkspaceSchedules();notify(`Schedule extended; ${extra.length} new standup(s).`);}}
+// Extension is deliberately additive: never alter an already-booked Graph series.
+// A recurring Outlook event has its own remote end date; silently changing only
+// the local repeatEnd would misrepresent the organizer's calendar.
+function gsScheduleExtension(sc,newEnd,existing=[]){
+ const p=sc.preferences||{},oldEnd=sc.end;
+ if(!p.repeatSprints)throw Error('Only schedules configured to repeat through consecutive sprints can be extended.');
+ const origin=(sc.meetings||[]).find(m=>m.type==='Sprint Planning')||sc.meetings?.find(m=>m.type==='Sprint Review');
+ const firstSprintStart=origin?.type==='Sprint Planning'?origin.date:sc.start;
+ const firstEnd=(sc.meetings||[]).find(m=>m.type==='Sprint Review')?.date||sc.end;
+ const weeks=Number((sc.meetings||[]).find(m=>m.repeat==='sprint')?.repeatInterval)||Math.ceil((planDate(firstEnd)-planDate(firstSprintStart))/86400000/7)||2;
+ const cycleDays=weeks*7;
+ const cycles=gsCeremonyCycle(firstSprintStart,planISO(new Date(planDate(firstSprintStart).getTime()+(cycleDays-1)*86400000)),newEnd,true);
+ const oldKeys=new Set(existing.filter(m=>m.status!=='Cancelled').map(m=>[m.type,m.secondary||'',m.date].join('|')));
+ const additions=[];
+ const add=(type,date,time,duration,secondary='')=>{
+  if(!date||date<=oldEnd||date>newEnd)return;
+  const key=[type,secondary,date].join('|');if(oldKeys.has(key))return;
+  oldKeys.add(key);additions.push({id:crypto.randomUUID(),type,secondary,title:'',date,time,duration,participants:p.participants||'',status:'Proposed',agenda:planAgenda(type)+(secondary?'\n\n'+planAgenda(secondary):''),outcome:'',createdAt:new Date().toISOString()});
+ };
+ const baseTime=p.time||'09:30';
+ for(const cycle of cycles){
+  if(cycle.end<=oldEnd)continue;
+  const workdays=[];for(let d=planDate(cycle.start);d<=planDate(cycle.end);d.setUTCDate(d.getUTCDate()+1))if(d.getUTCDay()>0&&d.getUTCDay()<6)workdays.push(planISO(d));
+  if(!workdays.length)continue;
+  if(p.types?.includes('Planning'))add('Sprint Planning',workdays[0],baseTime,60);
+  if(p.types?.includes('Review'))add('Sprint Review',cycle.end,baseTime,45);
+  const retroTime=p.types?.includes('Review')?gsTimeAfter(baseTime,45):baseTime;
+  if(p.types?.includes('Retro')&&p.types?.includes('Groom')&&p.combine)add('Retrospective',cycle.end,retroTime,60,'Backlog Refinement');
+  else{
+   if(p.types?.includes('Retro'))add('Retrospective',cycle.end,retroTime,30);
+   if(p.types?.includes('Groom'))add('Backlog Refinement',workdays[Math.min(workdays.length-1,Math.max(1,Math.floor(workdays.length*.55)))],baseTime,30);
+  }
+ }
+ // Evaluate standups after all closing ceremonies, including existing series.
+ const occupied=planOccupiedCeremonyDates({start:sc.start,end:newEnd},existing,additions);
+ const weekdays=new Set(p.manualWeekdays?.length&&p.cadence==='selected'?p.manualWeekdays:[1,2,3,4,5]);
+ if(p.types?.includes('Standup'))for(let d=new Date(planDate(oldEnd).getTime()+86400000);d<=planDate(newEnd);d.setUTCDate(d.getUTCDate()+1)){
+  const date=planISO(d);if(!weekdays.has(d.getUTCDay())||(p.cadence==='unoccupied'&&occupied.has(date)))continue;
+  if(existing.some(m=>m.type==='Standup'&&m.status!=='Cancelled'&&meetingOccurrencesInMonth([m],d.getUTCFullYear(),d.getUTCMonth()).some(occ=>occ.date===date)))continue;
+  // Existing standup series require remote Graph modification; don't imply they are extended.
+  add('Standup',date,baseTime,p.standupDuration||15);
+ }
+ return additions.sort((x,y)=>x.date.localeCompare(y.date)||x.time.localeCompare(y.time));
+}
+async function extendWorkspaceSchedule(id,newEnd){
+ const w=activeScheduleWorkspace(),sc=w?.meetingSchedules?.find(x=>x.id===id);if(!sc)return;
+ if(sc.lifecycle==='Retired')return notify('Retired schedules cannot be extended.',true);
+ if(!/^\d{4}-\d{2}-\d{2}$/.test(newEnd)||!Number.isFinite(planDate(newEnd).getTime())||newEnd<=sc.end||Math.round((planDate(newEnd)-planDate(sc.start))/86400000)>730)return notify('Choose a later valid end date, within 24 months of the start.',true);
+ let extra;try{extra=gsScheduleExtension(sc,newEnd,scheduleMeetingRecords(w));}catch(e){return notify(String(e.message||e),true);}
+ if(!extra.length)return notify('No additional meetings fall within this end date. Choose a later date or review the sprint cadence.',true);
+ const byType={};for(const m of extra)byType[m.type]=(byType[m.type]||0)+1;
+ if(!confirm(`Extend to ${newEnd}?\n\nNew internal meeting records: ${extra.length}\n${Object.entries(byType).map(([k,v])=>k+': '+v).join('\n')}\n\nExisting Outlook series will NOT be changed. New records must be booked explicitly. No invitations will be sent now.`))return;
+ const ok=await persist(r=>{const target=r.workspaces.find(x=>x.id===w.id)?.meetingSchedules?.find(x=>x.id===id);if(!target||target.end!==sc.end)throw Error('Schedule changed. Refresh before extending.');target.end=newEnd;target.preferences.repeatEnd=newEnd;target.meetings.push(...extra);target.updatedAt=new Date().toISOString();},false);
+ if(ok){renderWorkspaceSchedules();renderCeremonies();renderFinalSprintScheduleWarning();notify(`Schedule extended with ${extra.length} unbooked meeting records. Existing Outlook events unchanged.`);}
+}
+function renderFinalSprintScheduleWarning(){
+ const panel=$('ceremonyAssistant');if(!panel)return;
+ let notice=$('gsFinalSprintWarning');if(!notice){notice=document.createElement('div');notice.id='gsFinalSprintWarning';notice.className='gs-setup-warning hidden';notice.setAttribute('role','status');panel.parentElement?.insertBefore(notice,panel);}
+ const sprint=currentSprint(),workspace=activeScheduleWorkspace();
+ const active=(workspace?.meetingSchedules||[]).filter(sc=>sc.lifecycle==='Committed'&&sc.preferences?.repeatSprints&&sc.end&&sprint?.start&&sprint?.end&&sc.end>=sprint.start);
+ const expiring=active.filter(sc=>{const cycle=gsCeremonyCycle(sprint.start,sprint.end,sc.end,false)[0];return cycle&&sc.end>=sprint.start&&sc.end<planISO(new Date(planDate(cycle.boundary).getTime()+Math.ceil((planDate(sprint.end)-planDate(sprint.start)+86400000)/604800000)*7*86400000));});
+ notice.replaceChildren();notice.classList.toggle('hidden',!expiring.length);
+ if(!expiring.length)return;
+ const message=document.createElement('strong');message.textContent='Meeting schedule reaches its final sprint';const detail=document.createElement('p');detail.textContent=`${expiring.length} committed schedule(s) end during this sprint cycle. Extend the schedule to continue ceremonies into the next sprint; new Outlook bookings require approval.`;notice.append(message,detail);
+ const button=document.createElement('button');button.type='button';button.textContent='View schedules to extend';button.onclick=()=>{$('workspaceSchedules')?.scrollIntoView({behavior:'smooth',block:'start'});};notice.append(button);
+}
 // Persistent deletion audit is intentionally separate from browser diagnostics.
 function renderDeletionAudit(){const el=$('sprintDeletionAudit');if(!el)return;el.replaceChildren();const records=(registry?.sprintDeletionAudit||[]).slice(-100).reverse();if(!records.length){el.textContent='No sprint deletions recorded.';return;}for(const a of records){const p=document.createElement('p');p.textContent=`${a.at} · ${a.actor} · ${a.workspaceName} / ${a.sprintName} · ${a.itemCount} assigned items, ${a.ceremonyCount} ceremonies · ${a.id}`;el.append(p);}}
 async function deleteSprintSafely(){const s=currentSprint();if(!s)return notify('Select a saved sprint to delete.',true);
@@ -2459,19 +2932,29 @@ $('prepareStandup')?.addEventListener('click',prepareStandup);
 $('copyStandup')?.addEventListener('click',()=>{const summary=standupText();if(navigator.clipboard?.writeText)navigator.clipboard.writeText(summary).then(()=>notify('Standup summary copied.')).catch(()=>notify('Clipboard unavailable; select and copy the displayed summary.',true));else notify('Clipboard unavailable; select and copy the displayed summary.',true);});
 
 $('wizardBack').onclick=()=>showWizardStep(wizardStep-1);$('wizardReset').onclick=()=>{
- const hasProposal=proposedCeremonies.length>0;
+ const hasProposal=proposedCeremonies.length>0||wizardStep>1||!!$('planStart').value||!!$('planEnd').value;
  if(hasProposal&&!confirm('Discard the unsaved meeting proposal? Saved workspace schedules and Outlook meetings will remain unchanged.'))return;
  clearCeremonyProposal();
  $('planScope').value='period';$('planStart').value='';$('planEnd').value='';
  for(const id of ['planPlanning','planStandup','planReview','planRetro','planGroom'])$(id).checked=true;
- $('planCombine').checked=false;$('planCadence').value='unoccupied';$('planStandupRepeat').value='weekly';$('planOtherRepeat').value='auto';$('planDuration').value='15';
+ $('planCombine').checked=false;$('planCadence').value='unoccupied';$('planStandupRepeat').value='weekly';$('planOtherRepeat').value='single';$('planRepeatSprints').checked=false;$('planRepeatEnd').value='';syncRepeatSprints();$('planDuration').value='15';
  populateMeetingTimePicker($('planTime'),'09:30');$('planParticipants').value='';
  document.querySelectorAll('#planDays input[type=checkbox]').forEach(el=>{el.checked=el.value!=='0'&&el.value!=='6';});
- syncPlanScope();showWizardStep(1);
+ $('planManualStandups').open=false;syncPlanManualStandups();syncPlanScope();showWizardStep(1);
  $('wizardResetStatus').textContent='New proposal form ready. Saved workspace schedules and Outlook meetings were not changed.';
  notify('Unsaved proposal and form selections cleared. Saved meetings unchanged.');
 };
-$('wizardNext').onclick=()=>{if(wizardStep===1){const r=scheduleRange();if(!r.start||!r.end||r.end<r.start)return notify($('planScope').value==='sprint'?'Select a saved sprint with valid start and end dates, or choose Defined project period.':'Choose a valid schedule period.',true);}if(wizardStep===3&&$('planStandup').checked){const range=scheduleRange();if(!resolvePlanStandupDays(range,scheduleMeetingRecords(activeScheduleWorkspace())).length)return notify('No eligible standup weekdays. Adjust the cadence or weekday selection before continuing.',true);}showWizardStep(wizardStep+1);};
+$('wizardNext').onclick=()=>{if(wizardStep===1){const r=scheduleRange();if(!r.start||!r.end||r.end<r.start)return notify($('planScope').value==='sprint'?'Select a saved sprint with valid start and end dates, or choose Defined project period.':'Choose a valid schedule period.',true);}if(wizardStep===3&&$('planRepeatSprints').checked){const r=scheduleRange(),s=currentSprint(),days=s?.start&&s?.end?Math.round((planDate(s.end)-planDate(s.start))/86400000)+1:0;if(!s||days<7||days%7!==0)return wizardStepError('To repeat ceremonies, select a saved sprint with a whole-week cadence, or uncheck Repeat through consecutive sprints.');if(!/^\d{4}-\d{2}-\d{2}$/.test(r.end)||r.end<=s.end)return wizardStepError('Choose a recurrence end date after the current sprint, or uncheck Repeat through consecutive sprints.');}if(wizardStep===3){
+  try{
+   const range=scheduleRange();
+   if(!range.start||!range.end||range.end<range.start)return wizardStepError('Choose a valid schedule period and recurrence end date.');
+   if($('planStandup').checked){
+    // Evaluate against the actual proposed ceremonies, not just saved ones.
+    previewCeremonyPlan();
+    if(!planEligibleStandupDates(range,scheduleMeetingRecords(activeScheduleWorkspace()),proposedCeremonies).length)return wizardStepError('No eligible standup dates. Adjust the ceremony dates or select manual standup weekdays.');
+   }
+  }catch(e){return wizardStepError('Cannot continue: '+String(e.message||e));}
+ }showWizardStep(wizardStep+1);};
 $('planScope').onchange=syncPlanScope;
 $('planScope').value='sprint';
 $('confirmCeremonies').onclick=()=>void confirmCeremonyPlan();

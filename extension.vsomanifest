@@ -5,7 +5,8 @@
     "vso.work_write",
     "vso.extension.data",
     "vso.extension.data_write",
-    "vso.graph"
+    "vso.graph",
+    "vso.identity"
   ],
   "contributions": [
     {
@@ -35,5 +36,5 @@
     }
   ],
   "contributionTypes": [],
-  "version": "1.0.29"
+  "version": "1.0.39"
 }

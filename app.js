@@ -251,7 +251,7 @@ function showArchivedWorkspaces(){const archived=(registry.workspaces||[]).filte
 
 let assignedItems=[];
 let assignedLoadSequence=0;
-let ancestorItems=[];const workflowStates=new Map();const workflowCategories=new Map();
+let ancestorItems=[];const workflowStates=new Map();const workflowCategories=new Map();const workflowNativeTerminal=new Map();const workflowStateDetails=new Map();
 let searchTimer,searchSequence=0,nearbyResults=[];
 let savedSprintForm='',savedProjectVisibility='',activeSprintId='',switchingSprint=false;
 const sprintForm=()=>JSON.stringify(['sprintName','start','end','goal','status'].map(id=>$(id).value));
@@ -350,6 +350,111 @@ async function api(path,options={}){
  return response.json();
 }
 
+// Azure DevOps identity/Graph APIs are served by vssps.dev.azure.com, NOT dev.azure.com.
+// Graph descriptors and AAD originId values are not valid comment mention IDs. Only
+// verified Azure DevOps storage-key GUIDs (VSIDs) can be used in mention anchors.
+const MENTION_ID_RE=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const mentionCache=new Map();
+function normalizedMentionIdentity(entry){
+ const e=entry?.identity||entry;
+ if(!e||typeof e!=='object')return null;
+ const id=[e.id,e.entityId,e.storageKey].map(x=>String(x||'').trim()).find(x=>MENTION_ID_RE.test(x));
+ if(!id)return null;
+ const name=String(e.displayName||e.providerDisplayName||e.customDisplayName||e.name||e.properties?.DisplayName?.$value||'').trim();
+ if(!name)return null;
+ const email=String(e.mailAddress||e.uniqueName||e.email||e.properties?.Mail?.$value||'').trim();
+ return {id,name,email};
+}
+function knownMentionIdentities(term){
+ // Every Work Item Tracking IdentityRef is resolved by ADO and carries a real
+ // VSID. Work item assignees provide a reliable local fallback for team users.
+ const matching=[];
+ for(const group of [items,assignedItems,ancestorItems,browserItems,nearbyResults]){
+  if(!Array.isArray(group))continue;
+  for(const w of group){
+   const candidate=normalizedMentionIdentity({id:w.assigneeId,name:w.assignee,email:w.assigneeEmail||w.assigneeIdentity});
+   if(candidate)matching.push(candidate);
+  }
+ }
+ return matching.filter(x=>(x.name+' '+x.email).toLowerCase().includes(term.toLowerCase()));
+}
+function identityApiBase(){
+ const organization=new URL(organizationApiBase());
+ const name=organization.hostname==='dev.azure.com'?organization.pathname.split('/').filter(Boolean)[0]:organization.hostname.split('.')[0];
+ if(!name||!/^[a-z0-9-]+$/i.test(decodeURIComponent(name)))throw Error('Azure DevOps organization context unavailable for identity search');
+ return `https://vssps.dev.azure.com/${encodeURIComponent(decodeURIComponent(name))}`;
+}
+async function identityApi(path,options={}){
+ const method=options.method||'GET';
+ const request=accessToken=>fetch(identityApiBase()+path,{...options,headers:{Authorization:`Bearer ${accessToken}`,Accept:'application/json',...options.headers}});
+ let response=await request(token);
+ if(response.status===401&&method==='GET'){
+  const renewed=await sdk.getAccessToken();
+  if(renewed&&renewed!==token){token=renewed;response=await request(token);}
+ }
+ if(!response.ok)throw serviceHttpError('Azure DevOps identity service',response.status);
+ const type=response.headers?.get('content-type')||'';
+ if(!/\bjson\b|\+json\b/i.test(type))throw Error('Identity service returned a non-JSON response');
+ return response.json();
+}
+function uniqueMentionCandidates(candidates){
+ const byId=new Map();for(const entry of candidates){const item=normalizedMentionIdentity(entry);if(item&&!byId.has(item.id))byId.set(item.id,item);}return [...byId.values()];
+}
+async function searchMentionIdentities(term){
+ const query=String(term||'').trim();if(query.length<2)return [];
+ const key=query.toLowerCase(),cached=mentionCache.get(key);
+ if(cached&&Date.now()-cached.at<120000)return cached.users;
+ const matching=entries=>uniqueMentionCandidates(entries).filter(x=>(x.name+' '+x.email).toLowerCase().includes(key)).slice(0,15);
+ const finish=users=>{mentionCache.set(key,{at:Date.now(),users});return users;};
+ // Work item assignees are already authenticated IdentityRef records from ADO,
+ // so common project team members resolve immediately even if vssps is blocked.
+ const local=matching(knownMentionIdentities(query));
+ if(local.length){diagnostic('ado.mentions.search',{path:'work_item_identities',resolved:local.length});return finish(local);}
+ const errors=[];let hostUsers=[];
+ try{
+  const service=await sdk.getService('ms.vss-features.identity-service');
+  if(typeof service?.searchIdentitiesAsync!=='function')throw Error('Host identity search method unavailable');
+  hostUsers=await service.searchIdentitiesAsync(query,['user'],['ims','source']);
+  if(!Array.isArray(hostUsers))throw Error('Unexpected host identity result');
+  const found=matching(hostUsers);
+  diagnostic('ado.mentions.host',{matches:hostUsers.length,resolved:found.length});
+  if(found.length)return finish(found);
+ }catch(e){errors.push('host: '+String(e?.message||e));}
+ // Host people picker entries may have entityId but no display name. Resolve
+ // those IDs using the IMS service on vssps.dev.azure.com.
+ const ids=hostUsers.map(x=>x?.entityId).filter(x=>MENTION_ID_RE.test(String(x||''))).slice(0,20);
+ if(ids.length){
+  try{
+   const result=await identityApi(`/_apis/identities?identityIds=${ids.map(encodeURIComponent).join(',')}&queryMembership=None&api-version=7.1`);
+   const found=matching(Array.isArray(result?.value)?result.value:[]);
+   if(found.length){diagnostic('ado.mentions.search',{path:'host_vsid_resolution',resolved:found.length});return finish(found);}
+  }catch(e){errors.push('host resolution: '+String(e?.message||e));}
+ }
+ try{
+  const result=await identityApi(`/_apis/identities?searchFilter=General&filterValue=${encodeURIComponent(query)}&queryMembership=None&api-version=7.1`);
+  const found=matching(Array.isArray(result?.value)?result.value:[]);
+  if(found.length){diagnostic('ado.mentions.search',{path:'ims',resolved:found.length});return finish(found);}
+ }catch(e){errors.push('IMS: '+String(e?.message||e));}
+ // Graph query results provide descriptors, which must be resolved to VSIDs.
+ try{
+  const result=await identityApi('/_apis/graph/subjectquery?api-version=7.1-preview.1',{
+   method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query,subjectKind:['User']})});
+  const users=(Array.isArray(result)?result:Array.isArray(result?.value)?result.value:[])
+   .filter(x=>String(x?.subjectKind||'user').toLowerCase()==='user').slice(0,12);
+  const converted=await Promise.all(users.map(async user=>{
+   try{
+    if(!user.descriptor)return null;
+    const storageKey=await identityApi(`/_apis/graph/storagekeys/${encodeURIComponent(user.descriptor)}?api-version=7.1-preview.1`);
+    return normalizedMentionIdentity({id:storageKey?.value,name:user.displayName,email:user.mailAddress||user.principalName});
+   }catch(e){diagnostic('ado.mentions.graph_key_failure',{reason:String(e?.message||e)},'warn');return null;}
+  }));
+  const found=matching(converted.filter(Boolean));
+  if(found.length){diagnostic('ado.mentions.search',{path:'graph_storage_key',resolved:found.length});return finish(found);}
+ }catch(e){errors.push('Graph: '+String(e?.message||e));}
+ diagnostic('ado.mentions.search_failed',{hostResultCount:hostUsers.length,reason:errors.join('; ').slice(0,400)},'warn');
+ if(errors.length>=2)throw Error('Unable to resolve team identities. '+errors.join('; '));
+ return [];
+}
 // Local UI preferences are scoped to the Azure DevOps user and organization.
 let browserItems=[],browserSequence=0,contextKey='',browserBusy=false,contextHydrating=false;
 const browserSelection=new Set();let bulkBusy=false;
@@ -495,7 +600,15 @@ async function init(){try{
  const startupTab=readStartupTab();
  requestedTab=startupTab||'board';
   sdk=sdkModule;
-  await Promise.race([Promise.resolve(sdk.init({loaded:false,applyTheme:true})).then(()=>sdk.ready()),new Promise((_,reject)=>setTimeout(()=>reject(new Error('Azure DevOps extension SDK did not become ready within 15 seconds. Check the extension host and reload.')),15000))]);context=sdk.getHost();m365Identity();
+  await Promise.race([Promise.resolve(sdk.init({loaded:false,applyTheme:true})).then(()=>sdk.ready()),new Promise((_,reject)=>setTimeout(()=>reject(new Error('Azure DevOps extension SDK did not become ready within 15 seconds. Check the extension host and reload.')),15000))]);context=sdk.getHost();
+  const installedVersion=String(sdk.getExtensionContext()?.version||'');
+  const versionLabel=$('gsHeaderVersion');
+  if(versionLabel){versionLabel.textContent='v'+DIAG_VERSION;versionLabel.title='Loaded application: '+DIAG_VERSION+'; installed extension: '+(installedVersion||'unavailable');}
+  if(installedVersion&&installedVersion!==DIAG_VERSION){
+   diagnostic('extension.version_mismatch',{loaded:DIAG_VERSION,installed:installedVersion},'error');
+   throw Error(`Extension version mismatch: loaded application ${DIAG_VERSION} but Azure DevOps reports installed version ${installedVersion}. Reload after the Marketplace update is active.`);
+  }
+  m365Identity();
   // ADO hub readiness must not depend on organization queries or board restoration.
   sdk.notifyLoadSucceeded();notify('Connecting to organization data…');
   // Session recovery is independent of Azure DevOps data initialization.
@@ -653,15 +766,30 @@ async function toggleProjectManager(){
  $('manageProjects').textContent=opened?'Hide project configuration ▴':'Configure included / excluded projects ▾';
  notify(opened?'Project configuration opened.':'Project configuration closed.');
 }
-async function loadItems(){try{if(!workspaceSprints().length)throw Error('Create a sprint in this workspace first.');notify('Loading work items…');const names=$('project').value?[$('project').value]:projects.filter(p=>projectVisibility.includes(p.id)).map(p=>p.name);if(!names.length)throw Error('No included projects. Open Manage projects to include at least one.');const collected=[];for(const name of names){const escaped=name.replace(/'/g,"''");const state=$('stateFilter').value==='active'?" AND [System.State] NOT IN ('Closed','Removed')":'';const wiql={query:`SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '${escaped}'${state} ORDER BY [System.ChangedDate] DESC`};const r=await api(`/${encodeURIComponent(name)}/_apis/wit/wiql?$top=${MAX_ITEMS}&api-version=7.1`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(wiql)});const ids=(r.workItems||[]).slice(0,MAX_ITEMS).map(x=>x.id);for(let i=0;i<ids.length;i+=200){const detail=await api(`/_apis/wit/workitems?ids=${ids.slice(i,i+200).join(',')}&fields=System.Id,System.Title,System.TeamProject,System.State,System.AssignedTo,System.WorkItemType&api-version=7.1`);collected.push(...(detail.value||[]).map(x=>({id:x.id,rev:x.rev,project:x.fields['System.TeamProject'],title:x.fields['System.Title'],state:x.fields['System.State'],type:x.fields['System.WorkItemType'],assignee:x.fields['System.AssignedTo']?.displayName||'Unassigned',url:x._links?.html?.href||''})));}}
-items=collected;renderBacklog();renderBoard();rememberContext();notify(`Loaded ${items.length} work items across ${names.length} project(s).`);
+async function loadItems(){try{if(!workspaceSprints().length)throw Error('Create a sprint in this workspace first.');notify('Loading work items…');const names=$('project').value?[$('project').value]:projects.filter(p=>projectVisibility.includes(p.id)).map(p=>p.name);if(!names.length)throw Error('No included projects. Open Manage projects to include at least one.');const collected=[];for(const name of names){const escaped=name.replace(/'/g,"''");const state=$('stateFilter').value==='active'?" AND [System.State] NOT IN ('Closed','Removed','Completed','Done','Resolved','Accepted','Cut','Cancelled','Canceled','Tested and Approved','Development Complete')":'';const wiql={query:`SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '${escaped}'${state} ORDER BY [System.ChangedDate] DESC`};const r=await api(`/${encodeURIComponent(name)}/_apis/wit/wiql?$top=${MAX_ITEMS}&api-version=7.1`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(wiql)});const ids=(r.workItems||[]).slice(0,MAX_ITEMS).map(x=>x.id);for(let i=0;i<ids.length;i+=200){const detail=await api(`/_apis/wit/workitems?ids=${ids.slice(i,i+200).join(',')}&fields=System.Id,System.Title,System.TeamProject,System.State,System.AssignedTo,System.WorkItemType&api-version=7.1`);collected.push(...(detail.value||[]).map(x=>({id:x.id,rev:x.rev,project:x.fields['System.TeamProject'],title:x.fields['System.Title'],state:x.fields['System.State'],type:x.fields['System.WorkItemType'],assignee:x.fields['System.AssignedTo']?.displayName||'Unassigned',assigneeId:x.fields['System.AssignedTo']?.id||'',assigneeEmail:x.fields['System.AssignedTo']?.uniqueName||'',url:x._links?.html?.href||''})));}}
+// Filter after retrieval as well: inherited/custom project processes can define
+// terminal states with names not covered by the WIQL fast-path exclusion.
+if($('stateFilter').value==='active'){
+ const sample=[...new Map(collected.filter(w=>w.project&&w.type).map(w=>[workflowKey(w),w])).values()];
+ await Promise.allSettled(sample.map(w=>getStates(w)));
+}
+items=$('stateFilter').value==='active'?collected.filter(isAvailableForPlanning):collected;renderBacklog();renderBoard();rememberContext();notify(`Loaded ${items.length} work items across ${names.length} project(s).`);
 }catch(e){notify(e.message,true);}}
+// Finished/removed work is available only through an explicit All states selection.
+// The queue is intentionally not filtered: a queued ticket stays visible until
+// the user removes it or assigns it, even if Azure DevOps changes meanwhile.
+function isAvailableForPlanning(w){
+ const name=String(w.state||'').trim().toLowerCase();
+ if(['removed','cut','cancelled','canceled','closed','completed','done','resolved','accepted','tested and approved','development complete'].includes(name))return false;
+ const category=workflowCategory(w);
+ return category!=='Done'&&category!=='Closed';
+}
 function searchCandidates(){
  const query=$('search').value.trim().toLowerCase();
  if(!query)return [];
  const digits=/^#?(\d+)$/.exec(query)?.[1];
  const all=new Map([...items,...browserItems,...nearbyResults].map(w=>[w.id,w]));const committed=new Set((currentSprint()?.itemIds||[]).map(Number));
- return [...all.values()].filter(w=>!committed.has(Number(w.id))).map(w=>{
+ return [...all.values()].filter(w=>!committed.has(Number(w.id))&&($('stateFilter').value==='all'||isAvailableForPlanning(w))).map(w=>{
   const title=w.title.toLowerCase(), id=String(w.id);
   const exact=id===digits?0:title===query?1:title.startsWith(query)?2:title.includes(query)?3:id.includes(query)?4:10;
   const distance=digits?Math.abs(w.id-Number(digits)):0;
@@ -689,7 +817,7 @@ async function lookupNearbyIds(value){
   const response=await api(`/_apis/wit/workitems?ids=${ids.join(',')}&fields=System.Id,System.Title,System.TeamProject,System.State,System.AssignedTo,System.WorkItemType&errorPolicy=Omit&api-version=7.1`);
   if(sequence!==searchSequence)return;
   const allowed=new Set(projects.filter(p=>projectVisibility.includes(p.id)).map(p=>p.name));
-  nearbyResults=(response.value||[]).filter(x=>allowed.has(x.fields['System.TeamProject'])).map(x=>({id:x.id,rev:x.rev,project:x.fields['System.TeamProject'],title:x.fields['System.Title']||'',state:x.fields['System.State']||'',type:x.fields['System.WorkItemType']||'',assignee:x.fields['System.AssignedTo']?.displayName||'Unassigned',url:x._links?.html?.href||''}));
+  nearbyResults=(response.value||[]).filter(x=>allowed.has(x.fields['System.TeamProject'])).map(x=>({id:x.id,rev:x.rev,project:x.fields['System.TeamProject'],title:x.fields['System.Title']||'',state:x.fields['System.State']||'',type:x.fields['System.WorkItemType']||'',assignee:x.fields['System.AssignedTo']?.displayName||'Unassigned',assigneeId:x.fields['System.AssignedTo']?.id||'',assigneeEmail:x.fields['System.AssignedTo']?.uniqueName||'',url:x._links?.html?.href||''}));
  }catch{if(sequence!==searchSequence)return;nearbyResults=[];}
  renderSuggestions();
 }
@@ -697,7 +825,7 @@ function handleSearch(){
  clearTimeout(searchTimer);searchSequence++;nearbyResults=[];renderBacklog();renderSuggestions();
  if(/^#?\d{2,8}$/.test($('search').value.trim()))searchTimer=setTimeout(()=>lookupNearbyIds($('search').value),350);
 }
-function renderBacklog(){const body=$('backlog');body.replaceChildren();const q=$('search').value.toLowerCase().replace(/^#/,'');const s=registry?.sprints.find(x=>x.id===$('sprintPicker').value);for(const w of items.filter(x=>`${x.id} ${x.title} ${x.project} ${x.assignee}`.toLowerCase().includes(q))){const tr=document.createElement('tr');tr.innerHTML=`<td><a href="${escapeHtml(w.url)}" target="_blank" rel="noopener noreferrer">#${w.id}</a> ${escapeHtml(w.title)}</td><td>${escapeHtml(w.project)}</td><td>${escapeHtml(w.assignee)}</td><td>${escapeHtml(w.state)}</td><td></td>`;const b=document.createElement('button');b.className='secondary';const included=!!s?.itemIds.includes(w.id);b.textContent=included?'Already added':browserSelection.has(w.id)?'Remove from queue':'Queue now';b.disabled=!s||included;b.onclick=()=>{if(browserSelection.has(w.id))browserSelection.delete(w.id);else browserSelection.add(w.id);renderBacklog();renderBrowser();updateBulkToolbar();};tr.lastElementChild.append(b);body.append(tr);}if(!body.children.length){const tr=document.createElement('tr');tr.innerHTML='<td colspan="5">No matching loaded work items.</td>';body.append(tr);}updateBulkToolbar();}
+function renderBacklog(){const body=$('backlog');body.replaceChildren();const q=$('search').value.toLowerCase().replace(/^#/,'');const s=registry?.sprints.find(x=>x.id===$('sprintPicker').value);for(const w of items.filter(x=>($('stateFilter').value==='all'||isAvailableForPlanning(x))&&`${x.id} ${x.title} ${x.project} ${x.assignee}`.toLowerCase().includes(q))){const tr=document.createElement('tr');tr.innerHTML=`<td><a href="${escapeHtml(w.url)}" target="_blank" rel="noopener noreferrer">#${w.id}</a> ${escapeHtml(w.title)}</td><td>${escapeHtml(w.project)}</td><td>${escapeHtml(w.assignee)}</td><td>${escapeHtml(w.state)}</td><td></td>`;const b=document.createElement('button');b.className='secondary';const included=!!s?.itemIds.includes(w.id);b.textContent=included?'Already added':browserSelection.has(w.id)?'Remove from queue':'Queue now';b.disabled=!s||included;b.onclick=()=>{if(browserSelection.has(w.id))browserSelection.delete(w.id);else browserSelection.add(w.id);renderBacklog();renderBrowser();updateBulkToolbar();};tr.lastElementChild.append(b);body.append(tr);}if(!body.children.length){const tr=document.createElement('tr');tr.innerHTML='<td colspan="5">No matching loaded work items.</td>';body.append(tr);}updateBulkToolbar();}
 async function toggleItem(id){let s;try{s=requireSprint();}catch(e){return notify(e.message,true);}if(!(await guardSprint()))return;const wasIncluded=s.itemIds.includes(id);const ok=await persist(r=>{const t=r.sprints.find(x=>x.id===s.id);t.itemIds=t.itemIds.includes(id)?t.itemIds.filter(x=>x!==id):[...t.itemIds,id];});if(ok){await loadAssignedItems();renderBrowser();renderBacklog();renderSuggestions();if(!wasIncluded&&/^#?\d+$/.test($('search').value.trim()))void lookupNearbyIds(String(id));notify(`Work item #${id} ${wasIncluded?'removed from':'added to'} the sprint.`);}}
 async function loadAssignedItems(){
  const seq=++assignedLoadSequence;
@@ -768,7 +896,7 @@ async function enrichHierarchy(found,sequence){
  ancestorItems=contextual;
 }
 
-function normalizeItem(x){const f=x.fields||{};return {id:x.id,rev:x.rev,project:f['System.TeamProject'],title:f['System.Title']||'',state:f['System.State']||'',type:f['System.WorkItemType']||'',assignee:f['System.AssignedTo']?.displayName||'Unassigned',assigneeIdentity:f['System.AssignedTo']?.uniqueName||'',priority:f['Microsoft.VSTS.Common.Priority']??null,effort:f['Microsoft.VSTS.Scheduling.StoryPoints']??f['Microsoft.VSTS.Scheduling.Effort']??null,storyPoints:f['Microsoft.VSTS.Scheduling.StoryPoints']??null,effortField:f['Microsoft.VSTS.Scheduling.StoryPoints']!==undefined?'Microsoft.VSTS.Scheduling.StoryPoints':f['Microsoft.VSTS.Scheduling.Effort']!==undefined?'Microsoft.VSTS.Scheduling.Effort':null,startDate:String(f['Microsoft.VSTS.Scheduling.StartDate']||'').slice(0,10),targetDate:String(f['Microsoft.VSTS.Scheduling.TargetDate']||'').slice(0,10),dueDate:String(f['Microsoft.VSTS.Scheduling.DueDate']||'').slice(0,10),description:f['System.Description']||'',acceptanceCriteria:f['Microsoft.VSTS.Common.AcceptanceCriteria']??null,changedDate:f['System.ChangedDate']||'',url:x._links?.html?.href||''};}
+function normalizeItem(x){const f=x.fields||{};return {id:x.id,rev:x.rev,project:f['System.TeamProject'],title:f['System.Title']||'',state:f['System.State']||'',type:f['System.WorkItemType']||'',assignee:f['System.AssignedTo']?.displayName||'Unassigned',assigneeIdentity:f['System.AssignedTo']?.uniqueName||'',assigneeId:f['System.AssignedTo']?.id||'',assigneeEmail:f['System.AssignedTo']?.uniqueName||'',priority:f['Microsoft.VSTS.Common.Priority']??null,effort:f['Microsoft.VSTS.Scheduling.StoryPoints']??f['Microsoft.VSTS.Scheduling.Effort']??null,storyPoints:f['Microsoft.VSTS.Scheduling.StoryPoints']??null,effortField:f['Microsoft.VSTS.Scheduling.StoryPoints']!==undefined?'Microsoft.VSTS.Scheduling.StoryPoints':f['Microsoft.VSTS.Scheduling.Effort']!==undefined?'Microsoft.VSTS.Scheduling.Effort':null,startDate:String(f['Microsoft.VSTS.Scheduling.StartDate']||'').slice(0,10),targetDate:String(f['Microsoft.VSTS.Scheduling.TargetDate']||'').slice(0,10),dueDate:String(f['Microsoft.VSTS.Scheduling.DueDate']||'').slice(0,10),description:f['System.Description']||'',acceptanceCriteria:f['Microsoft.VSTS.Common.AcceptanceCriteria']??null,changedDate:f['System.ChangedDate']||'',url:x._links?.html?.href||''};}
 function currentSprint(){return registry?.sprints.find(x=>x.id===$('sprintPicker').value);}
 // Planning drafts are workspace-owned snapshots of Global Sprints coordination only.
 // They never write work item states or iteration paths back to Azure DevOps.
@@ -845,7 +973,7 @@ const LANE_PRESETS={'Backlog / Planned':'To Do','Ready to Start':'To Do','Active
 const LANE_CATEGORIES=['To Do','In Progress','Done','Closed'];
 let diagnosticEvents=[];const DIAG_KEY='pnpc-global-sprints-diagnostics-v2';
 const DIAG_LIMIT=600;
-const DIAG_VERSION='1.0.29';
+const DIAG_VERSION='1.0.39';
 let diagnosticSessionId='';
 // Production diagnostic payloads are deliberately numeric/boolean or finite enums.
 // Free-form strings (including messages and exception text) must never be exported.
@@ -1182,27 +1310,49 @@ async function moveLaneItem(id,lane){await saveLanes(s=>{s.itemLanes[id]=lane;},
 // Workflow metadata is scoped by project AND work-item type. Never mutate a global
 // state-name map from an individual project's inherited/custom process.
 function workflowKey(w){return `${w.project}::${w.type}`;}
+// Azure DevOps state CATEGORIES (not project process labels) are authoritative.
+// Project name + work-item type isolates inherited processes and custom subtypes.
+function nativeStateCategory(category){
+ const key=String(category||'').replace(/[\s_-]/g,'').toLowerCase();
+ return ({proposed:'To Do',inprogress:'In Progress',resolved:'Done',completed:'Closed',removed:'Removed'})[key]||null;
+}
 function workflowCategory(w,state=w.state){
- const scoped=workflowCategories.get(workflowKey(w));
  const name=String(state||'').trim().toLowerCase();
- // Authoritative project/type metadata overrides generic state-name assumptions.
+ const scoped=workflowCategories.get(workflowKey(w));
  return scoped?.get(name)||WORKFLOW_MAP[name]||'Other';
 }
-async function getStates(w){const key=workflowKey(w);if(workflowStates.has(key))return workflowStates.get(key);
+function nativeTerminal(w,state=w.state){
+ const name=String(state||'').trim().toLowerCase();
+ const details=workflowStateDetails.get(workflowKey(w))?.get(name);
+ if(details?.category)return details.category==='Closed';
+ return workflowNativeTerminal.get(workflowKey(w))?.has(name)||false;
+}
+async function getStates(w,refresh=false){
+ const key=workflowKey(w);
+ if(!refresh&&workflowStates.has(key))return workflowStates.get(key);
  const result=await api(`/${encodeURIComponent(w.project)}/_apis/wit/workitemtypes/${encodeURIComponent(w.type)}/states?api-version=7.1`);
- const entries=result.value||[];const states=entries.map(x=>x.name);
- const mapping=new Map();const categoryMap={proposed:'To Do',inprogress:'In Progress',resolved:'Done',completed:'Closed'};
- const hasTerminal=entries.some(x=>String(x.category||'').toLowerCase()==='completed'||['closed','accepted','completed'].includes(String(x.name||'').trim().toLowerCase()));
- for(const entry of entries){const label=String(entry.name||'').trim().toLowerCase();if(!label)continue;
-  const category=String(entry.category||'').toLowerCase();let normalized=categoryMap[category]||WORKFLOW_MAP[label];
-  if(category==='resolved'&&!hasTerminal)normalized='Closed';
-  if(label==='done'&&category==='completed'&&entries.some(x=>['closed','accepted'].includes(String(x.name||'').trim().toLowerCase())))normalized='Done';
-  if(normalized)mapping.set(label,normalized);
-  else diagnostic('ado.workflow.unmapped_state',{workItemType:w.type,project:w.project,category});
+ const entries=Array.isArray(result.value)?result.value:[];
+ if(!entries.length)throw Error(`Azure DevOps returned no states for ${w.project} / ${w.type}.`);
+ const states=[],mapping=new Map(),details=new Map(),terminal=new Set();
+ for(const [order,entry] of entries.entries()){
+  const label=String(entry.name||'').trim(),name=label.toLowerCase();
+  if(!name)continue;
+  const category=nativeStateCategory(entry.category??entry.stateCategory);
+  // A state called Done in the ADO Completed category represents work ready
+  // for the Global Sprints Done column, not acceptance into Completed.
+  // Never override an explicit category for Resolved, Complete, Closed, etc.
+  const display=category==='Closed'&&name==='done'?'Done':(category||WORKFLOW_MAP[name]||'Other');
+  states.push(label);mapping.set(name,display);
+  details.set(name,{name:label,category,order});
+  if(category==='Closed'||(!category&&['done','complete','completed','closed','accepted','finished'].includes(name)))terminal.add(name);
  }
+ if(!states.length)throw Error(`Azure DevOps returned no named states for ${w.project} / ${w.type}.`);
  workflowCategories.set(key,mapping);
- diagnostic('ado.workflow.states_loaded',{workItemType:w.type,project:w.project,stateCount:states.length,unmapped:entries.filter(x=>!mapping.has(String(x.name||'').trim().toLowerCase())).length});
- workflowStates.set(key,states);return states;
+ workflowStateDetails.set(key,details);
+ workflowNativeTerminal.set(key,terminal);
+ workflowStates.set(key,states);
+ diagnostic('ado.workflow.states_loaded',{project:w.project,workItemType:w.type,stateCount:states.length,terminalCount:terminal.size,refresh,hasCompletedCategory:[...details.values()].some(d=>d.category==='Closed')});
+ return states;
 }
 function assignedSelection(){
   const sprint=registry?.sprints.find(x=>x.id===$('sprintPicker').value);
@@ -1219,16 +1369,39 @@ const WORKFLOW_COLUMNS=['To Do','In Progress','Done','Closed'];
 const WORKFLOW_MAP={
  'to do':'To Do','new':'To Do','proposed':'To Do','approved':'To Do',
  'in progress':'In Progress','active':'In Progress','committed':'In Progress','doing':'In Progress',
- 'done':'Done','resolved':'Done','completed':'Closed','development complete':'Done',
+ 'done':'Done','resolved':'Done','complete':'Closed','completed':'Closed','finished':'Closed','development complete':'Done',
  'closed':'Closed','accepted':'Closed','tested and approved':'Closed'
 };
 function isRemoved(w){return ['removed','cut','cancelled','canceled'].includes((w.state||'').toLowerCase());}
 function workflowColumn(w){return workflowCategory(w);}
 // Presentation-only exception: an ADO Closed item may be displayed in Done.
 // Never rewrite the underlying terminal ADO state or report it as awaiting validation.
-function boardColumn(w){const native=workflowColumn(w);if(native!=='Closed')return native;const override=currentSprint()?.doneDisplayIds?.[w.id];if(override===true)return 'Done';if(override===false)return 'Closed';// A native Done state may be terminal for reporting without implying a Board move.
- return /^done$/i.test(String(w.state||'').trim())?'Done':'Closed';}
-async function setDoneDisplay(w,enabled){const id=currentSprint()?.id;if(!id)return false;const ok=await persist(r=>{const sp=r.sprints.find(x=>x.id===id);if(!sp)throw Error('Sprint no longer exists');sp.doneDisplayIds ||= {};if(enabled)sp.doneDisplayIds[w.id]=true;else if(/^done$/i.test(String(w.state||'').trim()))sp.doneDisplayIds[w.id]=false;else delete sp.doneDisplayIds[w.id];},false);if(ok){renderBoard();renderSprintHealth();notify(enabled?`#${w.id} displayed in Done; Azure DevOps state remains ${w.state}.`:`#${w.id} displayed in Completed; Azure DevOps state remains ${w.state}.`);}return ok;}
+function boardColumn(w){
+ const native=workflowColumn(w);
+ const override=currentSprint()?.doneDisplayIds?.[w.id];
+ // A Board-only Done placement is independent from native ADO workflow state.
+ if(override===true)return 'Done';
+ if(override===false&&native==='Done')return 'Closed';
+ if(native==='Closed'&&/^done$/i.test(String(w.state||'').trim()))return override===false?'Closed':'Done';
+ return native;
+}
+async function setDoneDisplay(w,enabled){
+ const id=currentSprint()?.id;if(!id)return false;
+ // Re-read the shared registry before saving: Board state and report snapshots
+ // may have updated the registry since this card was last rendered.
+ const ok=await saveLanes(sp=>{
+  sp.doneDisplayIds ||= {};
+  if(enabled===true)sp.doneDisplayIds[w.id]=true;
+  else if(enabled===false)sp.doneDisplayIds[w.id]=false;
+  else delete sp.doneDisplayIds[w.id];
+ },`Saved Board placement for #${w.id}.`);
+ if(ok){renderBoard();renderSprintHealth();
+  notify(enabled===true?`#${w.id} assigned to Done on the Board (ADO state: ${w.state}).`:
+   enabled===false?`#${w.id} displayed in Completed; Azure DevOps state remains ${w.state}.`:
+   `#${w.id} restored to its Azure DevOps workflow column (${w.state}).`);
+ }
+ return ok;
+}
 function compactMode(){return $('boardDensity')?.value==='compact';}
 async function updateWorkItemState(w,next){
  if(next===w.state)return true;
@@ -1245,13 +1418,104 @@ async function updateWorkItemState(w,next){
   return true;
  }catch(e){diagnostic('ado.state_update.failure',{workItemId:w.id,reason:String(e.message||e)},'error');notify(`State update rejected for #${w.id}: ${e.message}`,true);return false;}
 }
+// Pick an actual native state for this project AND work-item subtype.
+// Validate candidate transitions with ADO's no-write validateOnly endpoint so
+// inherited process rules can disallow transitions without changing the ticket.
+function stateCandidates(w,column,states){
+ const details=workflowStateDetails.get(workflowKey(w))||new Map();
+ const info=name=>details.get(String(name).toLowerCase())||{};
+ const rankLabel=name=>{
+  const rank={
+   'To Do':['new','to do','proposed','approved'],
+   'In Progress':['active','in progress','doing','committed'],
+   Done:['resolved','done','development complete','complete','completed','closed','accepted','finished'],
+   Closed:['closed','accepted','completed','complete','done','finished']
+  }[column]||[];
+  const idx=rank.indexOf(String(name).toLowerCase());return idx<0?100:idx;
+ };
+ const entries=states.map((name,index)=>({name,category:info(name).category,display:workflowCategory(w,name),index}));
+ const proposed=entries.filter(e=>e.category!=='Removed'&&(
+  column==='To Do'?e.display==='To Do':
+  column==='In Progress'?e.display==='In Progress':
+  column==='Done'?(e.category==='Done'||e.display==='Done'||e.category==='Closed'||(!e.category&&['complete','completed','closed','accepted','finished'].includes(e.name.toLowerCase()))):
+  column==='Closed'?(e.category==='Closed'||nativeTerminal(w,e.name)):false
+ ));
+ if(column==='Done'&&!proposed.length){
+  // Some custom processes have a state named Complete configured under
+  // InProgress, not Completed. Allow the named state as a fallback, but do NOT
+  // falsely classify it as a terminal state in Sprint Health.
+  proposed.push(...entries.filter(e=>['done','resolved','complete','completed','development complete','finished'].includes(e.name.toLowerCase())&&e.category==='In Progress'));
+ }
+ const priority=e=>{
+  if(column==='Done'){
+   if(e.category==='Done')return 0;
+   if(e.display==='Done')return 1;
+   if(e.category==='Closed')return 2;
+   return 3;
+  }
+  if(column==='Closed'&&e.category==='Closed')return 0;
+  return 1;
+ };
+ proposed.sort((a,b)=>priority(a)-priority(b)||rankLabel(a.name)-rankLabel(b.name)||a.index-b.index);
+ return proposed.map(e=>e.name);
+}
+async function validateStateTransition(w,next){
+ if(String(w.state||'').toLowerCase()===String(next).toLowerCase())return true;
+ const patch=[{op:'test',path:'/rev',value:w.rev},{op:'add',path:'/fields/System.State',value:next}];
+ await api(`/_apis/wit/workitems/${w.id}?validateOnly=true&api-version=7.1`,{method:'PATCH',headers:{'Content-Type':'application/json-patch+json'},body:JSON.stringify(patch)});
+ return true;
+}
 async function destinationState(w,column){
- const available=await getStates(w);
- const candidates=available.filter(state=>workflowCategory(w,state)===column);
- if(!candidates.length)throw Error(`No ${column} state is defined for ${w.type} in ${w.project}. The original Azure DevOps workflow is unchanged.`);
- if(candidates.includes(w.state))return w.state;
- const preferred={'To Do':['New','To Do','Approved','Proposed'],'In Progress':['Active','In Progress','Committed','Doing'],'Done':['Done','Resolved','Development Complete'],'Closed':['Closed','Accepted','Tested and Approved']};
- const rank=x=>{const i=preferred[column].findIndex(v=>v.toLowerCase()===x.toLowerCase());return i<0?999:i;};return candidates.sort((x,y)=>rank(x)-rank(y))[0];
+ let states=await getStates(w),candidates=stateCandidates(w,column,states);
+ // Handle an inherited process modified after the extension loaded.
+ if(!candidates.length){states=await getStates(w,true);candidates=stateCandidates(w,column,states);}
+ if(column==='Closed'&&nativeTerminal(w)&&!candidates.some(x=>String(x).toLowerCase()===String(w.state).toLowerCase()))return w.state;
+ if(!candidates.length){
+  const context=states.map(s=>`${s} (${workflowStateDetails.get(workflowKey(w))?.get(s.toLowerCase())?.category||'Uncategorized'})`).join(', ');
+  throw Error(`No native ${column} destination for ${w.project} / ${w.type}. Available Azure DevOps states: ${context}. Check the work-item type's workflow configuration.`);
+ }
+ // Prefer a no-op when the source work item is already in the destination state.
+ const same=candidates.find(x=>String(x).toLowerCase()===String(w.state).toLowerCase());if(same)return same;
+ const rejected=[];
+ const validateCandidates=async(list)=>{
+  for(const candidate of list){
+   try{await validateStateTransition(w,candidate);
+    diagnostic('ado.workflow.transition_resolved',{workItemId:w.id,project:w.project,workItemType:w.type,fromState:w.state,toState:candidate,column,category:workflowStateDetails.get(workflowKey(w))?.get(candidate.toLowerCase())?.category||'unknown'});
+    return candidate;
+   }catch(error){
+    const reason=String(error?.message||error).slice(0,160);rejected.push(`${candidate}: ${reason}`);
+    diagnostic('ado.workflow.transition_validation_rejected',{workItemId:w.id,project:w.project,workItemType:w.type,fromState:w.state,toState:candidate,column,reason},'warn');
+   }
+  }
+  return null;
+ };
+ const initial=await validateCandidates(candidates);if(initial)return initial;
+ // The type's inherited process may have changed since an earlier load. Retry
+ // only if a fresh WIT state list/category mapping differs, never indefinitely.
+ const original=states.map(n=>`${n}:${workflowStateDetails.get(workflowKey(w))?.get(n.toLowerCase())?.category}`).join('|');
+ try{
+  states=await getStates(w,true);
+  const current=states.map(n=>`${n}:${workflowStateDetails.get(workflowKey(w))?.get(n.toLowerCase())?.category}`).join('|');
+  if(current!==original){
+   candidates=stateCandidates(w,column,states);
+   const refreshed=await validateCandidates(candidates);if(refreshed)return refreshed;
+  }
+ }catch(e){rejected.push(`Refreshing workflow metadata: ${String(e.message||e).slice(0,100)}`);}
+ throw Error(`Azure DevOps rejected every ${column} transition for #${w.id} (${w.project} / ${w.type}). ${rejected.join(' | ').slice(0,550)}. No work-item state or Board placement was changed.`);
+}
+// Assignment uses verified identity choices, not an ambiguous display-name string.
+// Azure DevOps WIT accepts a unique email, a distinct name<email>, an IdentityRef,
+// or an empty string to clear the identity field (WIT 7.1 PATCH contract).
+function assignmentPatchValue(text,selected){
+ const entry=selected&&normalizedMentionIdentity(selected);
+ if(entry){
+  if(entry.email&&/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(entry.email))return entry.email;
+  return {id:entry.id,displayName:entry.name};
+ }
+ const value=String(text||'').trim();
+ if(!value)return '';
+ if(/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(value))return value;
+ throw Error('Choose a person from the suggestions, enter their full email address, or clear the field to unassign.');
 }
 const isPlanningContextType=w=>/^(epic|feature)$/i.test((w.type||'').trim());
 // Board detail stays in the extension. Only the explicit external link leaves this view.
@@ -1265,7 +1529,34 @@ async function openBoardItemDetail(w){
  const grid=el('div','gs-ticket-grid');const field=(label,control)=>{const wrap=el('label','gs-ticket-field');wrap.append(el('span','',label),control);grid.append(wrap);return control;};
  const title=field('Title',el('input'));title.value=w.title;title.required=true;
  const state=field('Azure DevOps state',el('select'));state.add(new Option(w.state,w.state));
- const assignee=field('Assigned to (email or identity)',el('input'));assignee.value=w.assigneeIdentity|| (w.assignee==='Unassigned'?'':w.assignee);assignee.placeholder='Name or email';
+ const assignee=field('Assigned to',el('input'));assignee.value=w.assigneeIdentity|| (w.assignee==='Unassigned'?'':w.assignee);assignee.placeholder='Search by name or enter an email';assignee.autocomplete='off';assignee.setAttribute('role','combobox');assignee.setAttribute('aria-autocomplete','list');assignee.setAttribute('aria-expanded','false');
+ const assignResults=el('div','gs-assignee-results');assignResults.setAttribute('role','listbox');assignResults.setAttribute('aria-label','Assign to an Azure DevOps user');
+ const assignHelp=el('small','gs-ticket-help','Select a suggested Azure DevOps user, enter a full email, or clear to unassign.');
+ // Keep suggestion buttons outside the label element: nested interactive controls
+ // can steal clicks and cause browsers to refocus the input without selecting.
+ const assignLabel=assignee.parentElement,assignContainer=el('div','gs-assignee-picker');assignLabel.parentElement.insertBefore(assignContainer,assignLabel);assignContainer.append(assignLabel,assignResults,assignHelp);
+ let selectedAssignee=null,assignSearchSeq=0,assignSearchTimer=null;
+ const clearAssigneeResults=()=>{assignResults.replaceChildren();assignee.setAttribute('aria-expanded','false');};
+ assignee.addEventListener('input',()=>{
+  selectedAssignee=null;clearTimeout(assignSearchTimer);clearAssigneeResults();const query=assignee.value.trim();
+  if(query.length<2||query.includes('@'))return;
+  const seq=++assignSearchSeq;
+  assignSearchTimer=setTimeout(async()=>{
+   try{
+    const users=await searchMentionIdentities(query);
+    if(seq!==assignSearchSeq||assignee.value.trim()!==query)return;
+    clearAssigneeResults();
+    for(const identity of users.slice(0,12)){
+     const choice=el('button','secondary gs-mention-option',identity.name+(identity.email?' · '+identity.email:''));choice.type='button';choice.setAttribute('role','option');
+     choice.onclick=()=>{selectedAssignee=identity;assignSearchSeq++;assignee.value=identity.email?identity.name+' <'+identity.email+'>':identity.name;clearAssigneeResults();feedback.textContent='Selected '+identity.name+'. Save Changes to update Azure DevOps.';};
+     assignResults.append(choice);
+    }
+    if(!users.length)assignResults.append(el('small','gs-ticket-help','No users found. You can enter a full email address instead.'));
+    assignee.setAttribute('aria-expanded','true');
+   }catch(e){if(seq===assignSearchSeq){clearAssigneeResults();assignResults.append(el('small','gs-ticket-help','User search unavailable: '+e.message+'. Enter a full email address instead.'));assignee.setAttribute('aria-expanded','true');}}
+  },250);
+ });
+ assignee.addEventListener('keydown',event=>{if(event.key==='Escape'){assignSearchSeq++;clearTimeout(assignSearchTimer);clearAssigneeResults();}});
  const effort=field('Effort / Story Points',el('input'));effort.type='number';effort.min='0';effort.step='any';effort.value=w.effort??'';
  const detailSection=el('section','gs-ticket-rich-fields');
  detailSection.append(el('h3','','Planning details'));
@@ -1282,7 +1573,49 @@ async function openBoardItemDetail(w){
  const feedback=el('p','gs-ticket-feedback');feedback.setAttribute('role','status');
  const actions=el('div','gs-ticket-actions');const link=el('a','gs-ticket-external','Open in Azure DevOps ↗');link.href=w.url||`${organizationApiBase()}/${encodeURIComponent(w.project)}/_workitems/edit/${w.id}`;link.target='_blank';link.rel='noopener noreferrer';const save=el('button','','Save Changes');save.type='submit';actions.append(link,save);
  form.append(grid,detailSection,info,feedback,actions);dialog.append(form);
- const comments=el('section','gs-ticket-comments');comments.append(el('h3','','Comments'));const history=el('div','gs-ticket-comment-history','Loading comments…');const comment=el('textarea');comment.rows=3;comment.placeholder='Add a comment to this work item';comment.setAttribute('aria-label','New work item comment');const send=el('button','secondary','Add Comment');send.type='button';comments.append(history,comment,send);dialog.append(comments);
+ const comments=el('section','gs-ticket-comments');comments.append(el('h3','','Comments'));const history=el('div','gs-ticket-comment-history','Loading comments…');const comment=el('textarea');comment.rows=3;comment.placeholder='Add a comment to this work item';comment.setAttribute('aria-label','New work item comment');const send=el('button','secondary','Add Comment');send.type='button';
+ const mentionResults=el('div','gs-mention-results');mentionResults.setAttribute('role','listbox');mentionResults.setAttribute('aria-label','Mention people');
+ const mentionHelp=el('small','gs-ticket-help','Type @ followed by a name, then select a matching Azure DevOps identity.');
+ comments.append(history,comment,mentionHelp,mentionResults,send);dialog.append(comments);
+ const mentions=new Map();let mentionQuerySeq=0;
+ const escHtml=v=>String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+ const activeMention=()=>{const left=comment.value.slice(0,comment.selectionStart);const match=left.match(/(?:^|\s)@([^@\n]{1,60})$/);return match?{name:match[1],start:left.length-match[0].length+(match[0].startsWith('@')?0:1),end:left.length}:null;};
+ const clearMentionResults=()=>mentionResults.replaceChildren();
+ const renderMentionCandidates=async()=>{
+  const match=activeMention(),seq=++mentionQuerySeq;clearMentionResults();
+  if(!match||match.name.trim().length<2)return;
+  try{
+   // Identity search resolves actual Azure DevOps identity IDs; display names alone are not mentions.
+   const result=await searchMentionIdentities(match.name.trim());
+   if(seq!==mentionQuerySeq)return;
+   const candidates=result.filter(x=>x.id&&x.name).slice(0,10);
+   for(const identity of candidates){
+    const name=identity.name,email=identity.email||'';
+    const choice=el('button','secondary gs-mention-option',name+(email?' · '+email:''));choice.type='button';choice.setAttribute('role','option');
+    choice.onclick=()=>{const current=activeMention();if(!current)return;const display='@'+name;comment.value=comment.value.slice(0,current.start)+display+comment.value.slice(current.end);mentions.set(display,{id:identity.id,name});const caret=current.start+display.length;comment.focus();comment.setSelectionRange(caret,caret);clearMentionResults();};
+    mentionResults.append(choice);
+   }
+   if(!candidates.length)mentionResults.append(el('small','gs-ticket-help','No matching Azure DevOps users found.'));
+  }catch(e){if(seq===mentionQuerySeq)mentionResults.append(el('small','gs-ticket-help','Identity search unavailable: '+e.message));}
+ };
+ let mentionSearchTimer=null;comment.addEventListener('input',()=>{clearTimeout(mentionSearchTimer);mentionSearchTimer=setTimeout(()=>{void renderMentionCandidates();},280);});
+ const mentionCommentHtml=()=>{
+  // Encode all user-entered content; only identities selected from ADO are emitted as mention anchors.
+  const pattern=[...mentions.keys()].sort((a,b)=>b.length-a.length);
+  let remaining=comment.value,html='';
+  while(remaining){
+   const found=pattern.map(token=>({token,index:remaining.indexOf(token)})).filter(x=>x.index>=0).sort((a,b)=>a.index-b.index||b.token.length-a.token.length)[0];
+   if(!found){html+=escHtml(remaining);break;}
+   html+=escHtml(remaining.slice(0,found.index));
+   const identity=mentions.get(found.token);
+   const after=remaining[found.index+found.token.length]||'';
+   if(identity&&/^[0-9a-f-]{36}$/i.test(identity.id)&&(!after||/[\s,.!?;:]/.test(after))){html+=`<a href="#" data-vss-mention="version:2.0,${identity.id}">${escHtml(found.token)}</a>`;}
+   else html+=escHtml(found.token);
+   remaining=remaining.slice(found.index+found.token.length);
+  }
+  return '<div>'+html.replace(/\n/g,'<br>')+'</div>';
+ };
+
  if(!dialog.open)dialog.showModal();
  try{const states=await getStates(w);state.replaceChildren(...states.map(v=>new Option(v,v)));state.value=w.state;}catch(e){feedback.textContent='Could not load valid states: '+e.message;}
  let estimateField=w.effortField;
@@ -1294,18 +1627,22 @@ async function openBoardItemDetail(w){
  
  const loadComments=async()=>{try{const r=await api(`/${encodeURIComponent(w.project)}/_apis/wit/workItems/${w.id}/comments?api-version=7.1-preview.4`);history.replaceChildren();for(const c of (r.comments||[]).slice(-25)){const row=el('div','gs-ticket-comment');row.append(el('strong','',c.createdBy?.displayName||'Team member'),el('p','',String(c.text||'').replace(/<[^>]*>/g,'')));history.append(row);}if(!history.children.length)history.textContent='No comments yet.';}catch(e){history.textContent='Comments unavailable: '+e.message;}};
  void loadComments();
- send.onclick=async()=>{if(!comment.value.trim())return;send.disabled=true;try{await api(`/${encodeURIComponent(w.project)}/_apis/wit/workItems/${w.id}/comments?api-version=7.1-preview.4`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:comment.value.trim()})});comment.value='';feedback.textContent='Comment added.';await loadComments();}catch(e){feedback.textContent='Comment was not saved: '+e.message;}finally{send.disabled=false;}};
+ send.onclick=async()=>{if(!comment.value.trim())return;send.disabled=true;try{await api(`/${encodeURIComponent(w.project)}/_apis/wit/workItems/${w.id}/comments?format=html&api-version=7.1-preview.4`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:mentionCommentHtml()})});comment.value='';mentions.clear();clearMentionResults();feedback.textContent='Comment added.';await loadComments();}catch(e){feedback.textContent='Comment was not saved: '+e.message;}finally{send.disabled=false;}};
  form.onsubmit=async event=>{event.preventDefault();const changes=[];const put=(name,value)=>changes.push({op:'add',path:'/fields/'+name,value});if(title.value.trim()!==w.title)put('System.Title',title.value.trim());
  if(description.value!==plainText(w.description))put('System.Description',htmlText(description.value));
- if(!criteria.disabled&&criteria.value!==plainText(w.acceptanceCriteria))put('Microsoft.VSTS.Common.AcceptanceCriteria',htmlText(criteria.value));if(state.value!==w.state)put('System.State',state.value);if(assignee.value.trim()!==(w.assigneeIdentity|| (w.assignee==='Unassigned'?'':w.assignee)))put('System.AssignedTo',assignee.value.trim());if(estimateField&&String(effort.value)!==String(w.effort??'')){if(effort.value!==''&&(!Number.isFinite(Number(effort.value))||Number(effort.value)<0)){feedback.textContent='Estimate must be zero or greater.';return;}changes.push(effort.value===''?{op:'remove',path:'/fields/'+estimateField}:{op:'add',path:'/fields/'+estimateField,value:Number(effort.value)});}
- if(!changes.length){feedback.textContent='No changes to save.';return;}save.disabled=true;try{const result=await api(`/_apis/wit/workitems/${w.id}?api-version=7.1`,{method:'PATCH',headers:{'Content-Type':'application/json-patch+json'},body:JSON.stringify([{op:'test',path:'/rev',value:w.rev},...changes])});const fresh=normalizeItem(result);for(const item of [w,...items,...assignedItems,...ancestorItems])if(Number(item.id)===Number(w.id))Object.assign(item,fresh);renderBoard();renderSprintHealth();renderTimeline();void autoReportObservation(currentSprint(),reportWork());feedback.textContent='Saved to Azure DevOps.';heading.querySelector('h2').textContent=fresh.title;}catch(e){feedback.textContent='Save failed: '+e.message;}finally{save.disabled=false;}};
+ if(!criteria.disabled&&criteria.value!==plainText(w.acceptanceCriteria))put('Microsoft.VSTS.Common.AcceptanceCriteria',htmlText(criteria.value));if(state.value!==w.state)put('System.State',state.value);
+ const originalAssignee=w.assigneeIdentity|| (w.assignee==='Unassigned'?'':w.assignee);
+ const changedAssignee=selectedAssignee?String(selectedAssignee.id).toLowerCase()!==String(w.assigneeId||'').toLowerCase():assignee.value.trim()!==originalAssignee;
+ if(changedAssignee){try{put('System.AssignedTo',assignmentPatchValue(assignee.value,selectedAssignee));}catch(error){feedback.textContent=error.message;return;}}
+ if(estimateField&&String(effort.value)!==String(w.effort??'')){if(effort.value!==''&&(!Number.isFinite(Number(effort.value))||Number(effort.value)<0)){feedback.textContent='Estimate must be zero or greater.';return;}changes.push(effort.value===''?{op:'remove',path:'/fields/'+estimateField}:{op:'add',path:'/fields/'+estimateField,value:Number(effort.value)});}
+ if(!changes.length){feedback.textContent='No changes to save.';return;}save.disabled=true;try{const result=await api(`/_apis/wit/workitems/${w.id}?api-version=7.1`,{method:'PATCH',headers:{'Content-Type':'application/json-patch+json'},body:JSON.stringify([{op:'test',path:'/rev',value:w.rev},...changes])});const fresh=normalizeItem(result);for(const item of [w,...items,...assignedItems,...ancestorItems])if(Number(item.id)===Number(w.id))Object.assign(item,fresh);if(changes.some(change=>change.path==='/fields/System.State')&&currentSprint()?.doneDisplayIds?.[w.id]!==undefined)await setDoneDisplay(w,null);renderBoard();renderSprintHealth();renderTimeline();void autoReportObservation(currentSprint(),reportWork());feedback.textContent='Saved to Azure DevOps.';heading.querySelector('h2').textContent=fresh.title;selectedAssignee=null;assignee.value=fresh.assigneeIdentity|| (fresh.assignee==='Unassigned'?'':fresh.assignee);clearAssigneeResults();}catch(e){feedback.textContent='Save failed: '+e.message;}finally{save.disabled=false;}};
 }
 
 function workItemCard(w){
  const card=document.createElement('div');card.className='ticket hybrid-ticket'+(w.contextOnly||isPlanningContextType(w)?' context-item':'');
  const heading=document.createElement('div');heading.className='hybrid-title';const detailsButton=document.createElement('button');detailsButton.type='button';detailsButton.className='gs-board-detail-trigger';detailsButton.textContent=`#${w.id} · ${w.title}`;detailsButton.setAttribute('aria-label',`View work item #${w.id} details`);detailsButton.onclick=()=>openBoardItemDetail(w);heading.append(detailsButton);
  const meta=document.createElement('small');meta.textContent=`${w.project} · ${w.type||'Work item'} · ${w.assignee}`;
- const status=document.createElement('small');status.textContent=`State: ${w.state||'Unknown'}`;
+ const status=document.createElement('small');status.textContent=`ADO state: ${w.state||'Unknown'}`;
  card.append(heading,meta,status);if(isSprintBlocked(w.id))card.classList.add('sprint-blocked');if(compactMode())card.classList.add('compact-card');
  if(!w.contextOnly&&!isPlanningContextType(w)&&$('boardMode').value==='kanban'){
   card.draggable=true;card.classList.add('draggable-card');
@@ -1313,7 +1650,7 @@ function workItemCard(w){
  }
 
  if(w.contextOnly||isPlanningContextType(w)){const hint=document.createElement('small');hint.textContent=w.contextOnly?'Parent context · not assigned to this sprint':'Planning context · excluded from execution Kanban';card.append(hint);return card;}
- const laneInfo=document.createElement('small');laneInfo.textContent=`Swimlane: ${laneFor(w.id)}${laneConfig(laneFor(w.id))?.override?' (custom mapping)':''}${boardColumn(w)==='Done'&&workflowColumn(w)==='Closed'?' · Terminal in Azure DevOps; displayed in Done for Board review':''}`;card.append(laneInfo);const controls=document.createElement('div');controls.className='card-controls';
+ const laneInfo=document.createElement('small');laneInfo.textContent=`Swimlane: ${laneFor(w.id)}${laneConfig(laneFor(w.id))?.override?' (custom mapping)':''}${boardColumn(w)==='Done'&&workflowColumn(w)!=='Done'?' · ADO: '+w.state+'; held in Done for review':''}`;card.append(laneInfo);const controls=document.createElement('div');controls.className='card-controls';
  const lane=document.createElement('select');lane.setAttribute('aria-label',`Swimlane for #${w.id}`);
  for(const name of laneNames())lane.add(new Option(name,name));lane.value=laneFor(w.id);
  lane.onchange=async()=>{const destination=lane.value;lane.disabled=true;await moveLaneItem(w.id,destination);lane.disabled=false;};
@@ -1355,31 +1692,40 @@ async function dropOnCell(id,column,lane,cell){
  try{
   if(column!==oldColumn){
    const states=await getStates(w);
-   const nativeDone=states.some(x=>workflowCategory(w,x)==='Done');
-   if(column==='Done'&&!nativeDone){
-    if(workflowColumn(w)!=='Closed'){
-     if(!confirm(`This project has no Done state for ${w.type}. Moving #${w.id} to Done will CLOSE the original Azure DevOps ticket. Continue?`))return;
-     const terminal=await destinationState(w,'Closed');
-     if(!await updateWorkItemState(w,terminal))return;
+   const key=workflowKey(w),terminal=workflowNativeTerminal.get(key)||new Set();
+   const originalOverride=currentSprint()?.doneDisplayIds?.[w.id];
+   if(column==='Done'){
+    const next=await destinationState(w,'Done');
+    // For a native terminal state without its own Done stage, the display
+    // choice MUST be stored as a separate sprint-scoped fact before the ADO
+    // PATCH. Native Completed remains terminal for reporting.
+    const nativeColumn=workflowCategory(w,next);
+    const needsOverride=nativeColumn!=='Done';
+    if(needsOverride&&!await setDoneDisplay(w,true))return;
+    if(!await updateWorkItemState(w,next)){
+     if(needsOverride)await setDoneDisplay(w,originalOverride===undefined?null:originalOverride);
+     return;
     }
-    if(!await setDoneDisplay(w,true))return;
-   }else if(column==='Closed'&&workflowColumn(w)==='Closed'){
-    // A native Done state can be terminal for metrics but remains visually Done until explicitly moved.
-    // If the process exposes a distinct Closed state, use it; otherwise persist presentation only.
-    if(/^done$/i.test(String(w.state||'').trim())){
-     const closedStates=states.filter(x=>x.toLowerCase()!=='done'&&workflowCategory(w,x)==='Closed');
-     if(closedStates.length){const target=closedStates.find(x=>/^closed$/i.test(x))||closedStates[0];if(!await updateWorkItemState(w,target))return;}
-     else if(!await setDoneDisplay(w,false))return;
-    }else if(!await setDoneDisplay(w,false))return;
+    if(!needsOverride&&originalOverride!==undefined&&!await setDoneDisplay(w,null)){
+     notify(`#${w.id} was updated in Azure DevOps, but clearing its previous Board override failed. Refresh and retry.`,true);return;
+    }
+   }else if(column==='Closed'){
+    // Already terminal: accepting the card is a Board-only operation.
+    // Otherwise resolve and validate the project's true terminal state.
+    const next=nativeTerminal(w)?w.state:await destinationState(w,'Closed');
+    if(next!==w.state&&!await updateWorkItemState(w,next))return;
+    if(!await setDoneDisplay(w,false))return;
    }else{
-    const target=await destinationState(w,column);
-    if(!await updateWorkItemState(w,target))return;
-    if(currentSprint()?.doneDisplayIds?.[w.id]&&!await setDoneDisplay(w,false))return;
+    const next=await destinationState(w,column);
+    if(!await updateWorkItemState(w,next))return;
+    if(currentSprint()?.doneDisplayIds?.[w.id]!==undefined&&!await setDoneDisplay(w,null)){
+     notify(`Azure DevOps updated #${id}, but Board placement could not be cleared. Refresh and retry.`,true);return;
+    }
    }
   }
   if(lane!==oldLane){
    const ok=await saveLanes(s=>{s.itemLanes[id]=lane;},`Moved #${id} to swimlane ${lane}.`);
-   if(!ok){notify(`State updated, but could not save swimlane for #${id}.`,true);return;}
+   if(!ok){notify(`The ADO state updated, but could not save swimlane for #${id}.`,true);return;}
   }
   renderBacklog();renderBoard();
  }catch(e){notify(`Cannot move #${id}: ${e.message}`,true);}
@@ -1435,7 +1781,9 @@ function renderHybridBoard(){
  updateKanbanScrollControls();
 }
 function renderBoard(){renderHybridBoard();}
-async function changeState(w,state){await updateWorkItemState(w,state);renderBacklog();renderBoard();}
+async function changeState(w,state){if(!await updateWorkItemState(w,state))return;
+ if(currentSprint()?.doneDisplayIds?.[w.id]!==undefined)await setDoneDisplay(w,null);
+ renderBacklog();renderBoard();}
 async function capture(){let s;try{s=requireSprint();}catch(e){return notify(e.message,true);}const missing=s.itemIds.filter(id=>![...items,...assignedItems].some(w=>w.id===id));if(missing.length)return notify(`Load all committed work items before capturing a baseline. ${missing.length} item(s) are not currently loaded.`,true);const snapshot={at:new Date().toISOString(),items:s.itemIds.map(id=>{const w=[...items,...assignedItems].find(x=>x.id===id);return {id,project:w.project,title:w.title,type:w.type,state:w.state,completionCategory:workflowColumn(w),effort:w.effort,storyPoints:w.storyPoints};})};const ok=await persist(r=>{r.sprints.find(x=>x.id===s.id).snapshots.push(snapshot);});if(ok){renderHistory();notify(`Commitment baseline captured with ${snapshot.items.length} work items at ${new Date(snapshot.at).toLocaleString()}. Open History Record to inspect it.`);}}
 
 // Advisory sprint-readiness checks. No mutations, enforced cadence, or new persisted schema.
@@ -1530,7 +1878,7 @@ try{const parsed=JSON.parse(localStorage.getItem(DIAG_KEY)||'[]');diagnosticEven
 window.addEventListener('error',e=>{if(/ResizeObserver loop (limit exceeded|completed with undelivered notifications)/i.test(String(e.message||'')))return;diagnostic('runtime.error',{message:String(e.message).slice(0,250)},'error');});
 window.addEventListener('unhandledrejection',e=>diagnostic('runtime.rejection',{message:String(e.reason?.message||e.reason).slice(0,250)},'error'));
 $('boardMode').onchange=()=>{rememberContext();renderBoard();};$('addLane').onclick=addLane;$('renameLane').onclick=renameLane;$('removeLane').onclick=removeLane;
-$('manageProjects').onclick=toggleProjectManager;$('includeProjects').onclick=()=>moveProjects(true);$('excludeProjects').onclick=()=>moveProjects(false);$('saveProjectPreferences').onclick=saveProjectPreferences;$('newSprint').onclick=newSprint;$('saveSprint').onclick=saveSprint;$('capture').onclick=capture;$('refresh').onclick=loadItems;$('sprintPicker').onchange=switchSprint;
+$('manageProjects').onclick=toggleProjectManager;$('includeProjects').onclick=()=>moveProjects(true);$('excludeProjects').onclick=()=>moveProjects(false);$('saveProjectPreferences').onclick=saveProjectPreferences;$('newSprint').onclick=newSprint;$('saveSprint').onclick=saveSprint;$('capture').onclick=capture;$('refresh').onclick=loadItems;$('stateFilter').onchange=()=>{renderBacklog();renderSuggestions();void loadItems();};$('sprintPicker').onchange=switchSprint;
  ['sprintName','start','end','goal','status'].forEach(id=>{ $(id).addEventListener('input',()=>{updateDirty();renderGuidance();});$(id).addEventListener('change',()=>{updateDirty();renderGuidance();}); });$('search').oninput=handleSearch;
 
 // Provide consistent immediate visual response for all action buttons.
@@ -2104,8 +2452,9 @@ function renderCeremonies(){renderMeetingReferenceCalendar();const list=$('cerem
 $('saveCeremony').onclick=()=>void saveCeremony();$('clearCeremony').onclick=resetCeremony;
 // v0.5.0: Azure DevOps-backed reporting and editable auto-timeline.
 let reportProjectFilter='',reportPersonFilter='',timelineBusy=false,lastReportRefresh=0;
-const reportIsClosed=w=>workflowColumn(w)==='Closed';
-const reportIsDone=w=>workflowColumn(w)==='Done';
+// Reports use native terminal state, never a reversible Board placement.
+const reportIsClosed=w=>workflowNativeTerminal.get(workflowKey(w))?.has(String(w.state||'').trim().toLowerCase()) ?? (workflowColumn(w)==='Closed');
+const reportIsDone=w=>!reportIsClosed(w)&&workflowColumn(w)==='Done';
 const reportWork=()=>{const s=currentSprint();const all=new Map([...items,...assignedItems].map(w=>[Number(w.id),w]));return (s?.itemIds||[]).map(id=>all.get(Number(id))).filter(w=>w&&!isPlanningContextType(w)&&!isRemoved(w));};
 // Every report and PM warning uses the same resolution of assigned sprint IDs.
 function reportCoverage(){const s=currentSprint();const ids=[...new Set((s?.itemIds||[]).map(Number))];const resolved=new Map([...items,...assignedItems].map(w=>[Number(w.id),w]));const missing=ids.filter(id=>!resolved.has(id));const context=ids.filter(id=>resolved.has(id)&&isPlanningContextType(resolved.get(id)));const executable=ids.filter(id=>resolved.has(id)&&!isPlanningContextType(resolved.get(id))&&!isRemoved(resolved.get(id)));return {assigned:ids.length,missing,context,executable};}

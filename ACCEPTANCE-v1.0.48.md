@@ -1,0 +1,10 @@
+# Global Sprints v1.0.48 — Live acceptance checklist
+
+1. **Sprint 2 overview:** Compare Report Accepted/Closed, Done/Awaiting validation and Active/New to the Board's Closed, Done and active executable cards. If 0 accepted and 23 Done, confirm none has actually been moved into the Board Closed lane; native ADO Completed alone must not override a Done validation hold. Test moving one appropriately validated card to Closed, then refreshing; count should change exactly once and native ADO constraints must be respected.
+2. **Burndown:** With one observation date, verify no horizontal progress bar masquerades as a dated burndown; see explicit insufficient-history explanation. After real observations on a second calendar date, expect blue actual and dashed ideal line. Never expect fabricated past daily measurements.
+3. **Velocity:** Verify previous ended sprints from the same workspace appear in chronological order (max eight); current sprint is not the only bar. Previous sprints without observations must show missing-data gaps, not zeros. Compare actual historical points to each sprint's latest saved observation. If no past observations exist, expect an honest no-history state.
+4. **Work Packages:** Scroll to the bottom of Reports, below Gantt delivery overview. Search, parent/child expansion, links and estimate accounting should still work.
+5. **Daily observations:** Visit the selected sprint on two separate days without changes; confirm at least one saved observation each day and no duplicate same-state observations within a day. Existing first baseline must remain unchanged.
+6. **Non-regression:** Board Refresh green, @mentions, cross-sprint #910 additions, workflows across ADO processes, parent-child effort single-count, Outlook existing bookings and licensing startup remain unmodified.
+
+**Open unrelated gates:** TF400813 initial registry authentication recovery, live Outlook cancellation/attendee notices, workspace restoration, Product Command rejection semantics, native Windows build and final release audit.

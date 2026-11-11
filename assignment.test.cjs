@@ -26,5 +26,5 @@ assert(src.includes("put('System.AssignedTo',assignmentPatchValue(assignee.value
 assert(src.includes('selectedAssignee=null;assignee.value=fresh.assigneeIdentity'));
 assert(src.includes("const assignLabel=assignee.parentElement,assignContainer=el('div','gs-assignee-picker')"));
 console.log('PASS: picker selection, ADO PATCH wiring, successful-save reset and independent option buttons');
-assert(src.includes("const DIAG_VERSION='1.0.39'"));
+assert(src.includes("const DIAG_VERSION='"+JSON.parse(require('node:fs').readFileSync('extension.vsomanifest','utf8')).version+"'"));
 console.log('PASS: header/runtime version guard');

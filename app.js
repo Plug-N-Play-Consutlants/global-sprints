@@ -14,7 +14,15 @@ const ROOM_ENFORCE_PREVIEW=true; // Client UI gate only. Product Command remains
 function normalizeRoomResponse(raw){
  if(!raw||typeof raw!=='object'||!ALLOWED.has(raw.status)||typeof raw.allowed!=='boolean')throw Error('Unexpected licensing service response.');
  if(raw.allowed!==['licensed','trial_active'].includes(raw.status))throw Error('Inconsistent licensing decision.');
- return {status:raw.status,allowed:raw.allowed,startedAt:typeof raw.started_at==='string'?raw.started_at:null,expiresAt:typeof raw.expires_at==='string'?raw.expires_at:null};
+ const parseDate=(value,label)=>{
+  if(value===null||value===undefined||value==='')return null;
+  if(typeof value!=='string'||!Number.isFinite(Date.parse(value)))throw Error('Invalid licensing '+label+' date.');
+  return value;
+ };
+ const startedAt=parseDate(raw.started_at,'start'),expiresAt=parseDate(raw.expires_at,'expiry');
+ if(raw.status==='trial_active'&&!expiresAt)throw Error('Active trial requires a verified expiry date.');
+ // Paid entitlements without an explicit expiry retain the agreed outage-tolerant policy.
+ return {status:raw.status,allowed:raw.allowed,startedAt,expiresAt};
 }
 async function roomRequest({operation,organization,token,licenseKey,signal}){
  if(!['entitlement','trial','activate'].includes(operation))throw Error('Unsupported licensing operation.');
@@ -82,9 +90,10 @@ function roomRestoreVerified(){
   const saved=JSON.parse(raw);
   if(saved.schema!==1||saved.organizationId!==String(sdk.getHost().id).toLowerCase()||saved.organization!==roomOrganization().toLowerCase())return false;
   const result=normalizeCachedRoomDecision(saved.decision);
-  // A previously verified trial has a known end date; an outage must not extend it indefinitely.
-  if(result.status==='trial_active'&&result.expiresAt&&Date.parse(result.expiresAt)<=Date.now()){
-   roomStatus={...result,status:'trial_expired',allowed:false};
+  // Honour an explicit verified expiry (trial or paid) even when Product Command is offline.
+  // No arbitrary offline TTL for an unexpired paid entitlement; preserve outage tolerance.
+  if(result.expiresAt&&Date.parse(result.expiresAt)<=Date.now()){
+   roomStatus={...result,status:result.status==='trial_active'?'trial_expired':'expired',allowed:false};
   }else roomStatus=result;
   diagnostic('licensing.cache.restored',{status:roomStatus.status,allowed:roomStatus.allowed});
   return true;
@@ -98,7 +107,7 @@ function roomScheduleRetry(){
 function roomClearRetry(){if(roomRetryTimer){clearTimeout(roomRetryTimer);roomRetryTimer=null;}roomRetryDelay=ROOM_RETRY_MIN_MS;}
 function roomAccessAllowed(){
  if(!roomStatus?.allowed)return false;
- return !(roomStatus.status==='trial_active'&&roomStatus.expiresAt&&Date.parse(roomStatus.expiresAt)<=Date.now());
+ return !(roomStatus.expiresAt&&Date.parse(roomStatus.expiresAt)<=Date.now());
 }
 function roomReadableStatus(){
  if(!roomStatus)return 'Entitlement not checked';
@@ -169,7 +178,8 @@ async function checkRoom(operation='entitlement'){
   // Retain the last verified decision, if one exists.
   renderRoomStatus(`Licensing check failed: ${error.name==='AbortError'?'Request timed out.':error.message} ${roomStatus?'Last verified status: '+roomReadableStatus()+'. Service will retry automatically.':'No verified entitlement is available. Work areas remain restricted until verification succeeds.'}`);
   if(operation==='entitlement')roomScheduleRetry();
-  diagnostic('licensing.room.unavailable',{operation,status:error.status||'network',code:error.code||'unavailable'},'warn');
+  if(error.status===403)diagnostic('licensing.transport_denied',{operation:'license',status:403,errorCode:'licensing_transport_denied'},'error');
+  else diagnostic('licensing.room.unavailable',{operation:'license',status:Number(error.status)||0,errorCode:'unknown'},'warn');
  }finally{
   roomBusy=false;
   for(const id of ['licenseRoomCheck','licenseRoomTrial','licenseRoomActivate'])if($(id))$(id).disabled=false;
@@ -215,18 +225,15 @@ async function renameWorkspace(){const w=activeWorkspace();if(!w)return;
  const ok=await persist(r=>{r.workspaces.find(x=>x.id===w.id).name=name.trim();},false);
  if(ok){renderWorkspacePicker(w.id);notify('Workspace renamed.');}
 }
-async function archiveWorkspace(){const w=activeWorkspace();if(!w||w.id===DEFAULT_WORKSPACE_ID)return notify('The Default Workspace cannot be archived.',true);
- if(!confirm(`Archive workspace "${w.name}"? Its sprints and ceremonies will be preserved but hidden until restored.`))return;
- const ok=await persist(r=>{r.workspaces.find(x=>x.id===w.id).archived=true;},false);
- if(ok){activeWorkspaceId=DEFAULT_WORKSPACE_ID;renderWorkspacePicker();syncWorkspaceProjects();renderSprintPicker('');clearWorkspaceViews();rememberContext();notify('Workspace archived. Its data has been retained.');}
-}
+async function archiveWorkspace(){return gs40CloseWorkspace();}
+
 function clearWorkspaceViews(){items=[];assignedItems=[];ancestorItems=[];browserItems=[];browserSelection.clear();nearbyResults=[];++browserSequence;++assignedLoadSequence;renderBrowser();renderBacklog();renderBoard();renderSprintHealth();}
 async function switchWorkspace(){
  const destination=$('workspacePicker').value;
  $('workspacePicker').value=activeWorkspaceId;
  if(!(await guardSprint())||!(await guardProjects()))return;
  activeWorkspaceId=destination;renderWorkspacePicker(destination);syncWorkspaceProjects();
- const last=readContext().workspaceSprints?.[destination]||'';
+ const last=activeWorkspace()?.planningRequired?'':(readContext().workspaceSprints?.[destination]||'');
  renderSprintPicker(last);clearWorkspaceViews();rememberContext();await loadAssignedItems();notify('Workspace opened.');
 }
 function renderWorkspaceConfiguration(){
@@ -246,7 +253,7 @@ function showArchivedWorkspaces(){const archived=(registry.workspaces||[]).filte
  if(!archived.length)return notify('No archived workspaces.');
  const name=prompt('Restore archived workspace by entering its exact name:\n'+archived.map(w=>w.name).join('\n'));if(name===null)return;
  const match=archived.find(w=>w.name===name);if(!match)return notify('No matching archived workspace.',true);
- void persist(r=>{r.workspaces.find(w=>w.id===match.id).archived=false;},false).then(ok=>{if(ok){renderWorkspacePicker(activeWorkspaceId);notify('Workspace restored.');}});
+ void persist(r=>{const selected=r.workspaces.find(w=>w.id===match.id);selected.archived=false;selected.restoredAt=new Date().toISOString();selected.planningRequired=true;},false).then(ok=>{if(ok){activeWorkspaceId=match.id;renderWorkspacePicker(match.id);syncWorkspaceProjects();renderSprintPicker('');clearWorkspaceViews();rememberContext();notify('Workspace restored. Historical records remain; create a new sprint and schedule meetings again.');}});
 }
 
 let assignedItems=[];
@@ -287,7 +294,11 @@ function contextualMessage(target,message,error){
  status.textContent=message;status.classList.toggle('error',!!error);return true;
 }
 function notify(message,error=false){
- if(error)diagnostic('ui.operation_failed',{message},'error');
+ if(error){const targetId=String(lastActionTarget?.id||'');
+  const operation=/board|lane|card/i.test(targetId)?'transition':/refresh/i.test(targetId)?'refresh':/license|room/i.test(targetId)?'license':/queue|browse|package|sprint/i.test(targetId)?'membership':'update';
+  const errorCode=/concurrent|revision|precondition|\b412\b/i.test(message)?'revision_conflict':/401|authenticat|session/i.test(message)?'auth_required':/403|permission/i.test(message)?'permission_denied':/member|assigned.*sprint/i.test(message)?'membership_conflict':'unknown';
+  diagnostic('ui.operation_failed',{operation,errorCode},'error');
+ }
  // System messages remain in the global notification area. Action-specific failures
  // are displayed at the initiating component, without a competing page banner.
  if(error&&contextualMessage(lastActionTarget,message,true))return;
@@ -326,28 +337,40 @@ function organizationApiBase(){
   throw Error('Azure DevOps organization context is incomplete (no collection URL or name). Please report this message and the project URL.');
 }
 function serviceHttpError(service,status){
- const category=status===401?'Authentication required':status===403?'Permission denied':status===404?'Resource not found':status===409||status===412?'Concurrent change detected':status===429?'Request throttled':status>=500?'Service temporarily unavailable':'Request failed';
- return Error(`${service}: ${category} (HTTP ${Number(status)||0}). Check Extension Health or contact support if this persists.`);
+ const category=status===401?'Authentication required':status===403?'Permission denied':status===404?'Resource not found':status===409||status===412?'Precondition failed (possible stale work-item revision or transition rule)':status===429?'Request throttled':status>=500?'Service temporarily unavailable':'Request failed';
+ const error=Error(`${service}: ${category} (HTTP ${Number(status)||0}). Check Extension Health or contact support if this persists.`);
+ error.status=Number(status)||0;return error;
 }
 async function api(path,options={}){
- const started=Date.now(),method=options.method||'GET';
- const request=async accessToken=>fetch(`${organizationApiBase()}${path}`,{...options,headers:{Authorization:`Bearer ${accessToken}`,Accept:'application/json',...options.headers}});
- let response=await request(token);
- // A cached token may expire while the iframe remains open. Retry a read once with the
- // SDK-issued token; never retry writes or reinterpret a genuine permission denial.
- if(response.status===401&&method==='GET'){
-  const fresh=await sdk.getAccessToken();
-  if(fresh&&fresh!==token){token=fresh;response=await request(token);}
- }
- if(!response.ok){diagnostic('ado.api_failure',{status:response.status,method,durationMs:Date.now()-started},'error');throw serviceHttpError('Azure DevOps',response.status);}
- if(method!=='GET')diagnostic('ado.api_write',{status:response.status,method,durationMs:Date.now()-started});
- if(response.status===204)return null;
- const type=response.headers?.get('content-type')||'';
- if(!/\bjson\b|\+json\b/i.test(type)){
-  diagnostic('ado.api_non_json',{method,contentType:type.slice(0,90),path:path.split('?')[0]},'error');
-  throw Error('Azure DevOps returned a non-JSON response. The request may have been redirected or the session may need reauthorization.');
- }
- return response.json();
+ const started=Date.now(),method=String(options.method||'GET').toUpperCase();
+ // WIQL and workitemsbatch use POST but only read. Safe to refresh token and retry a failed read.
+ const readOnly=method==='GET'||options.readOnly===true||/\/_apis\/wit\/(workitemsbatch|wiql)(?:[/?]|$)/i.test(path);
+ const isWrite=!readOnly;
+ const {readOnly:ignoredReadOnly,...fetchOptions}=options;
+ const request=async accessToken=>fetch(`${organizationApiBase()}${path}`,{...fetchOptions,headers:{Authorization:`Bearer ${accessToken}`,Accept:'application/json',...fetchOptions.headers}});
+ if(isWrite)GS44Session.beginWrite();
+ try{
+  let response=await request(token);
+  // ADO access tokens can expire while an extension iframe remains mounted. Only
+  // GETs are retried after SDK renewal; writes are never automatically replayed.
+  if(response.status===401&&readOnly){
+   const fresh=await sdk.getAccessToken();
+   if(fresh){token=fresh;response=await request(token);}
+  }
+  if(!response.ok){diagnostic('ado.api_failure',{status:response.status,method,durationMs:Date.now()-started},'error');
+   if(response.status===401||response.status===203)GS44Session.markAuthenticationFailure(response.status);
+   throw serviceHttpError('Azure DevOps',response.status);
+  }
+  diagnostic(isWrite?'ado.api_write':'ado.api_read',{status:response.status,method,durationMs:Date.now()-started,readOnly});
+  if(response.status===204)return null;
+  const type=response.headers?.get('content-type')||'';
+  if(!/\bjson\b|\+json\b/i.test(type)){
+   diagnostic('ado.api_non_json',{method,status:response.status,contentType:type.slice(0,90),path:path.split('?')[0]},'error');
+   if(response.status===203||/html/i.test(type))GS44Session.markAuthenticationFailure(response.status);
+   throw Error('Azure DevOps returned a non-JSON response. The host session may need refreshing; unsaved card edits will be preserved.');
+  }
+  return response.json();
+ }finally{if(isWrite)GS44Session.endWrite();}
 }
 
 // Azure DevOps identity/Graph APIs are served by vssps.dev.azure.com, NOT dev.azure.com.
@@ -358,7 +381,8 @@ const mentionCache=new Map();
 function normalizedMentionIdentity(entry){
  const e=entry?.identity||entry;
  if(!e||typeof e!=='object')return null;
- const id=[e.id,e.entityId,e.storageKey].map(x=>String(x||'').trim()).find(x=>MENTION_ID_RE.test(x));
+ // A host people-picker entityId may be a directory identifier, not an ADO VSID.
+ const id=[e.id,e.storageKey].map(x=>String(x||'').trim()).find(x=>MENTION_ID_RE.test(x));
  if(!id)return null;
  const name=String(e.displayName||e.providerDisplayName||e.customDisplayName||e.name||e.properties?.DisplayName?.$value||'').trim();
  if(!name)return null;
@@ -385,18 +409,23 @@ function identityApiBase(){
  return `https://vssps.dev.azure.com/${encodeURIComponent(decodeURIComponent(name))}`;
 }
 async function identityApi(path,options={}){
- const method=options.method||'GET';
- const request=accessToken=>fetch(identityApiBase()+path,{...options,headers:{Authorization:`Bearer ${accessToken}`,Accept:'application/json',...options.headers}});
+ const method=String(options.method||'GET').toUpperCase();
+ const {readOnly,...fetchOptions}=options;
+ const request=accessToken=>fetch(identityApiBase()+path,{...fetchOptions,headers:{Authorization:`Bearer ${accessToken}`,Accept:'application/json',...fetchOptions.headers}});
  let response=await request(token);
- if(response.status===401&&method==='GET'){
+ if(response.status===401&&(method==='GET'||readOnly)){
   const renewed=await sdk.getAccessToken();
   if(renewed&&renewed!==token){token=renewed;response=await request(token);}
  }
- if(!response.ok)throw serviceHttpError('Azure DevOps identity service',response.status);
+ if(!response.ok){if(response.status===401||response.status===203)GS44Session.markAuthenticationFailure(response.status);throw serviceHttpError('Azure DevOps identity service',response.status);}
  const type=response.headers?.get('content-type')||'';
- if(!/\bjson\b|\+json\b/i.test(type))throw Error('Identity service returned a non-JSON response');
+ if(!/\bjson\b|\+json\b/i.test(type)){
+  if(response.status===203||/html/i.test(type))GS44Session.markAuthenticationFailure(response.status);
+  throw Error('Identity service returned a non-JSON response. Reload Global Sprints if the session has expired.');
+ }
  return response.json();
 }
+
 function uniqueMentionCandidates(candidates){
  const byId=new Map();for(const entry of candidates){const item=normalizedMentionIdentity(entry);if(item&&!byId.has(item.id))byId.set(item.id,item);}return [...byId.values()];
 }
@@ -405,7 +434,7 @@ async function searchMentionIdentities(term){
  const key=query.toLowerCase(),cached=mentionCache.get(key);
  if(cached&&Date.now()-cached.at<120000)return cached.users;
  const matching=entries=>uniqueMentionCandidates(entries).filter(x=>(x.name+' '+x.email).toLowerCase().includes(key)).slice(0,15);
- const finish=users=>{mentionCache.set(key,{at:Date.now(),users});return users;};
+ const finish=users=>{if(users.length)mentionCache.set(key,{at:Date.now(),users});else mentionCache.delete(key);return users;};
  // Work item assignees are already authenticated IdentityRef records from ADO,
  // so common project team members resolve immediately even if vssps is blocked.
  const local=matching(knownMentionIdentities(query));
@@ -438,7 +467,7 @@ async function searchMentionIdentities(term){
  // Graph query results provide descriptors, which must be resolved to VSIDs.
  try{
   const result=await identityApi('/_apis/graph/subjectquery?api-version=7.1-preview.1',{
-   method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query,subjectKind:['User']})});
+   method:'POST',readOnly:true,headers:{'Content-Type':'application/json'},body:JSON.stringify({query,subjectKind:['User']})});
   const users=(Array.isArray(result)?result:Array.isArray(result?.value)?result.value:[])
    .filter(x=>String(x?.subjectKind||'user').toLowerCase()==='user').slice(0,12);
   const converted=await Promise.all(users.map(async user=>{
@@ -468,7 +497,7 @@ function restoreContext(){
  for(const [id,key] of [['boardMode','boardMode'],['boardDensity','boardDensity'],['project','project'],['browseProject','browseProject'],['browseMode','browseMode']]){
   if(saved[key]&&[...$(id).options].some(o=>o.value===saved[key]))$(id).value=saved[key];
  }
- return workspaceSprints().some(s=>s.id===(saved.workspaceSprints?.[activeWorkspaceId]||saved.sprint))?(saved.workspaceSprints?.[activeWorkspaceId]||saved.sprint):'';
+ return activeWorkspace()?.planningRequired?'':workspaceSprints().some(s=>s.id===(saved.workspaceSprints?.[activeWorkspaceId]||saved.sprint))?(saved.workspaceSprints?.[activeWorkspaceId]||saved.sprint):'';
 }
 function populateBrowseProjects(){
  const select=$('browseProject'),old=select.value;
@@ -510,7 +539,7 @@ async function browseBacklog(){
    }
   }
   if(sequence!==browserSequence)return;
-  browserItems=found;renderBrowser();renderSuggestions();
+  browserItems=await gs40EnrichBrowseParents(found,sequence);if(sequence!==browserSequence)return;renderBrowser();renderSuggestions();
   browseNotice(`Showing ${found.length} recently changed work items from ${project}${(result.workItems||[]).length>=MAX_ITEMS?' (first 200; refine using search for older items)':''}. Add and Remove save immediately.`);
  }catch(e){browseNotice('Unable to browse backlog: '+e.message,true);}
  finally{browserBusy=false;$('browseLoad').disabled=false;}
@@ -530,15 +559,25 @@ function renderBrowser(){
  }
  const makeEntry=item=>{
   const row=document.createElement('div');row.className='browse-entry';
-  const checkbox=document.createElement('input');checkbox.type='checkbox';checkbox.className='browse-select';checkbox.setAttribute('aria-label',`Select work item ${item.id}`);checkbox.checked=browserSelection.has(item.id);checkbox.disabled=!sprint||bulkBusy;checkbox.onchange=()=>{if(checkbox.checked)browserSelection.add(item.id);else browserSelection.delete(item.id);updateBulkToolbar();};
+  const checkbox=document.createElement('input');checkbox.type='checkbox';checkbox.className='browse-select';checkbox.setAttribute('aria-label',`Select work item ${item.id}`);checkbox.checked=browserSelection.has(item.id);checkbox.disabled=!sprint||bulkBusy;checkbox.onchange=()=>{if(!GS40Core.isTask(item)){checkbox.checked=false;void gs41OpenPackagePreview(item.id);return;}if(checkbox.checked)browserSelection.add(item.id);else browserSelection.delete(item.id);updateBulkToolbar();};
   const title=document.createElement('span');title.className='browse-title';
   const a=document.createElement('a');a.textContent=`#${item.id}`;a.href=item.url||`${organizationApiBase()}/${encodeURIComponent(item.project)}/_workitems/edit/${item.id}`;a.target='_blank';a.rel='noopener noreferrer';
   title.append(a,document.createTextNode(` ${item.title} `));
   const meta=document.createElement('span');meta.className='muted';meta.textContent=`${item.type} · ${item.state}`;
   const btn=document.createElement('button');btn.className='secondary';
-  const included=!!sprint?.itemIds.includes(item.id);btn.textContent=included?'Already on sprint':browserSelection.has(item.id)?'Remove from queue':'Queue now';btn.disabled=!sprint||included;
-  btn.onclick=()=>{if(browserSelection.has(item.id))browserSelection.delete(item.id);else browserSelection.add(item.id);renderBrowser();renderBacklog();};
-  row.append(checkbox,title,meta,btn);return row;
+  const included=!!sprint?.itemIds.includes(item.id);btn.textContent=GS40Core.isTask(item)?(included?'Already on sprint':browserSelection.has(item.id)?'Remove from queue':'Queue task'):(included?'Review story + children':'Preview story + children');btn.disabled=!sprint||(included&&GS40Core.isTask(item));
+  btn.onclick=()=>{if(!GS40Core.isTask(item))return void gs41OpenPackagePreview(item.id);if(browserSelection.has(item.id))browserSelection.delete(item.id);else browserSelection.add(item.id);renderBrowser();renderBacklog();};
+  row.append(checkbox,title,meta,btn);
+  if(!GS40Core.isTask(item)){
+   const group=document.createElement('button');group.type='button';group.className='secondary';
+   const visibleChildren=browserItems.filter(x=>Number(x.parentId)===Number(item.id)).length;
+   group.textContent=visibleChildren?`View ${visibleChildren}+ related items`:'View related items';
+   group.title='Resolve actual Azure DevOps child links, then add this work item and eligible descendants in one operation';
+   group.disabled=!sprint||bulkBusy;
+   group.onclick=()=>void gs40AddWorkPackage(item.id);
+   row.append(group);
+  }
+  return row;
  };
  const build=(item,depth,seen)=>{
   if(seen.has(item.id)||depth>25)return document.createTextNode('');
@@ -566,7 +605,7 @@ function updateBulkToolbar(){
 function renderQueuedList(){
  const host=document.getElementById('gs-queued-list');if(!host)return;host.replaceChildren();
  const all=new Map([...items,...browserItems,...nearbyResults,...assignedItems].map(w=>[Number(w.id),w]));
- for(const id of browserSelection){const row=document.createElement('div');row.className='row';const item=all.get(Number(id));const label=document.createElement('span');label.textContent='#'+id+(item?' · '+item.title:'');const add=document.createElement('button');add.type='button';add.textContent='Add to board';add.disabled=bulkBusy;add.onclick=()=>bulkAssign(true,[id]);const remove=document.createElement('button');remove.type='button';remove.className='secondary';remove.textContent='Remove from queue';remove.onclick=()=>{browserSelection.delete(id);renderBrowser();renderBacklog();};row.append(label,add,remove);host.append(row);}
+ for(const id of browserSelection){const row=document.createElement('div');row.className='row';const item=all.get(Number(id));const label=document.createElement('span');label.textContent='#'+id+(item?' · '+item.title:'');const add=document.createElement('button');add.type='button';add.textContent='Add to board';add.disabled=bulkBusy;add.onclick=()=>item&&!GS40Core.isTask(item)?void gs41OpenPackagePreview(item.id):bulkAssign(true,[id]);const remove=document.createElement('button');remove.type='button';remove.className='secondary';remove.textContent='Remove from queue';remove.onclick=()=>{browserSelection.delete(id);renderBrowser();renderBacklog();};row.append(label,add,remove);host.append(row);}
 }
 async function bulkAssign(add,onlyIds=null){
  if(bulkBusy||!browserSelection.size)return;
@@ -621,7 +660,7 @@ async function init(){try{
   contextKey='pnpc-gs-ui:'+encodeURIComponent(organizationApiBase())+':'+encodeURIComponent(sdk.getUser?.()?.id||'anonymous');
   const savedContext=readContext();const savedWorkspace=savedContext.workspace;
   contextHydrating=true;
-  try{renderWorkspacePicker(savedWorkspace);syncWorkspaceProjects();renderWorkspaceConfiguration();populateBrowseProjects();const lastSprint=restoreContext();renderSprintPicker(lastSprint);syncPlanScope();renderWorkspaceSchedules();renderDeletionAudit();renderBoard();renderHistory();}
+  try{renderWorkspacePicker(savedWorkspace);syncWorkspaceProjects();renderWorkspaceConfiguration();populateBrowseProjects();const lastSprint=restoreContext();renderSprintPicker(lastSprint);syncPlanScope();renderWorkspaceSchedules();renderDeletionAudit();renderBoard();renderHistory();gs40ReadRetro();}
   finally{contextHydrating=false;}
   // One initial application, after all declarations and workspace/sprint context are ready.
   // A deliberate user navigation during an asynchronous startup always wins.
@@ -679,9 +718,9 @@ async function saveProjectPreferences(){
 }
 function renderSprintPicker(preferred){const p=$('sprintPicker');const selected=preferred||p.value;p.replaceChildren(new Option('Select a sprint',''));workspaceSprints().forEach(s=>p.add(new Option(s.name,s.id)));p.value=workspaceSprints().some(s=>s.id===selected)?selected:'';activeSprintId=p.value;renderSprintFields();if($('planScope'))syncPlanScope();rememberContext();}
 function renderSprintFields(){const s=registry.sprints.find(x=>x.id===$('sprintPicker').value);$('sprintName').value=s?.name||'';$('start').value=s?.start||'';$('end').value=s?.end||'';$('goal').value=s?.goal||'';$('status').value=s?.status||'Planning';savedSprintForm=sprintForm();updateDirty();renderGuidance();renderBacklog();renderBrowser();renderBoard();renderHistory();renderCeremonies();renderWorkspaceSchedules();renderSprintHealth();renderPmAssistance();renderDeletionAudit();renderBoardDrafts();}
-async function persist(change,render=true,announce=true){
- if(busy){notify('An operation is already in progress. Please wait.',true);return false;}
- busy=true;notify('Saving changes…');
+async function persist(change,render=true,announce=true,localFeedback=null){
+ if(busy){if(localFeedback)localFeedback('An operation is already in progress. Please wait.',true);else notify('An operation is already in progress. Please wait.',true);return false;}
+ busy=true;if(localFeedback)localFeedback('Saving changes…');else notify('Saving changes…');
  try{
   // Reject stale edits rather than silently replacing another user's registry changes.
   // The extension-data service ETag on setDocument provides the final atomic check.
@@ -706,8 +745,8 @@ async function persist(change,render=true,announce=true){
   const saved=await storage.setDocument(COLLECTION,next);registry=saved;
  if(render)renderSprintPicker($('sprintPicker').value);
  if(announce)notify('Changes saved successfully.');return true;
- }catch(e){notify('Save failed: '+e.message+' Reload before retrying if another user changed this record.',true);return false;}
- finally{busy=false;}
+ }catch(e){const message='Save failed: '+e.message+' Reload before retrying if another user changed this record.';if(localFeedback){diagnostic('ui.operation_failed',{message},'error');localFeedback(message,true);}else notify(message,true);return false;}
+ finally{busy=false;if(typeof GS44Session!=='undefined')GS44Session.resumeDeferred();}
 }
 async function newSprint(){openNewSprintDialog();}
 async function saveSprint(){
@@ -789,7 +828,7 @@ function searchCandidates(){
  if(!query)return [];
  const digits=/^#?(\d+)$/.exec(query)?.[1];
  const all=new Map([...items,...browserItems,...nearbyResults].map(w=>[w.id,w]));const committed=new Set((currentSprint()?.itemIds||[]).map(Number));
- return [...all.values()].filter(w=>!committed.has(Number(w.id))&&($('stateFilter').value==='all'||isAvailableForPlanning(w))).map(w=>{
+ return [...all.values()].filter(w=>(!committed.has(Number(w.id))||!GS40Core.isTask(w))&&($('stateFilter').value==='all'||isAvailableForPlanning(w))).map(w=>{
   const title=w.title.toLowerCase(), id=String(w.id);
   const exact=id===digits?0:title===query?1:title.startsWith(query)?2:title.includes(query)?3:id.includes(query)?4:10;
   const distance=digits?Math.abs(w.id-Number(digits)):0;
@@ -802,9 +841,17 @@ function renderSuggestions(){
  const matches=searchCandidates();
  for(const w of matches){
   const b=document.createElement('button');b.type='button';b.setAttribute('role','option');
-  const main=document.createElement('span');main.textContent=`#${w.id} · ${w.title}`;
-  const sub=document.createElement('span');sub.className='muted';sub.textContent=`${w.project} · ${w.state}`;
-  b.append(main,sub);b.disabled=!currentSprint()||currentSprint().itemIds.includes(w.id)||browserSelection.has(w.id);b.title=browserSelection.has(w.id)?'Already queued':`Queue #${w.id} immediately`;b.onclick=()=>{if(!currentSprint()||currentSprint().itemIds.includes(w.id)||browserSelection.has(w.id))return;if(!items.some(x=>x.id===w.id))items.push(w);browserSelection.add(w.id);renderBacklog();renderBrowser();renderSuggestions();updateBulkToolbar();};target.append(b);
+  const main=document.createElement('span');const parent=[...browserItems,...items,...assignedItems].find(x=>Number(x.id)===Number(w.parentId));main.textContent=`${parent?'↳ ':''}#${w.id} · ${w.title}${parent?' (under #'+parent.id+')':''}`;if(parent)main.style.paddingLeft='14px';
+  const sub=document.createElement('span');sub.className='muted';sub.textContent=`${w.type||'Work Item'} · ${w.project} · ${w.state}`;
+  b.append(main,sub);b.disabled=!currentSprint()||(GS40Core.isTask(w)&&(currentSprint().itemIds.includes(w.id)||browserSelection.has(w.id)));b.title=GS40Core.isTask(w)?'Queue this task':`Preview #${w.id} and its Azure DevOps child work before adding`; b.onclick=()=>{if(!currentSprint()||(currentSprint().itemIds.includes(w.id)&&GS40Core.isTask(w)))return;if(!GS40Core.isTask(w))return void gs41OpenPackagePreview(w.id);if(browserSelection.has(w.id))return;if(!items.some(x=>x.id===w.id))items.push(w);browserSelection.add(w.id);renderBacklog();renderBrowser();renderSuggestions();updateBulkToolbar();};target.append(b);
+  if(!GS40Core.isTask(w)){
+   const add=document.createElement('button');add.type='button';add.className='secondary';
+   add.textContent='Preview work package';add.disabled=!currentSprint();
+   add.title='Add work package directly to the sprint; fetch associated children from Azure DevOps';
+   add.onclick=()=>void gs40AddWorkPackage(w.id);
+   target.append(add);
+  }
+
  }
  if(!matches.length){const hint=document.createElement('div');hint.className='hint';hint.textContent='No matches yet. Load work items or try another term.';target.append(hint);}
  target.classList.remove('hidden');$('search').setAttribute('aria-expanded','true');
@@ -825,7 +872,38 @@ function handleSearch(){
  clearTimeout(searchTimer);searchSequence++;nearbyResults=[];renderBacklog();renderSuggestions();
  if(/^#?\d{2,8}$/.test($('search').value.trim()))searchTimer=setTimeout(()=>lookupNearbyIds($('search').value),350);
 }
-function renderBacklog(){const body=$('backlog');body.replaceChildren();const q=$('search').value.toLowerCase().replace(/^#/,'');const s=registry?.sprints.find(x=>x.id===$('sprintPicker').value);for(const w of items.filter(x=>($('stateFilter').value==='all'||isAvailableForPlanning(x))&&`${x.id} ${x.title} ${x.project} ${x.assignee}`.toLowerCase().includes(q))){const tr=document.createElement('tr');tr.innerHTML=`<td><a href="${escapeHtml(w.url)}" target="_blank" rel="noopener noreferrer">#${w.id}</a> ${escapeHtml(w.title)}</td><td>${escapeHtml(w.project)}</td><td>${escapeHtml(w.assignee)}</td><td>${escapeHtml(w.state)}</td><td></td>`;const b=document.createElement('button');b.className='secondary';const included=!!s?.itemIds.includes(w.id);b.textContent=included?'Already added':browserSelection.has(w.id)?'Remove from queue':'Queue now';b.disabled=!s||included;b.onclick=()=>{if(browserSelection.has(w.id))browserSelection.delete(w.id);else browserSelection.add(w.id);renderBacklog();renderBrowser();updateBulkToolbar();};tr.lastElementChild.append(b);body.append(tr);}if(!body.children.length){const tr=document.createElement('tr');tr.innerHTML='<td colspan="5">No matching loaded work items.</td>';body.append(tr);}updateBulkToolbar();}
+function renderBacklog(){
+ const body=$('backlog');body.replaceChildren();const q=$('search').value.toLowerCase().replace(/^#/,'');
+ const sprint=currentSprint();const candidates=items.filter(x=>($('stateFilter').value==='all'||isAvailableForPlanning(x))&&`${x.id} ${x.title} ${x.project} ${x.assignee}`.toLowerCase().includes(q));
+ const ids=new Map(items.map(w=>[Number(w.id),w]));
+ candidates.sort((a,b)=>{
+  const ap=ids.has(Number(a.parentId))?Number(a.parentId):Number(a.id),bp=ids.has(Number(b.parentId))?Number(b.parentId):Number(b.id);
+  return a.project.localeCompare(b.project)||ap-bp||(a.parentId?1:0)-(b.parentId?1:0)||a.id-b.id;
+ });
+ for(const w of candidates){
+  const tr=document.createElement('tr');
+  const title=document.createElement('td');
+  const parent=ids.get(Number(w.parentId));
+  if(parent){title.className='gs41-backlog-child';const marker=document.createElement('span');marker.textContent='↳ ';marker.title='Child of #'+parent.id;title.append(marker);}
+  const link=document.createElement('a');link.href=w.url||`${organizationApiBase()}/${encodeURIComponent(w.project)}/_workitems/edit/${w.id}`;
+  link.target='_blank';link.rel='noopener noreferrer';link.textContent='#'+w.id;
+  title.append(link,document.createTextNode(' '+w.title));
+  for(const content of [title,w.project,w.assignee,w.state]){const td=typeof content==='string'?document.createElement('td'):content;if(typeof content==='string')td.textContent=content;tr.append(td);}
+  const actions=document.createElement('td');
+  const included=!!sprint?.itemIds.some(id=>Number(id)===Number(w.id));
+  const button=document.createElement('button');button.className='secondary';button.type='button';
+  button.textContent=GS40Core.isTask(w)?(included?'Already on sprint':browserSelection.has(w.id)?'Remove from queue':'Queue task'):(included?'Review story + children':'Preview story + children');
+  button.disabled=!sprint||(included&&GS40Core.isTask(w));
+  button.onclick=()=>{
+   if(!GS40Core.isTask(w))return void gs41OpenPackagePreview(w.id);
+   if(browserSelection.has(w.id))browserSelection.delete(w.id);else browserSelection.add(w.id);
+   renderBacklog();renderBrowser();updateBulkToolbar();
+  };
+  actions.append(button);tr.append(actions);body.append(tr);
+ }
+ if(!body.children.length){const tr=document.createElement('tr');tr.innerHTML='<td colspan="5">No matching loaded work items.</td>';body.append(tr);}
+ updateBulkToolbar();
+}
 async function toggleItem(id){let s;try{s=requireSprint();}catch(e){return notify(e.message,true);}if(!(await guardSprint()))return;const wasIncluded=s.itemIds.includes(id);const ok=await persist(r=>{const t=r.sprints.find(x=>x.id===s.id);t.itemIds=t.itemIds.includes(id)?t.itemIds.filter(x=>x!==id):[...t.itemIds,id];});if(ok){await loadAssignedItems();renderBrowser();renderBacklog();renderSuggestions();if(!wasIncluded&&/^#?\d+$/.test($('search').value.trim()))void lookupNearbyIds(String(id));notify(`Work item #${id} ${wasIncluded?'removed from':'added to'} the sprint.`);}}
 async function loadAssignedItems(){
  const seq=++assignedLoadSequence;
@@ -896,7 +974,7 @@ async function enrichHierarchy(found,sequence){
  ancestorItems=contextual;
 }
 
-function normalizeItem(x){const f=x.fields||{};return {id:x.id,rev:x.rev,project:f['System.TeamProject'],title:f['System.Title']||'',state:f['System.State']||'',type:f['System.WorkItemType']||'',assignee:f['System.AssignedTo']?.displayName||'Unassigned',assigneeIdentity:f['System.AssignedTo']?.uniqueName||'',assigneeId:f['System.AssignedTo']?.id||'',assigneeEmail:f['System.AssignedTo']?.uniqueName||'',priority:f['Microsoft.VSTS.Common.Priority']??null,effort:f['Microsoft.VSTS.Scheduling.StoryPoints']??f['Microsoft.VSTS.Scheduling.Effort']??null,storyPoints:f['Microsoft.VSTS.Scheduling.StoryPoints']??null,effortField:f['Microsoft.VSTS.Scheduling.StoryPoints']!==undefined?'Microsoft.VSTS.Scheduling.StoryPoints':f['Microsoft.VSTS.Scheduling.Effort']!==undefined?'Microsoft.VSTS.Scheduling.Effort':null,startDate:String(f['Microsoft.VSTS.Scheduling.StartDate']||'').slice(0,10),targetDate:String(f['Microsoft.VSTS.Scheduling.TargetDate']||'').slice(0,10),dueDate:String(f['Microsoft.VSTS.Scheduling.DueDate']||'').slice(0,10),description:f['System.Description']||'',acceptanceCriteria:f['Microsoft.VSTS.Common.AcceptanceCriteria']??null,changedDate:f['System.ChangedDate']||'',url:x._links?.html?.href||''};}
+function normalizeItem(x){const f=x.fields||{};return {id:x.id,rev:x.rev,project:f['System.TeamProject'],title:f['System.Title']||'',state:f['System.State']||'',type:f['System.WorkItemType']||'',assignee:f['System.AssignedTo']?.displayName||'Unassigned',assigneeIdentity:f['System.AssignedTo']?.uniqueName||'',assigneeId:f['System.AssignedTo']?.id||'',assigneeEmail:f['System.AssignedTo']?.uniqueName||'',priority:f['Microsoft.VSTS.Common.Priority']??null,effort:f['Microsoft.VSTS.Scheduling.StoryPoints']??f['Microsoft.VSTS.Scheduling.Effort']??null,storyPoints:f['Microsoft.VSTS.Scheduling.StoryPoints']??null,effortField:f['Microsoft.VSTS.Scheduling.StoryPoints']!==undefined?'Microsoft.VSTS.Scheduling.StoryPoints':f['Microsoft.VSTS.Scheduling.Effort']!==undefined?'Microsoft.VSTS.Scheduling.Effort':null,startDate:String(f['Microsoft.VSTS.Scheduling.StartDate']||'').slice(0,10),targetDate:String(f['Microsoft.VSTS.Scheduling.TargetDate']||'').slice(0,10),dueDate:String(f['Microsoft.VSTS.Scheduling.DueDate']||'').slice(0,10),description:f['System.Description']||'',acceptanceCriteria:f['Microsoft.VSTS.Common.AcceptanceCriteria']??null,changedDate:f['System.ChangedDate']||'',iterationPath:f['System.IterationPath']||'',remainingWork:f['Microsoft.VSTS.Scheduling.RemainingWork']??null,originalEstimate:f['Microsoft.VSTS.Scheduling.OriginalEstimate']??null,completedWork:f['Microsoft.VSTS.Scheduling.CompletedWork']??null,url:x._links?.html?.href||''};}
 function currentSprint(){return registry?.sprints.find(x=>x.id===$('sprintPicker').value);}
 // Planning drafts are workspace-owned snapshots of Global Sprints coordination only.
 // They never write work item states or iteration paths back to Azure DevOps.
@@ -973,12 +1051,12 @@ const LANE_PRESETS={'Backlog / Planned':'To Do','Ready to Start':'To Do','Active
 const LANE_CATEGORIES=['To Do','In Progress','Done','Closed'];
 let diagnosticEvents=[];const DIAG_KEY='pnpc-global-sprints-diagnostics-v2';
 const DIAG_LIMIT=600;
-const DIAG_VERSION='1.0.39';
+const DIAG_VERSION='1.0.49';
 let diagnosticSessionId='';
 // Production diagnostic payloads are deliberately numeric/boolean or finite enums.
 // Free-form strings (including messages and exception text) must never be exported.
-const DIAGNOSTIC_SAFE_FIELDS=new Set(['status','method','durationMs','assigned','unavailable','loaded','missing','count','checkCount','failed','warnings','version','projectCount','itemCount','snapshotCount','success','connected','enabled','state','errorCode','operation','attempt','retryable','conflict','recordCount']);
-const DIAGNOSTIC_ENUMS={method:new Set(['GET','POST','PUT','PATCH','DELETE']),state:new Set(['connected','disconnected','pending','active','inactive','expired','unknown']),errorCode:new Set(['storage_unavailable','registry_conflict','graph_failed','graph_uncertain','validation_failed','unknown']),operation:new Set(['load','save','create','update','cancel','reconcile','delete','render','restore'])};
+const DIAGNOSTIC_SAFE_FIELDS=new Set(['status','method','durationMs','assigned','unavailable','loaded','missing','count','checkCount','failed','warnings','version','projectCount','itemCount','snapshotCount','success','connected','enabled','state','errorCode','operation','attempt','retryable','conflict','recordCount','itemId','otherSprintCount','currentRevision','expectedRevision','readOnly','changed','deferred']);
+const DIAGNOSTIC_ENUMS={method:new Set(['GET','POST','PUT','PATCH','DELETE']),state:new Set(['connected','disconnected','pending','active','inactive','expired','unknown']),errorCode:new Set(['storage_unavailable','registry_conflict','graph_failed','graph_uncertain','validation_failed','revision_conflict','auth_required','permission_denied','licensing_transport_denied','refresh_failed','membership_conflict','unknown']),operation:new Set(['load','save','create','update','cancel','reconcile','delete','render','restore','refresh','transition','license','membership','comment'])};
 function safeDiagnosticDetails(details){
  const out={};
  for(const [key,value] of Object.entries(details||{})){
@@ -1462,7 +1540,18 @@ function stateCandidates(w,column,states){
 async function validateStateTransition(w,next){
  if(String(w.state||'').toLowerCase()===String(next).toLowerCase())return true;
  const patch=[{op:'test',path:'/rev',value:w.rev},{op:'add',path:'/fields/System.State',value:next}];
- await api(`/_apis/wit/workitems/${w.id}?validateOnly=true&api-version=7.1`,{method:'PATCH',headers:{'Content-Type':'application/json-patch+json'},body:JSON.stringify(patch)});
+ try{await api(`/_apis/wit/workitems/${w.id}?validateOnly=true&api-version=7.1`,{method:'PATCH',headers:{'Content-Type':'application/json-patch+json'},body:JSON.stringify(patch)});}
+ catch(error){
+  if(error.status===412||error.status===409){
+   let latest=null;try{latest=await api(`/_apis/wit/workitems/${w.id}?fields=System.State&api-version=7.1`);}catch{}
+   if(latest&&Number(latest.rev)!==Number(w.rev)){
+    diagnostic('ado.workflow.revision_conflict',{operation:'transition',itemId:Number(w.id),expectedRevision:Number(w.rev),currentRevision:Number(latest.rev),status:error.status,errorCode:'revision_conflict'},'warn');
+    const stale=Error(`Work item #${w.id} changed in Azure DevOps (revision ${w.rev} → ${latest.rev}). Refresh Board, review the current state, and retry your action. No changes were saved.`);stale.code='revision_conflict';stale.status=error.status;throw stale;
+   }
+   diagnostic('ado.workflow.validation_failed',{operation:'transition',itemId:Number(w.id),status:error.status,errorCode:'validation_failed'},'warn');
+  }
+  throw error;
+ }
  return true;
 }
 async function destinationState(w,column){
@@ -1483,8 +1572,9 @@ async function destinationState(w,column){
     diagnostic('ado.workflow.transition_resolved',{workItemId:w.id,project:w.project,workItemType:w.type,fromState:w.state,toState:candidate,column,category:workflowStateDetails.get(workflowKey(w))?.get(candidate.toLowerCase())?.category||'unknown'});
     return candidate;
    }catch(error){
+    if(error.code==='revision_conflict'||error.status===401||error.status===403)throw error;
     const reason=String(error?.message||error).slice(0,160);rejected.push(`${candidate}: ${reason}`);
-    diagnostic('ado.workflow.transition_validation_rejected',{workItemId:w.id,project:w.project,workItemType:w.type,fromState:w.state,toState:candidate,column,reason},'warn');
+    diagnostic('ado.workflow.transition_validation_rejected',{itemId:Number(w.id),operation:'transition',status:Number(error.status)||0,errorCode:'validation_failed'},'warn');
    }
   }
   return null;
@@ -1500,7 +1590,7 @@ async function destinationState(w,column){
    candidates=stateCandidates(w,column,states);
    const refreshed=await validateCandidates(candidates);if(refreshed)return refreshed;
   }
- }catch(e){rejected.push(`Refreshing workflow metadata: ${String(e.message||e).slice(0,100)}`);}
+ }catch(e){if(e.code==='revision_conflict'||e.status===401||e.status===403)throw e;rejected.push(`Refreshing workflow metadata: ${String(e.message||e).slice(0,100)}`);}
  throw Error(`Azure DevOps rejected every ${column} transition for #${w.id} (${w.project} / ${w.type}). ${rejected.join(' | ').slice(0,550)}. No work-item state or Board placement was changed.`);
 }
 // Assignment uses verified identity choices, not an ambiguous display-name string.
@@ -1577,47 +1667,84 @@ async function openBoardItemDetail(w){
  const mentionResults=el('div','gs-mention-results');mentionResults.setAttribute('role','listbox');mentionResults.setAttribute('aria-label','Mention people');
  const mentionHelp=el('small','gs-ticket-help','Type @ followed by a name, then select a matching Azure DevOps identity.');
  comments.append(history,comment,mentionHelp,mentionResults,send);dialog.append(comments);
- const mentions=new Map();let mentionQuerySeq=0;
- const escHtml=v=>String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
- const activeMention=()=>{const left=comment.value.slice(0,comment.selectionStart);const match=left.match(/(?:^|\s)@([^@\n]{1,60})$/);return match?{name:match[1],start:left.length-match[0].length+(match[0].startsWith('@')?0:1),end:left.length}:null;};
+ const mentions=new Map();let mentionQuerySeq=0,mentionSearchTimer=null;
+ const escHtml=v=>String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');
+ const activeMention=()=>GS45Mentions.active(comment.value,comment.selectionStart,mentions);
  const clearMentionResults=()=>mentionResults.replaceChildren();
+ const selectedMentions=el('div','gs-mention-selected');selectedMentions.setAttribute('aria-live','polite');
+ comment.after(selectedMentions);
+ const renderSelectedMentions=()=>{
+  selectedMentions.replaceChildren();
+  const selected=GS45Mentions.prune(comment.value,mentions);
+  for(const token of selected)selectedMentions.append(el('span','gs-mention-chip','✓ '+token+' · linked to Azure DevOps'));
+ };
  const renderMentionCandidates=async()=>{
   const match=activeMention(),seq=++mentionQuerySeq;clearMentionResults();
   if(!match||match.name.trim().length<2)return;
   try{
-   // Identity search resolves actual Azure DevOps identity IDs; display names alone are not mentions.
    const result=await searchMentionIdentities(match.name.trim());
-   if(seq!==mentionQuerySeq)return;
+   const current=activeMention();
+   if(seq!==mentionQuerySeq||!current||current.start!==match.start||current.name!==match.name)return;
    const candidates=result.filter(x=>x.id&&x.name).slice(0,10);
    for(const identity of candidates){
     const name=identity.name,email=identity.email||'';
     const choice=el('button','secondary gs-mention-option',name+(email?' · '+email:''));choice.type='button';choice.setAttribute('role','option');
-    choice.onclick=()=>{const current=activeMention();if(!current)return;const display='@'+name;comment.value=comment.value.slice(0,current.start)+display+comment.value.slice(current.end);mentions.set(display,{id:identity.id,name});const caret=current.start+display.length;comment.focus();comment.setSelectionRange(caret,caret);clearMentionResults();};
+    // Keep the textarea caret intact while a suggestion is clicked.
+    choice.addEventListener('pointerdown',event=>event.preventDefault());
+    choice.onclick=()=>{
+     const candidate=activeMention();
+     if(seq!==mentionQuerySeq||!candidate||candidate.start!==match.start||candidate.name!==match.name)return;
+     const applied=GS45Mentions.select(comment.value,candidate,identity);
+     mentions.set(applied.token,{id:identity.id,name});
+     ++mentionQuerySeq;clearTimeout(mentionSearchTimer);clearMentionResults();
+     comment.value=applied.value;comment.focus();comment.setSelectionRange(applied.caret,applied.caret);
+     gs44Dirty=true;renderSelectedMentions();
+     diagnostic('ado.mentions.selected',{workItemId:w.id,identityResolved:true});
+     feedback.textContent='Mention linked to Azure DevOps. Continue typing or add another mention.';
+    };
     mentionResults.append(choice);
    }
    if(!candidates.length)mentionResults.append(el('small','gs-ticket-help','No matching Azure DevOps users found.'));
   }catch(e){if(seq===mentionQuerySeq)mentionResults.append(el('small','gs-ticket-help','Identity search unavailable: '+e.message));}
  };
- let mentionSearchTimer=null;comment.addEventListener('input',()=>{clearTimeout(mentionSearchTimer);mentionSearchTimer=setTimeout(()=>{void renderMentionCandidates();},280);});
+ comment.addEventListener('input',()=>{
+  GS45Mentions.prune(comment.value,mentions);renderSelectedMentions();
+  ++mentionQuerySeq;clearTimeout(mentionSearchTimer);clearMentionResults();
+  if(!activeMention())return; // A selected @Name followed by ordinary text must not start a new search.
+  mentionSearchTimer=setTimeout(()=>{void renderMentionCandidates();},280);
+ });
  const mentionCommentHtml=()=>{
-  // Encode all user-entered content; only identities selected from ADO are emitted as mention anchors.
-  const pattern=[...mentions.keys()].sort((a,b)=>b.length-a.length);
-  let remaining=comment.value,html='';
-  while(remaining){
-   const found=pattern.map(token=>({token,index:remaining.indexOf(token)})).filter(x=>x.index>=0).sort((a,b)=>a.index-b.index||b.token.length-a.token.length)[0];
-   if(!found){html+=escHtml(remaining);break;}
-   html+=escHtml(remaining.slice(0,found.index));
-   const identity=mentions.get(found.token);
-   const after=remaining[found.index+found.token.length]||'';
-   if(identity&&/^[0-9a-f-]{36}$/i.test(identity.id)&&(!after||/[\s,.!?;:]/.test(after))){html+=`<a href="#" data-vss-mention="version:2.0,${identity.id}">${escHtml(found.token)}</a>`;}
-   else html+=escHtml(found.token);
-   remaining=remaining.slice(found.index+found.token.length);
-  }
-  return '<div>'+html.replace(/\n/g,'<br>')+'</div>';
+  const {html,unresolved}=GS45Mentions.serialize(comment.value,mentions,escHtml);
+  if(unresolved.length)throw Error('Unresolved mention '+unresolved.join(', ')+'. Select each person from the Azure DevOps suggestions before posting.');
+  return html;
  };
 
+
+ // A returning stale browser tab auto-reloads; keep unsaved card edits in this
+ // tab's session storage, then offer them on reopening the same work item.
+ let gs44Dirty=false;
+ const cardInputs={title,state,assignee,effort,description,criteria,comment};
+ for(const fieldNode of Object.values(cardInputs)){
+  fieldNode.addEventListener('input',()=>{gs44Dirty=true;});
+  fieldNode.addEventListener('change',()=>{gs44Dirty=true;});
+ }
+ GS44Session.setCardProvider(()=>{
+  if(!dialog.open||!gs44Dirty)return null;
+  return {dirty:true,id:w.id,project:w.project,values:Object.fromEntries(Object.entries(cardInputs).map(([key,node])=>[key,node.value])),mentions:[...mentions.entries()],selectedAssignee:selectedAssignee&&normalizedMentionIdentity(selectedAssignee)};
+ });
+ const recovered=GS44Session.restoreCard(w.id,w.project);
+ if(recovered?.values){
+  for(const [key,value] of Object.entries(recovered.values))if(cardInputs[key]&&typeof value==='string')cardInputs[key].value=value;
+  for(const [label,identity] of recovered.mentions||[])if(/^@[\w .'-]+$/.test(label)&&MENTION_ID_RE.test(String(identity?.id||'')))mentions.set(label,identity);
+  renderSelectedMentions();
+  if(recovered.selectedAssignee)selectedAssignee=normalizedMentionIdentity(recovered.selectedAssignee);
+  feedback.textContent='Unsaved card edits were recovered after a session refresh. Review them before saving or posting.';
+  gs44Dirty=true;
+ }
+ dialog.addEventListener('close',()=>GS44Session.setCardProvider(null),{once:true});
+
  if(!dialog.open)dialog.showModal();
- try{const states=await getStates(w);state.replaceChildren(...states.map(v=>new Option(v,v)));state.value=w.state;}catch(e){feedback.textContent='Could not load valid states: '+e.message;}
+ try{const states=await getStates(w);state.replaceChildren(...states.map(v=>new Option(v,v)));state.value=recovered?.values?.state&&states.includes(recovered.values.state)?recovered.values.state:w.state;}catch(e){feedback.textContent='Could not load valid states: '+e.message;}
  let estimateField=w.effortField;
  if(!estimateField){try{const type=await api(`/${encodeURIComponent(w.project)}/_apis/wit/workitemtypes/${encodeURIComponent(w.type)}?api-version=7.1`);const fields=(type.fieldInstances||type.fields||[]).map(x=>x.referenceName||x.field?.referenceName);estimateField=fields.includes('Microsoft.VSTS.Scheduling.StoryPoints')?'Microsoft.VSTS.Scheduling.StoryPoints':fields.includes('Microsoft.VSTS.Scheduling.Effort')?'Microsoft.VSTS.Scheduling.Effort':null;}catch{} }
  if(!estimateField){effort.disabled=true;estimateHelp.textContent='No supported Effort or Story Points field found. Open Azure DevOps to configure estimates.';}
@@ -1627,7 +1754,11 @@ async function openBoardItemDetail(w){
  
  const loadComments=async()=>{try{const r=await api(`/${encodeURIComponent(w.project)}/_apis/wit/workItems/${w.id}/comments?api-version=7.1-preview.4`);history.replaceChildren();for(const c of (r.comments||[]).slice(-25)){const row=el('div','gs-ticket-comment');row.append(el('strong','',c.createdBy?.displayName||'Team member'),el('p','',String(c.text||'').replace(/<[^>]*>/g,'')));history.append(row);}if(!history.children.length)history.textContent='No comments yet.';}catch(e){history.textContent='Comments unavailable: '+e.message;}};
  void loadComments();
- send.onclick=async()=>{if(!comment.value.trim())return;send.disabled=true;try{await api(`/${encodeURIComponent(w.project)}/_apis/wit/workItems/${w.id}/comments?format=html&api-version=7.1-preview.4`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:mentionCommentHtml()})});comment.value='';mentions.clear();clearMentionResults();feedback.textContent='Comment added.';await loadComments();}catch(e){feedback.textContent='Comment was not saved: '+e.message;}finally{send.disabled=false;}};
+ send.onclick=async()=>{if(!comment.value.trim())return;
+  // Never silently post an unresolved @mention as ordinary text after a stale edit.
+  let markup;
+  try{markup=mentionCommentHtml();}catch(e){feedback.textContent=e.message;return;}
+  send.disabled=true;try{await api(`/${encodeURIComponent(w.project)}/_apis/wit/workItems/${w.id}/comments?format=html&api-version=7.1-preview.4`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:markup})});comment.value='';mentions.clear();clearMentionResults();renderSelectedMentions();feedback.textContent='Comment added.';diagnostic('ado.mentions.comment_posted',{workItemId:w.id,hadMention:markup.includes('data-vss-mention=')});await loadComments();}catch(e){diagnostic('ado.mentions.comment_failed',{workItemId:w.id,reason:String(e?.message||e).slice(0,170)},'error');feedback.textContent='Comment was not saved: '+e.message;}finally{send.disabled=false;}};
  form.onsubmit=async event=>{event.preventDefault();const changes=[];const put=(name,value)=>changes.push({op:'add',path:'/fields/'+name,value});if(title.value.trim()!==w.title)put('System.Title',title.value.trim());
  if(description.value!==plainText(w.description))put('System.Description',htmlText(description.value));
  if(!criteria.disabled&&criteria.value!==plainText(w.acceptanceCriteria))put('Microsoft.VSTS.Common.AcceptanceCriteria',htmlText(criteria.value));if(state.value!==w.state)put('System.State',state.value);
@@ -1635,7 +1766,7 @@ async function openBoardItemDetail(w){
  const changedAssignee=selectedAssignee?String(selectedAssignee.id).toLowerCase()!==String(w.assigneeId||'').toLowerCase():assignee.value.trim()!==originalAssignee;
  if(changedAssignee){try{put('System.AssignedTo',assignmentPatchValue(assignee.value,selectedAssignee));}catch(error){feedback.textContent=error.message;return;}}
  if(estimateField&&String(effort.value)!==String(w.effort??'')){if(effort.value!==''&&(!Number.isFinite(Number(effort.value))||Number(effort.value)<0)){feedback.textContent='Estimate must be zero or greater.';return;}changes.push(effort.value===''?{op:'remove',path:'/fields/'+estimateField}:{op:'add',path:'/fields/'+estimateField,value:Number(effort.value)});}
- if(!changes.length){feedback.textContent='No changes to save.';return;}save.disabled=true;try{const result=await api(`/_apis/wit/workitems/${w.id}?api-version=7.1`,{method:'PATCH',headers:{'Content-Type':'application/json-patch+json'},body:JSON.stringify([{op:'test',path:'/rev',value:w.rev},...changes])});const fresh=normalizeItem(result);for(const item of [w,...items,...assignedItems,...ancestorItems])if(Number(item.id)===Number(w.id))Object.assign(item,fresh);if(changes.some(change=>change.path==='/fields/System.State')&&currentSprint()?.doneDisplayIds?.[w.id]!==undefined)await setDoneDisplay(w,null);renderBoard();renderSprintHealth();renderTimeline();void autoReportObservation(currentSprint(),reportWork());feedback.textContent='Saved to Azure DevOps.';heading.querySelector('h2').textContent=fresh.title;selectedAssignee=null;assignee.value=fresh.assigneeIdentity|| (fresh.assignee==='Unassigned'?'':fresh.assignee);clearAssigneeResults();}catch(e){feedback.textContent='Save failed: '+e.message;}finally{save.disabled=false;}};
+ if(!changes.length){feedback.textContent='No changes to save.';return;}save.disabled=true;try{const result=await api(`/_apis/wit/workitems/${w.id}?api-version=7.1`,{method:'PATCH',headers:{'Content-Type':'application/json-patch+json'},body:JSON.stringify([{op:'test',path:'/rev',value:w.rev},...changes])});const fresh=normalizeItem(result);for(const item of [w,...items,...assignedItems,...ancestorItems])if(Number(item.id)===Number(w.id))Object.assign(item,fresh);if(changes.some(change=>change.path==='/fields/System.State')&&currentSprint()?.doneDisplayIds?.[w.id]!==undefined)await setDoneDisplay(w,null);renderBoard();renderSprintHealth();renderTimeline();void autoReportObservation(currentSprint(),reportWork());feedback.textContent='Saved to Azure DevOps.';gs44Dirty=!!comment.value.trim();heading.querySelector('h2').textContent=fresh.title;selectedAssignee=null;assignee.value=fresh.assigneeIdentity|| (fresh.assignee==='Unassigned'?'':fresh.assignee);clearAssigneeResults();}catch(e){feedback.textContent='Save failed: '+e.message;}finally{save.disabled=false;}};
 }
 
 function workItemCard(w){
@@ -1666,7 +1797,8 @@ function workItemCard(w){
  const quickActions=document.createElement('div');quickActions.className='sprint-card-quick';quickActions.append(blockerLabel,remove);heading.append(remove);
  const laneLabel=document.createElement('label');laneLabel.textContent='Swimlane';laneLabel.append(lane);
  const stateLabel=document.createElement('label');stateLabel.textContent='ADO state';stateLabel.append(state);
- if($('boardMode').value==='kanban')controls.append(laneLabel);controls.append(stateLabel);card.append(blockerLabel,controls);if(compactMode()){meta.classList.add('density-detail');status.classList.add('density-detail');controls.classList.add('density-detail');const toggle=document.createElement('button');toggle.type='button';toggle.className='secondary compact-controls-toggle';toggle.textContent='Edit';toggle.onclick=()=>controls.classList.toggle('density-detail');card.append(toggle);}return card;
+ if($('boardMode').value==='kanban')controls.append(laneLabel);controls.append(stateLabel);card.append(blockerLabel,controls);gs40AppendCardChildren(card,w);
+if(compactMode()){meta.classList.add('density-detail');status.classList.add('density-detail');controls.classList.add('density-detail');const toggle=document.createElement('button');toggle.type='button';toggle.className='secondary compact-controls-toggle';toggle.textContent='Edit';toggle.onclick=()=>controls.classList.toggle('density-detail');card.append(toggle);}return card;
 }
 function renderHierarchy(selected){
  const root=$('hierarchyView');root.replaceChildren();if(!selected.length){root.textContent='No work items assigned to this sprint.';return;}
@@ -1696,9 +1828,9 @@ async function dropOnCell(id,column,lane,cell){
    const originalOverride=currentSprint()?.doneDisplayIds?.[w.id];
    if(column==='Done'){
     const next=await destinationState(w,'Done');
-    // For a native terminal state without its own Done stage, the display
-    // choice MUST be stored as a separate sprint-scoped fact before the ADO
-    // PATCH. Native Completed remains terminal for reporting.
+    // For a native terminal state without its own Done stage, the Board
+    // placement is stored separately from the native ADO state. Reports
+    // use that sprint-specific Done stage as pending validation.
     const nativeColumn=workflowCategory(w,next);
     const needsOverride=nativeColumn!=='Done';
     if(needsOverride&&!await setDoneDisplay(w,true))return;
@@ -1728,6 +1860,9 @@ async function dropOnCell(id,column,lane,cell){
    if(!ok){notify(`The ADO state updated, but could not save swimlane for #${id}.`,true);return;}
   }
   renderBacklog();renderBoard();
+  // A Board-only validation/acceptance decision must be visible in history,
+  // even when native ADO System.State is unchanged (Completed -> Done).
+  void autoReportObservation(currentSprint(),reportWork());
  }catch(e){notify(`Cannot move #${id}: ${e.message}`,true);}
  finally{cell.classList.remove('drop-pending');renderBoard();}
 }
@@ -1783,8 +1918,8 @@ function renderHybridBoard(){
 function renderBoard(){renderHybridBoard();}
 async function changeState(w,state){if(!await updateWorkItemState(w,state))return;
  if(currentSprint()?.doneDisplayIds?.[w.id]!==undefined)await setDoneDisplay(w,null);
- renderBacklog();renderBoard();}
-async function capture(){let s;try{s=requireSprint();}catch(e){return notify(e.message,true);}const missing=s.itemIds.filter(id=>![...items,...assignedItems].some(w=>w.id===id));if(missing.length)return notify(`Load all committed work items before capturing a baseline. ${missing.length} item(s) are not currently loaded.`,true);const snapshot={at:new Date().toISOString(),items:s.itemIds.map(id=>{const w=[...items,...assignedItems].find(x=>x.id===id);return {id,project:w.project,title:w.title,type:w.type,state:w.state,completionCategory:workflowColumn(w),effort:w.effort,storyPoints:w.storyPoints};})};const ok=await persist(r=>{r.sprints.find(x=>x.id===s.id).snapshots.push(snapshot);});if(ok){renderHistory();notify(`Commitment baseline captured with ${snapshot.items.length} work items at ${new Date(snapshot.at).toLocaleString()}. Open History Record to inspect it.`);}}
+ renderBacklog();renderBoard();void autoReportObservation(currentSprint(),reportWork());}
+async function capture(){let s;try{s=requireSprint();}catch(e){return notify(e.message,true);}const missing=s.itemIds.filter(id=>![...items,...assignedItems].some(w=>w.id===id));if(missing.length)return notify(`Load all committed work items before capturing a baseline. ${missing.length} item(s) are not currently loaded.`,true);const snapshot={at:new Date().toISOString(),items:s.itemIds.map(id=>{const w=[...items,...assignedItems].find(x=>x.id===id);return {id,project:w.project,title:w.title,type:w.type,state:w.state,completionCategory:workflowColumn(w),deliveryCategory:boardColumn(w),effort:w.effort,storyPoints:w.storyPoints,parentId:w.parentId||null,remainingWork:w.remainingWork??null};})};const ok=await persist(r=>{r.sprints.find(x=>x.id===s.id).snapshots.push(snapshot);});if(ok){renderHistory();notify(`Commitment baseline captured with ${snapshot.items.length} work items at ${new Date(snapshot.at).toLocaleString()}. Open History Record to inspect it.`);}}
 
 // Advisory sprint-readiness checks. No mutations, enforced cadence, or new persisted schema.
 function renderGuidance(){
@@ -1830,14 +1965,15 @@ function renderPlanningSteps(){
  node.replaceChildren();const s=currentSprint(),key=guidancePreferenceKey();
  const hidden=!!(key&&localStorage.getItem(key)==='1');content.classList.toggle('hidden',hidden);dismiss.classList.toggle('hidden',hidden);restore.classList.toggle('hidden',!hidden);
  if(!s){node.textContent='Select a sprint to begin planning.';dismiss.disabled=true;return;}dismiss.disabled=false;
+ const ceremonies=GS43Schedules.planning(s,activeScheduleWorkspace(),gs43Today());
  const steps=[
   {name:'Define the sprint objective',done:!!$('goal').value.trim(),help:'Describe the outcome the team intends to deliver.',target:'goal'},
   {name:'Review the planning dates',done:!!$('start').value&&!!$('end').value&&$('start').value<=$('end').value,help:'Choose a useful delivery window; no fixed sprint length is required.',target:'start'},
   {name:'Select committed work',done:(s.itemIds||[]).length>0,help:'Use Board → Backlog to browse and add work directly.',tab:'board'},
   {name:'Capture a commitment baseline',done:(s.snapshots||[]).length>0,help:'Capture a baseline once the team agrees on its initial work.',target:'capture'},
-  {name:'Plan sprint ceremonies',done:(s.ceremonies||[]).length>0,help:'Use the Guided Ceremony Planner to preview standups, review and refinement.',target:'ceremonyAssistant'}
+  {name:'Plan sprint ceremonies',done:ceremonies.done,completion:ceremonies.label,help:'Review any continuing workspace/project-period bookings before creating new invitations.',target:'ceremonyAssistant',scheduleId:ceremonies.scheduleId,history:ceremonies.history}
  ];
- for(const step of steps){const li=document.createElement('li');const status=document.createElement('strong');status.textContent=(step.done?'✓ Done: ':'○ To do: ')+step.name;li.append(status,document.createTextNode(' — '+(step.done?'Completed.':step.help)+' '));if(!step.done){const btn=document.createElement('button');btn.type='button';btn.className='secondary';btn.textContent=step.tab?'Open Board':'Go to step';btn.addEventListener('click',()=>{if(step.tab){const tab=document.querySelector('[data-tab="board"]');tab?.click();}else{const el=$(step.target);el?.scrollIntoView({behavior:'smooth',block:'center'});el?.focus?.();}});li.append(btn);}node.append(li);}
+ for(const step of steps){const li=document.createElement('li');const status=document.createElement('strong');status.textContent=(step.done?'✓ Done: ':'○ To do: ')+step.name;li.append(status,document.createTextNode(' — '+(step.done?(step.completion?step.completion+'.':'Completed.'):step.help)+' '));if(!step.done||step.scheduleId){const btn=document.createElement('button');btn.type='button';btn.className='secondary';btn.textContent=step.tab?'Open Board':step.scheduleId?'View schedule':'Go to step';btn.addEventListener('click',()=>{if(step.tab){const tab=document.querySelector('[data-tab="board"]');tab?.click();}else if(step.scheduleId){const disclosure=$('gs42SavedSchedulesDisclosure');if(disclosure)disclosure.open=true;if(step.history)window.gs43HistoryExpanded=true;expandedScheduleId=step.scheduleId;renderWorkspaceSchedules();const el=$('gs43ScheduleHistory')&&step.history?$('gs43ScheduleHistory'):$('workspaceSchedules');el?.scrollIntoView({behavior:'smooth',block:'center'});}else{const el=$(step.target);el?.scrollIntoView({behavior:'smooth',block:'center'});el?.focus?.();}});li.append(btn);}node.append(li);}
 }
 $('guidanceDismiss').addEventListener('click',()=>{const key=guidancePreferenceKey();if(key)localStorage.setItem(key,'1');renderPlanningSteps();});
 $('guidanceRestore').addEventListener('click',()=>{const key=guidancePreferenceKey();if(key)localStorage.removeItem(key);renderPlanningSteps();});
@@ -2249,22 +2385,23 @@ function meetingActionFeedback(id,scheduleId,message,error=false){
  if(node&&contextualMessage(node,message,error))return;
  notify(message,error);
 }
-async function outlookCancelCeremony(id,scheduleId=null){
+async function outlookCancelCeremony(id,scheduleId=null,options={}){
  const c=outlookCeremonyRecord(id,scheduleId),o=c?.outlook;
  if(o?.state!=='booked'||!o.eventId)return meetingActionFeedback(id,scheduleId,'Only confirmed Outlook bookings can be cancelled.',true);
  if(!m365Account||o.accountId!==(m365Account.homeAccountId||m365Account.username))return notify('Connect the Microsoft 365 account that owns this booking.',true);
  if(outlookBookingBusy)return notify('An Outlook operation is in progress.',true);
- if(!confirm(o.recurring?'Cancel the ENTIRE recurring Outlook meeting series and notify attendees? This cancels all remaining occurrences. The workspace ceremony record will be retained as Cancelled.':'Cancel this Outlook meeting and notify attendees? This cannot be undone. The ceremony record will be retained as Cancelled.'))return;
+ if(!options.bulk&&!confirm(o.recurring?'Cancel the ENTIRE recurring Outlook meeting series and notify attendees? This cancels all remaining occurrences. The workspace ceremony record will be retained as Cancelled.':'Cancel this Outlook meeting and notify attendees? This cannot be undone. The ceremony record will be retained as Cancelled.'))return;
  outlookBookingBusy=true;const w=activeScheduleWorkspace(),sp=currentSprint(),operationId=crypto.randomUUID();
  try{
   const marked=await persist(r=>{const t=outlookTarget(r,id,scheduleId,w?.id,sp?.id);if(t?.outlook?.state!=='booked')throw Error('Meeting changed.');t.outlook={...t.outlook,state:'cancel-pending',operationId};},false);
   if(!marked)return;
   // DELETE is appropriate for organizer-owned events; Graph notifies attendees.
   try{await outlookGraph('DELETE','/me/calendars/'+encodeURIComponent(o.calendarId)+'/events/'+encodeURIComponent(o.eventId));}
-  catch(e){if(!String(e.message||e).includes('Microsoft Graph 404:'))throw e; /* Already absent: treat as cancelled. */}
+  catch(e){if(!/HTTP 404|Graph 404/i.test(String(e.message||e)))throw e; /* Already absent: treat as cancelled. */}
   const saved=await persist(r=>{const t=outlookTarget(r,id,scheduleId,w?.id,sp?.id);if(t?.outlook?.operationId!==operationId)throw Error('Meeting changed.');t.outlook={...o,state:'cancelled',cancelledAt:new Date().toISOString()};t.status='Cancelled';},false);
   if(saved)meetingActionFeedback(id,scheduleId,'Outlook meeting cancelled. You may now remove its Global Sprints record.');else meetingActionFeedback(id,scheduleId,'Outlook cancellation succeeded, but registry confirmation failed. Use Review Outlook status.',true);
- }catch(e){meetingActionFeedback(id,scheduleId,'Cancellation result uncertain: '+String(e.message||e)+'. Review Outlook status before retrying.',true);}finally{outlookBookingBusy=false;renderCeremonies();renderWorkspaceSchedules();}
+  return !!saved;
+ }catch(e){meetingActionFeedback(id,scheduleId,'Cancellation result uncertain: '+String(e.message||e)+'. Review Outlook status before retrying.',true);return false;}finally{outlookBookingBusy=false;renderCeremonies();renderWorkspaceSchedules();}
 }
 function nextFutureCeremonyDate(c){
  const now=new Date(),day=new Date(now.getFullYear(),now.getMonth(),now.getDate()+1);
@@ -2341,6 +2478,7 @@ async function scheduleCeremonyInOutlook(id,scheduleId=null,pastMode=null,bulkAp
  if(outlookBookingBusy)return notify('Another Outlook booking is in progress.',true);
  const c=outlookCeremonyRecord(id,scheduleId);
  if(!c)return notify('Meeting record is no longer available. Reload before scheduling.',true);
+ if(scheduleId){const sc=activeScheduleWorkspace()?.meetingSchedules?.find(x=>x.id===scheduleId);if(!sc||sc.lifecycle!=='Committed')return ceremonyBookingFeedback(id,scheduleId,'Commit the internal schedule before creating Outlook invitations. Existing bookings are retained.');}
  if(c.outlook?.state==='booked')return notify('This meeting is already linked to an Outlook event. Duplicate booking prevented.',true);
  if(c.outlook?.state==='pending')return notify('An earlier Outlook request has an unresolved result. Check the selected Outlook calendar before attempting any further booking.',true);
  if(c.status==='Cancelled'||c.status==='Completed')return notify('Cancelled or completed meetings cannot be newly booked.',true);
@@ -2435,7 +2573,7 @@ async function scheduleCeremonyInOutlook(id,scheduleId=null,pastMode=null,bulkAp
   notify('Outlook booking result needs verification: '+String(e.message||e)+'. Check Outlook before retrying. The meeting is marked pending to prevent duplicates.',true);
  }finally{outlookBookingBusy=false;renderCeremonies();renderWorkspaceSchedules();}
 }
-function renderCeremonies(){renderMeetingReferenceCalendar();const list=$('ceremonyList');if(!list)return;list.replaceChildren();const sp=currentSprint(),w=activeScheduleWorkspace();const records=[...(w?.meetingSchedules||[]).flatMap(sc=>(sc.meetings||[]).map(c=>({...c,_scheduleId:sc.id}))),...(sp?.ceremonies||[])].sort((a,b)=>(a.date||'9999').localeCompare(b.date||'9999')||(a.time||'').localeCompare(b.time||''));if(!records.length){list.textContent='No meeting records yet. Use Meeting Schedule Setup or create a meeting above.';return;}for(const c of records){const box=document.createElement('div');box.className='ceremony-record';box.dataset.ceremonyBookingId=String(c.id);box.dataset.ceremonyScheduleId=String(c._scheduleId||'');const h=document.createElement('strong');h.textContent=(c.title||c.type)+(c.secondary?' + '+c.secondary:'');const info=document.createElement('p');info.className='muted';info.textContent=[c.originalPlannedDate?'Originally planned '+c.originalPlannedDate:'',c.status||'Proposed',c.date,c.time,c.duration?c.duration+' min':'',c.repeat&&c.repeat!=='none'?'Repeats '+(c.repeat==='weekly'?(c.repeatDays||[]).join(', '):'every '+(c.repeatInterval||2)+' weeks')+' through '+(c.repeatEnd||'unspecified end'):'One-time',c.participants,c._scheduleId?'Workspace schedule':'Sprint record'].filter(Boolean).join(' · ');box.append(h,info);for(const [label,key] of [['Agenda','agenda'],['Decisions / follow-up','outcome']])if(c[key]){const p=document.createElement('p');const strong=document.createElement('strong');strong.textContent=label+': ';p.append(strong,document.createTextNode(c[key]));box.append(p);}if(c.secondary){const completion=document.createElement('div');completion.className='row';for(const [purpose,key] of [[c.type,'primary'],[c.secondary,'secondary']]){const label=document.createElement('label');const check=document.createElement('input');check.type='checkbox';check.checked=!!c.ceremonyCompletion?.[key];check.onchange=async()=>{const ok=await persist(r=>{const m=c._scheduleId?r.workspaces.find(x=>x.id===w.id)?.meetingSchedules?.find(x=>x.id===c._scheduleId)?.meetings?.find(x=>x.id===c.id):(r.sprints.find(x=>x.id===sp.id)?.ceremonies||[]).find(x=>x.id===c.id);if(!m)throw Error('Meeting missing.');m.ceremonyCompletion||={primary:false,secondary:false};m.ceremonyCompletion[key]=check.checked;},false);if(!ok)check.checked=!check.checked;else renderCeremonyInsights();};label.append(check,document.createTextNode(' '+purpose+' complete'));completion.append(label);}box.append(completion);}const actions=document.createElement('div');actions.className='row';const edit=document.createElement('button');edit.type='button';edit.textContent='Edit';edit.onclick=()=>editCeremony(c.id,c._scheduleId||null);const remove=document.createElement('button');remove.type='button';remove.className='secondary';remove.textContent='Remove';remove.onclick=()=>void deleteCeremony(c.id,c._scheduleId||null);actions.append(edit);
+function renderCeremonies(){renderMeetingReferenceCalendar();const list=$('ceremonyList');if(!list)return;list.replaceChildren();const sp=currentSprint(),w=activeScheduleWorkspace();const records=[...(w?.meetingSchedules||[]).filter(sc=>!GS43Schedules.view(sc,gs43Today()).history).flatMap(sc=>(sc.meetings||[]).map(c=>({...c,_scheduleId:sc.id}))),...(sp?.ceremonies||[])].sort((a,b)=>(a.date||'9999').localeCompare(b.date||'9999')||(a.time||'').localeCompare(b.time||''));if(!records.length){list.textContent='No meeting records yet. Use Meeting Schedule Setup or create a meeting above.';return;}for(const c of records){const box=document.createElement('div');box.className='ceremony-record';box.dataset.ceremonyBookingId=String(c.id);box.dataset.ceremonyScheduleId=String(c._scheduleId||'');const h=document.createElement('strong');h.textContent=(c.title||c.type)+(c.secondary?' + '+c.secondary:'');const info=document.createElement('p');info.className='muted';info.textContent=[c.originalPlannedDate?'Originally planned '+c.originalPlannedDate:'',c.status||'Proposed',c.date,c.time,c.duration?c.duration+' min':'',c.repeat&&c.repeat!=='none'?'Repeats '+(c.repeat==='weekly'?(c.repeatDays||[]).join(', '):'every '+(c.repeatInterval||2)+' weeks')+' through '+(c.repeatEnd||'unspecified end'):'One-time',c.participants,c._scheduleId?'Workspace schedule':'Sprint record'].filter(Boolean).join(' · ');box.append(h,info);for(const [label,key] of [['Agenda','agenda'],['Decisions / follow-up','outcome']])if(c[key]){const p=document.createElement('p');const strong=document.createElement('strong');strong.textContent=label+': ';p.append(strong,document.createTextNode(c[key]));box.append(p);}if(c.secondary){const completion=document.createElement('div');completion.className='row';for(const [purpose,key] of [[c.type,'primary'],[c.secondary,'secondary']]){const label=document.createElement('label');const check=document.createElement('input');check.type='checkbox';check.checked=!!c.ceremonyCompletion?.[key];check.onchange=async()=>{const ok=await persist(r=>{const m=c._scheduleId?r.workspaces.find(x=>x.id===w.id)?.meetingSchedules?.find(x=>x.id===c._scheduleId)?.meetings?.find(x=>x.id===c.id):(r.sprints.find(x=>x.id===sp.id)?.ceremonies||[]).find(x=>x.id===c.id);if(!m)throw Error('Meeting missing.');m.ceremonyCompletion||={primary:false,secondary:false};m.ceremonyCompletion[key]=check.checked;},false);if(!ok)check.checked=!check.checked;else renderCeremonyInsights();};label.append(check,document.createTextNode(' '+purpose+' complete'));completion.append(label);}box.append(completion);}const actions=document.createElement('div');actions.className='row';const edit=document.createElement('button');edit.type='button';edit.textContent='Edit';edit.onclick=()=>editCeremony(c.id,c._scheduleId||null);const remove=document.createElement('button');remove.type='button';remove.className='secondary';remove.textContent='Remove';remove.onclick=()=>void deleteCeremony(c.id,c._scheduleId||null);actions.append(edit);
  const outlook=document.createElement('button');outlook.type='button';outlook.className='secondary';
  outlook.textContent=c.outlook?.state==='booked'?'Booked in Outlook':c.outlook?.state==='pending'?'Booking needs review':c.outlook?.state==='cancelled'?'Cancelled in Outlook':c.outlook?.state?'Outlook sync needs review':'Schedule in Outlook';
  outlook.disabled=!!c.outlook?.state||c.status==='Cancelled'||c.status==='Completed';
@@ -2452,10 +2590,16 @@ function renderCeremonies(){renderMeetingReferenceCalendar();const list=$('cerem
 $('saveCeremony').onclick=()=>void saveCeremony();$('clearCeremony').onclick=resetCeremony;
 // v0.5.0: Azure DevOps-backed reporting and editable auto-timeline.
 let reportProjectFilter='',reportPersonFilter='',timelineBusy=false,lastReportRefresh=0;
-// Reports use native terminal state, never a reversible Board placement.
-const reportIsClosed=w=>workflowNativeTerminal.get(workflowKey(w))?.has(String(w.state||'').trim().toLowerCase()) ?? (workflowColumn(w)==='Closed');
-const reportIsDone=w=>!reportIsClosed(w)&&workflowColumn(w)==='Done';
-const reportWork=()=>{const s=currentSprint();const all=new Map([...items,...assignedItems].map(w=>[Number(w.id),w]));return (s?.itemIds||[]).map(id=>all.get(Number(id))).filter(w=>w&&!isPlanningContextType(w)&&!isRemoved(w));};
+// Delivery reports describe the selected Global Sprint's Board stage, not just
+// the native ADO process category. A process with no non-terminal Done stage
+// may store a terminal ADO Completed state while Global Sprints holds the
+// card in Done pending validation. The native state is NEVER rewritten here.
+const reportIsClosed=w=>boardColumn(w)==='Closed';
+const reportIsDone=w=>boardColumn(w)==='Done';
+const reportWork=()=>{const s=currentSprint();const all=new Map([...items,...assignedItems].map(w=>[Number(w.id),w]));
+ const candidates=(s?.itemIds||[]).map(id=>all.get(Number(id))).filter(w=>w&&!isRemoved(w));
+ return candidates.filter(w=>!isPlanningContextType(w)||(GS40Core.featureOwner(w,candidates)&&!(registry?.sprints||[]).some(sp=>sp.id!==s.id&&sp.workspaceId===s.workspaceId&&(sp.itemIds||[]).some(id=>Number(id)===Number(w.id)))));
+};
 // Every report and PM warning uses the same resolution of assigned sprint IDs.
 function reportCoverage(){const s=currentSprint();const ids=[...new Set((s?.itemIds||[]).map(Number))];const resolved=new Map([...items,...assignedItems].map(w=>[Number(w.id),w]));const missing=ids.filter(id=>!resolved.has(id));const context=ids.filter(id=>resolved.has(id)&&isPlanningContextType(resolved.get(id)));const executable=ids.filter(id=>resolved.has(id)&&!isPlanningContextType(resolved.get(id))&&!isRemoved(resolved.get(id)));return {assigned:ids.length,missing,context,executable};}
 // Manual captures are immutable historical evidence. Keep the first observation as
@@ -2466,22 +2610,35 @@ function retainReportHistory(snapshots,automaticLimit=150){
  const keep=new Set(autos.slice(-automaticLimit));
  return snapshots.filter((record,index)=>index===0||!record.automatic||keep.has(record));
 }
-let observationInFlight=false;
-function observationItems(s,found){const byId=new Map(found.map(w=>[Number(w.id),w]));return [...new Set((s.itemIds||[]).map(Number))].map(id=>{const w=byId.get(id);return w&&{id:w.id,project:w.project,title:w.title,type:w.type,state:w.state,completionCategory:workflowColumn(w),effort:w.effort,storyPoints:w.storyPoints};}).filter(Boolean);}
-function observationFingerprint(rows){return JSON.stringify(rows.map(w=>[w.id,w.type,w.state,w.effort,w.storyPoints]));}
+let observationInFlight=false,observationQueuedSprintId=null;
+function observationItems(s,found){const byId=new Map(found.map(w=>[Number(w.id),w]));return [...new Set((s.itemIds||[]).map(Number))].map(id=>{const w=byId.get(id);return w&&{id:w.id,project:w.project,title:w.title,type:w.type,state:w.state,completionCategory:workflowColumn(w),deliveryCategory:boardColumn(w),effort:w.effort,storyPoints:w.storyPoints,parentId:w.parentId||null,remainingWork:w.remainingWork??null};}).filter(Boolean);}
+function observationFingerprint(rows){return JSON.stringify(rows.map(w=>[w.id,w.type,w.state,w.completionCategory,w.deliveryCategory,w.effort,w.storyPoints,w.parentId,w.remainingWork]));}
 async function autoReportObservation(s,found){
- if(observationInFlight||!s||!found||found.length!==new Set((s.itemIds||[]).map(Number)).size||sprintDirty()||projectsDirty())return;
- const rows=observationItems(s,found),previous=(s.snapshots||[]).at(-1);
- if(previous&&observationFingerprint(previous.items||[])===observationFingerprint(rows))return;
+ // Always use complete assigned membership, not the executable-only report
+ // subset: including a Feature/Epic used to disable auto observations entirely.
+ if(!s||currentSprint()?.id!==s.id||sprintDirty()||projectsDirty())return;
+ if(observationInFlight){observationQueuedSprintId=s.id;return;}
+ const ids=[...new Set((s.itemIds||[]).map(Number))],all=new Map([...items,...assignedItems,...(found||[])].map(w=>[Number(w.id),w]));
+ if(ids.some(id=>!all.has(id)))return; // never save an incomplete observation
+ const rows=observationItems(s,ids.map(id=>all.get(id))),previous=(s.snapshots||[]).at(-1);
+ if(previous&&observationFingerprint(previous.items||[])===observationFingerprint(rows)&&reportObservationDay(previous.at)===reportToday())return;
  observationInFlight=true;
  try{
   const saved=await persist(r=>{const sp=r.sprints.find(x=>x.id===s.id);if(!sp)throw Error('Sprint no longer exists');sp.snapshots ||= [];
-   const last=sp.snapshots.at(-1);if(last&&observationFingerprint(last.items||[])===observationFingerprint(rows))return;
+   const last=sp.snapshots.at(-1);if(last&&observationFingerprint(last.items||[])===observationFingerprint(rows)&&reportObservationDay(last.at)===reportToday())return;
    sp.snapshots.push({at:new Date().toISOString(),automatic:true,items:rows});sp.snapshots=retainReportHistory(sp.snapshots);
   },false);
   diagnostic(saved?'reports.observation.saved':'reports.observation.failed',{sprintId:s.id,workItemCount:rows.length,automatic:true},saved?'info':'warn');
   if(saved&&currentSprint()?.id===s.id){renderSprintHealth();renderTimeline();}
- }catch(e){diagnostic('reports.observation.failed',{reason:String(e.message||e)},'error');}finally{observationInFlight=false;}
+ }catch(e){diagnostic('reports.observation.failed',{reason:String(e.message||e)},'error');}
+ finally{
+  observationInFlight=false;
+  // A native PATCH and its Board-only Done/Closed placement may be saved in
+  // separate writes. Capture the final delivery stage after any in-flight
+  // observation finishes; don't lose the second update or replay ADO writes.
+  const queued=observationQueuedSprintId;observationQueuedSprintId=null;
+  if(queued&&currentSprint()?.id===queued)void autoReportObservation(currentSprint(),[...items,...assignedItems]);
+ }
 }
 function reportFiltered(){return reportWork().filter(w=>(!reportProjectFilter||w.project===reportProjectFilter)&&(!reportPersonFilter||w.assignee===reportPersonFilter));}
 function reportWorkItemLink(w){const button=reportNode('button','secondary gs-report-work-link','#'+w.id+' · '+w.title);button.type='button';button.title='Open work item details';button.onclick=()=>void openBoardItemDetail(w);return button;}
@@ -2490,7 +2647,7 @@ function reportNode(tag,className,textValue){const n=document.createElement(tag)
 function reportMetric(parent,label,value,description=''){const n=reportNode('div','gs-metric');n.append(reportNode('span','muted',label),reportNode('strong','',value));if(description)n.append(reportNode('small','muted',description));parent.append(n);}
 function reportVisualBars(parent,rows,labels=['Closed','Done','Open']){const graph=reportNode('div','gs-visual-bars');const max=Math.max(1,...rows.map(r=>r.values.reduce((a,b)=>a+b,0)));const legend=reportNode('div','gs-chart-legend');labels.forEach((label,i)=>{const item=reportNode('span','gs-legend-item');const swatch=reportNode('i','gs-swatch gs-swatch-'+i);item.append(swatch,document.createTextNode(label));legend.append(item);});graph.append(legend);if(!rows.length){graph.append(reportNode('p','muted','No work items match these filters.'));parent.append(graph);return;}for(const row of rows){const line=reportNode('div','gs-visual-row');line.append(reportNode('span','gs-visual-name',row.name));const track=reportNode('div','gs-visual-track');track.setAttribute('role','img');track.setAttribute('aria-label',row.name+': '+row.values.map((n,i)=>n+' '+labels[i]).join(', '));row.values.forEach((n,i)=>{if(n<=0)return;const segment=reportNode('span','gs-visual-segment gs-fill-'+i);segment.style.width=(n/max*100)+'%';segment.title=n+' '+labels[i];track.append(segment);});line.append(track,reportNode('strong','gs-visual-count',String(row.values.reduce((a,b)=>a+b,0))));graph.append(line);}parent.append(graph);}
 function reportEmptyChart(parent,heading,description){const empty=reportNode('div','gs-chart-empty');empty.append(reportNode('div','gs-chart-empty-icon','▥'),reportNode('strong','',heading),reportNode('p','muted',description));parent.append(empty);}
-function reportVelocityChart(parent,rows){const graph=reportNode('div','gs-velocity-chart');const max=Math.max(1,...rows.map(r=>r.value));for(const row of rows){const item=reportNode('div','gs-velocity-column');const area=reportNode('div','gs-velocity-area');const bar=reportNode('div','gs-velocity-bar');bar.style.height=(row.value?Math.max(6,row.value/max*100):0)+'%';bar.title=row.name+': '+row.value+' completed points';area.append(bar);item.append(reportNode('strong','',String(row.value)),area,reportNode('span','',row.name));graph.append(item);}parent.append(graph);}
+function reportVelocityChart(parent,rows){const graph=reportNode('div','gs-velocity-chart');const values=rows.filter(r=>Number.isFinite(r.value)).map(r=>r.value),max=Math.max(1,...values);for(const row of rows){const item=reportNode('div','gs-velocity-column');const area=reportNode('div','gs-velocity-area');if(Number.isFinite(row.value)){const bar=reportNode('div','gs-velocity-bar');bar.style.height=(row.value?Math.max(6,row.value/max*100):0)+'%';bar.title=row.name+': '+row.value+' observed completed points';area.append(bar);}else{area.classList.add('gs-velocity-no-data');area.title='No valid saved historical observation';}item.append(reportNode('strong','',Number.isFinite(row.value)?String(row.value):'—'),area,reportNode('span','',row.name));if(row.detail)item.append(reportNode('small','muted',row.detail));graph.append(item);}parent.append(graph);}
 function reportBurndownProgress(parent,p,label){const graph=reportNode('div','gs-burndown-progress');const total=Math.max(1,p.total);const completed=reportNode('span','gs-burndown-completed');completed.style.width=(Math.max(0,p.completed)/total*100)+'%';const remaining=reportNode('span','gs-burndown-remaining');remaining.style.width=(Math.max(0,p.remaining)/total*100)+'%';graph.append(completed,remaining);graph.setAttribute('role','img');graph.setAttribute('aria-label',label+': '+p.completed+' completed points, '+p.remaining+' remaining points');parent.append(reportNode('p','muted',label),graph);}
 function reportDate(v){return v?String(v).slice(0,10):'';}
 // Snapshot timestamps may be ISO strings or legacy numeric epoch values.
@@ -2507,47 +2664,74 @@ function reportSnapshotTimestamp(value){
  return '';
 }
 function reportToday(){const d=new Date();return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;}
+function reportObservationDay(at){const t=reportSnapshotTimestamp(at);if(!t)return '';const d=new Date(t);return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;}
 function reportDay(v){return Date.parse(v+'T12:00:00Z')/86400000;}
 function reportSafeDate(v){return /^\d{4}-\d{2}-\d{2}$/.test(v)&&Number.isFinite(reportDay(v));}
 function reportExport(){const s=currentSprint();if(!s)return notify('Select a sprint.',true);const data=reportFiltered();const header=['ID','Project','Title','State','Assigned to','Start','Target','Due','Priority','Effort'];const csv=[header,...data.map(w=>[w.id,w.project,w.title,w.state,w.assignee,w.startDate,w.targetDate,w.dueDate,w.priority??'',w.effort??''])].map(row=>row.map(v=>'"'+String(v??'').replace(/"/g,'""')+'"').join(',')).join('\r\n');const blob=new Blob([csv],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob);const link=document.createElement('a');link.href=url;link.download='global-sprint-'+String(s.name||'report').replace(/[^a-z0-9-]/gi,'-')+'.csv';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
 function reportSelectors(){const p=$('reportProject'),u=$('reportPerson');if(!p||!u)return;const work=reportWork();const projects=[...new Set(work.map(w=>w.project).filter(Boolean))].sort(),people=[...new Set(work.map(w=>w.assignee).filter(Boolean))].sort();p.replaceChildren(new Option('All projects',''),...projects.map(v=>new Option(v,v)));u.replaceChildren(new Option('All team members',''),...people.map(v=>new Option(v,v)));if(!projects.includes(reportProjectFilter))reportProjectFilter='';if(!people.includes(reportPersonFilter))reportPersonFilter='';p.value=reportProjectFilter;u.value=reportPersonFilter;}
-function renderReportDashboard(){const host=$('reportDashboard');if(!host)return;host.replaceChildren();const sprint=currentSprint();if(!sprint){host.append(reportNode('p','muted','Select a global sprint to view its reports.'));return;}const all=reportWork(),work=reportFiltered(),closed=work.filter(reportIsClosed),done=work.filter(reportIsDone),active=work.filter(w=>!reportIsClosed(w)&&!reportIsDone(w));const today=reportToday(),overdue=active.filter(w=>reportSafeDate(w.dueDate||w.targetDate)&&reportDate(w.dueDate||w.targetDate)<today),blocked=work.filter(w=>sprint.blockedItems?.[w.id]);const coverage=reportCoverage(),missing=coverage.missing.length;
- const title=reportNode('h3','',sprint.name+' · Delivery overview');host.append(title);const cards=reportNode('div','gs-metrics');reportMetric(cards,'Accepted / Closed',closed.length,work.length+' executable items');reportMetric(cards,'Done / Awaiting validation',done.length);reportMetric(cards,'Active or New',active.length);reportMetric(cards,'Overdue',overdue.length);reportMetric(cards,'Blocked',blocked.length);reportMetric(cards,'Not loaded',missing);host.append(cards);host.append(reportNode('p','muted',`${coverage.assigned} assigned · ${coverage.executable.length} executable · ${coverage.context.length} planning context · ${missing} unavailable. Filters apply to the figures above.`));
- const health=reportNode('section','gs-report-block');health.append(reportNode('h3','','Sprint Health'));const total=work.length;const accepted=total?Math.round(closed.length/total*100):0;const tested=total?Math.round(done.length/total*100):0;const bar=reportNode('div','gs-progress');bar.setAttribute('role','progressbar');bar.setAttribute('aria-valuenow',String(accepted));bar.setAttribute('aria-valuemin','0');bar.setAttribute('aria-valuemax','100');bar.setAttribute('aria-label','Accepted work');const a=reportNode('span','gs-progress-closed'),d=reportNode('span','gs-progress-done');a.style.width=accepted+'%';d.style.width=tested+'%';bar.append(a,d);const summary=reportNode('div','gs-health-score');summary.append(reportNode('strong','',accepted+'%'),reportNode('span','muted','Accepted / Closed'));health.append(summary,bar,reportNode('p','muted',`${accepted}% accepted · ${tested}% awaiting validation · ${Math.max(0,100-accepted-tested)}% remaining. Only validation-pending Done states remain unaccepted.`));const status=sprintHealthData();const healthState=missing?'Insufficient data':status.label;health.append(reportNode('p','gs-health-note',healthState+' · '+(missing?'Some assigned items could not be loaded. ':status.reason)));if(missing)health.append(reportNode('p','muted','Health and completion are incomplete because '+missing+' assigned items could not be loaded.'));host.append(health);reportWorkItemList(health,work,'Inspect sprint work items');
+function renderReportDashboard(){const host=$('reportDashboard');if(!host)return;host.replaceChildren();const packages=$('gs48ReportWorkPackages');if(packages)packages.replaceChildren();const sprint=currentSprint();if(!sprint){$('reportVelocity')?.replaceChildren();$('reportBurndown')?.replaceChildren();host.append(reportNode('p','muted','Select a global sprint to view its reports.'));return;}const all=reportWork(),work=reportFiltered(),closed=work.filter(reportIsClosed),done=work.filter(reportIsDone),active=work.filter(w=>!reportIsClosed(w)&&!reportIsDone(w));const today=reportToday(),overdue=active.filter(w=>reportSafeDate(w.dueDate||w.targetDate)&&reportDate(w.dueDate||w.targetDate)<today),blocked=work.filter(w=>sprint.blockedItems?.[w.id]);const coverage=reportCoverage(),missing=coverage.missing.length;
+ const delivered=done.length+closed.length,deliveryPct=work.length?Math.round(delivered/work.length*100):0;
+ const title=reportNode('h3','',sprint.name+' · Delivery overview');host.append(title);const cards=reportNode('div','gs-metrics');reportMetric(cards,'Done / Closed',delivered,'Development completed, whether or not formally accepted');reportMetric(cards,'Active or New',active.length,'Development remaining');reportMetric(cards,'Overdue',overdue.length);reportMetric(cards,'Blocked',blocked.length);reportMetric(cards,'Not loaded',missing);host.append(cards);host.append(reportNode('p','muted',`${coverage.assigned} assigned · ${coverage.executable.length} executable · ${coverage.context.length} planning context · ${missing} unavailable. Filters apply to the figures above.`));
+ const health=reportNode('section','gs-report-block');health.append(reportNode('h3','','Sprint Health · Delivery progress'));const bar=reportNode('div','gs-progress');bar.setAttribute('role','progressbar');bar.setAttribute('aria-valuenow',String(deliveryPct));bar.setAttribute('aria-valuemin','0');bar.setAttribute('aria-valuemax','100');bar.setAttribute('aria-label','Development delivered: Done and Closed');const deliveredBar=reportNode('span','gs-progress-done gs49-delivery-fill');deliveredBar.style.width=deliveryPct+'%';bar.append(deliveredBar);const summary=reportNode('div','gs-health-score');summary.append(reportNode('strong','',deliveryPct+'%'),reportNode('span','muted','Development delivered · '+delivered+' of '+work.length+' executable items'));health.append(summary,bar,reportNode('p','muted',`${delivered} Done or Closed · ${active.length} Active or New. Completed development is counted without requiring acceptance; QA/bugs remain separate risks.`));const status=sprintHealthData();const healthState=missing?'Insufficient data':status.label;health.append(reportNode('p','gs-health-note',healthState+' · '+(missing?'Some assigned items could not be loaded. ':status.reason)));if(missing)health.append(reportNode('p','muted','Health and completion are incomplete because '+missing+' assigned items could not be loaded.'));host.append(health);reportWorkItemList(health,work,'Inspect sprint work items');
+ const qa=reportNode('section','gs-report-block gs49-validation');qa.append(reportNode('h3','','Validation & quality clearance'));const qaCards=reportNode('div','gs-metrics');reportMetric(qaCards,'Awaiting validation',done.length,'Development Done; QA/PM review may still find defects');reportMetric(qaCards,'Accepted / Closed',closed.length,'Explicitly accepted on this Global Sprints Board');const openDefects=active.filter(w=>/bug|defect/i.test(String(w.type||'')));const formerlyDone=new Set((sprint.snapshots||[]).flatMap(x=>x.items||[]).filter(reportCompletedState).map(x=>Number(x.id)));const reopened=active.filter(w=>formerlyDone.has(Number(w.id)));reportMetric(qaCards,'Open defects',openDefects.length,'Currently active Bug/Defect work items in this sprint');reportMetric(qaCards,'Reopened work',reopened.length,'Previously recorded Done/Closed but currently active');qa.append(qaCards,reportNode('p','muted','Validation clearance is not the Sprint Health completion percentage. Open defects and reopened work are based on recorded work items/observations; test outcomes not tracked in ADO cannot be inferred. Native ADO terminal states do not imply automatic PM sign-off.'));host.append(qa);
  const byProject=reportNode('section','gs-report-block');byProject.append(reportNode('h3','','Project delivery'));const projectTable=reportNode('table');projectTable.innerHTML='<thead><tr><th>Project</th><th>Work</th><th>Closed</th><th>Done</th><th>Open</th></tr></thead>';const body=reportNode('tbody');for(const project of [...new Set(work.map(w=>w.project))].sort()){const list=work.filter(w=>w.project===project),row=reportNode('tr');for(const value of [project,list.length,list.filter(reportIsClosed).length,list.filter(reportIsDone).length,list.filter(w=>!reportIsClosed(w)&&!reportIsDone(w)).length])row.append(reportNode('td','',value));body.append(row);}projectTable.append(body);reportVisualBars(byProject,[...new Set(work.map(w=>w.project))].sort().map(project=>{const list=work.filter(w=>w.project===project);return {name:project,values:[list.filter(reportIsClosed).length,list.filter(reportIsDone).length,list.filter(w=>!reportIsClosed(w)&&!reportIsDone(w)).length]};}));const projectDetail=reportNode('details','gs-chart-details');projectDetail.append(reportNode('summary','','View project data table'),projectTable);byProject.append(projectDetail);host.append(byProject);reportWorkItemList(byProject,work,'Inspect project work items');
  const workload=reportNode('section','gs-report-block');workload.append(reportNode('h3','','Team workload'));const table=reportNode('table');table.innerHTML='<thead><tr><th>Assigned to</th><th>Open</th><th>Awaiting validation</th><th>Closed</th></tr></thead>';const tbody=reportNode('tbody');for(const person of [...new Set(work.map(w=>w.assignee||'Unassigned'))].sort()){const list=work.filter(w=>(w.assignee||'Unassigned')===person),tr=reportNode('tr');for(const v of [person,list.filter(w=>!reportIsClosed(w)&&!reportIsDone(w)).length,list.filter(reportIsDone).length,list.filter(reportIsClosed).length])tr.append(reportNode('td','',v));tbody.append(tr);}table.append(tbody);reportVisualBars(workload,[...new Set(work.map(w=>w.assignee||'Unassigned'))].sort().map(person=>{const list=work.filter(w=>(w.assignee||'Unassigned')===person);return {name:person,values:[list.filter(reportIsClosed).length,list.filter(reportIsDone).length,list.filter(w=>!reportIsClosed(w)&&!reportIsDone(w)).length]};}));const teamDetail=reportNode('details','gs-chart-details');teamDetail.append(reportNode('summary','','View workload data table'),table);workload.append(teamDetail,reportNode('p','muted','Assignment counts are not capacity or time estimates.'));host.append(workload);reportWorkItemList(workload,work,'Inspect team work items');
  const issues=reportNode('section','gs-report-block');issues.append(reportNode('h3','','Management attention'));const attention=[...new Map([...overdue,...blocked,...done].map(w=>[w.id,w])).values()];if(!attention.length)issues.append(reportNode('p','muted','No overdue, blocked or validation-pending work among loaded items.'));for(const w of attention.slice(0,30)){const line=reportNode('div','gs-attention');line.append(reportWorkItemLink(w),reportNode('span','muted',w.project+' · '+w.state+(overdue.includes(w)?' · Overdue':'')));issues.append(line);}host.append(issues);
- renderVelocityBurndown();}
-function reportCompletedState(w){return ['Done','Closed'].includes(w?.completionCategory||workflowColumn(w));}
+ if(packages)gs40RenderReportDrilldown(packages,work);
+ renderVelocityBurndown();
+}
+function reportCompletedState(w){
+ // New snapshots retain the sprint-specific delivery stage as-of capture.
+ // Older immutable snapshots retain their recorded native category; never
+ // backfill historical Board overrides from today's current sprint.
+ const stage=w?.deliveryCategory||w?.completionCategory||boardColumn(w);
+ return stage==='Done'||stage==='Closed';
+}
 function reportEstimate(w){const raw=w?.effort??w?.storyPoints;return raw!==null&&raw!==undefined&&raw!==''&&Number.isFinite(Number(raw))&&Number(raw)>=0?Number(raw):0;}
-function reportCommittedProgress(baseline,observed){const executable=baseline.filter(w=>!isPlanningContextType(w)&&!isRemoved(w));const latest=new Map(observed.map(w=>[Number(w.id),w]));let total=0,completed=0,completedItems=0,remaining=0;for(const original of executable){const now=latest.get(Number(original.id));const estimate=reportEstimate(now||original);total+=estimate;if(now&&reportCompletedState(now)){completed+=estimate;completedItems++;}else remaining+=estimate;}return {total,completed,remaining,completedItems,totalItems:executable.length};}
+function reportCommittedProgress(baseline,observed){
+ // The first snapshot is immutable. Historical snapshots lacking parentId cannot
+ // be retroactively inferred; new captures carry relations for exact accounting.
+ return GS40Core.progress(baseline,observed,reportCompletedState,w=>!isRemoved(w));
+}
 function renderVelocityBurndown(){
  const velocity=$('reportVelocity'),burn=$('reportBurndown');if(!velocity||!burn)return;velocity.replaceChildren();burn.replaceChildren();const s=currentSprint();if(!s)return;
- const siblings=workspaceSprints().filter(x=>x.start).sort((a,b)=>a.start.localeCompare(b.start));const table=reportNode('table');table.innerHTML='<thead><tr><th>Sprint</th><th>Committed items</th><th>Completed items</th><th>Completed points</th><th>Remaining points</th></tr></thead>';const tb=reportNode('tbody');const velocityRows=[];
- for(const sp of siblings.slice(-8)){
-  const snaps=(sp.snapshots||[]).filter(x=>reportSnapshotTimestamp(x.at)&&Array.isArray(x.items)).sort((a,b)=>reportSnapshotTimestamp(a.at).localeCompare(reportSnapshotTimestamp(b.at)));if(!snaps.length)continue;
-  const progress=reportCommittedProgress(snaps[snaps.length-1].items,snaps[snaps.length-1].items);velocityRows.push({name:sp.name,value:progress.completed});const row=reportNode('tr');for(const v of [sp.name,progress.totalItems,progress.completedItems,progress.completed,progress.remaining])row.append(reportNode('td','',v));tb.append(row);
+ // Velocity compares PREVIOUS sprints only. A current-sprint progress bar is
+ // not historical velocity, and missing snapshots are unknown rather than zero.
+ const today=reportToday(),history=workspaceSprints().filter(sp=>sp.id!==s.id&&sp.start&&sp.end&&reportSafeDate(sp.end)&&(sp.end<today||/^(closed|complete|completed)$/i.test(String(sp.status||'')))).sort((a,b)=>a.start.localeCompare(b.start)).slice(-8);
+ const table=reportNode('table');table.innerHTML='<thead><tr><th>Sprint</th><th>As of</th><th>Recorded scope</th><th>Completed items</th><th>Completed points</th><th>Remaining points</th></tr></thead>';const tb=reportNode('tbody');const velocityRows=[];
+ for(const sp of history){
+  const snaps=(sp.snapshots||[]).filter(x=>reportSnapshotTimestamp(x.at)&&Array.isArray(x.items)).sort((a,b)=>reportSnapshotTimestamp(a.at).localeCompare(reportSnapshotTimestamp(b.at)));
+  const latest=snaps[snaps.length-1],row=reportNode('tr');
+  if(latest){const progress=reportCommittedProgress(latest.items,latest.items);const asOf=reportObservationDay(latest.at);velocityRows.push({name:sp.name,value:progress.completed,detail:'As of '+asOf});for(const v of [sp.name,asOf,progress.totalItems,progress.completedItems,progress.completed,progress.remaining])row.append(reportNode('td','',v));}
+  else{velocityRows.push({name:sp.name,value:null,detail:'No observation'});for(const v of [sp.name,'No observation','—','—','—','—'])row.append(reportNode('td','',v));}
+  tb.append(row);
  }
- table.append(tb);if(velocityRows.length)reportVelocityChart(velocity,velocityRows);else {const current=reportCommittedProgress(reportWork(),reportWork());if(current.totalItems) {reportVelocityChart(velocity,[{name:'Current sprint · live (not historical velocity)',value:current.completed}]);velocity.append(reportNode('p','muted','Historical velocity needs recorded sprint observations; the bar above is live completion only.'));}else reportEmptyChart(velocity,'No velocity data','Assign executable work items to display live completion.');}
+ table.append(tb);
+ if(!history.length)reportEmptyChart(velocity,'No previous sprints available','Velocity compares completed historical sprints. Create and record more than one sprint to establish a trend.');
+ else if(velocityRows.some(row=>Number.isFinite(row.value))){
+  reportVelocityChart(velocity,velocityRows);
+  if(velocityRows.filter(row=>Number.isFinite(row.value)).length<2)velocity.append(reportNode('p','gs-health-note','Only one previous sprint has recorded effort. More completed sprint observations are needed for a meaningful velocity trend.'));
+  if(velocityRows.some(row=>row.value===null))velocity.append(reportNode('p','muted','A dash means no saved history for that sprint; missing measurements are not zero velocity.'));
+ }else reportEmptyChart(velocity,'Historical velocity not recorded',`${history.length} previous sprint(s) found, but none has a dated work-item observation. Missing history cannot be reconstructed reliably from current Azure DevOps states.`);
  const coverage=reportCoverage(),liveWork=reportWork();
- if(!coverage.missing.length&&coverage.assigned){const live=reportCommittedProgress(liveWork,liveWork);velocity.append(reportNode('p','gs-health-note',`Selected sprint live completion (${s.name}): ${live.completed} completed points, ${live.remaining} remaining points; ${live.completedItems} of ${live.totalItems} executable items completed. This is not historical velocity.`));}
- else if(coverage.missing.length)velocity.append(reportNode('p','muted',`${coverage.missing.length} committed items are not loaded; live completion cannot be verified.`));
- const detail=reportNode('details','gs-chart-details');detail.append(reportNode('summary','','View completed-effort data'),table);velocity.append(detail,reportNode('p','muted','Completed points use normalized Effort or Story Points. Done, Completed and Closed count as completed execution; each item counts once. Each historical bar reflects its last recorded observation, not necessarily its final sprint result.' ));
+ if(!coverage.missing.length&&coverage.assigned){const live=reportCommittedProgress(liveWork,liveWork);velocity.append(reportNode('p','gs-health-note',`Current sprint (${s.name}) is separate from historical velocity: ${live.completed} completed points and ${live.remaining} remaining points; ${live.completedItems} of ${live.totalItems} executable commitment units delivered.`));}
+ else if(coverage.missing.length)velocity.append(reportNode('p','muted',`${coverage.missing.length} items are not loaded; current-sprint completion cannot be verified.`));
+ const detail=reportNode('details','gs-chart-details');detail.append(reportNode('summary','','View historical velocity data'),table);velocity.append(detail,reportNode('p','muted','Previous eight ended sprints in this workspace, ordered by start date. Each available bar uses its last saved observation, not an inferred final result. Done and Closed count as delivered work; shared parent/child effort is counted once. Unrecorded history is excluded, not treated as zero.'));
  const snaps=(s.snapshots||[]).filter(x=>reportSnapshotTimestamp(x.at)&&Array.isArray(x.items)).sort((a,b)=>reportSnapshotTimestamp(a.at).localeCompare(reportSnapshotTimestamp(b.at)));
  if(!snaps.length){
   const live=reportWork(),committed=(s.itemIds||[]).length;
   if(committed&&!reportCoverage().missing.length){const progress=reportCommittedProgress(live,live);burn.append(reportNode('p','gs-health-note',`Live sprint progress: ${progress.completed} completed points, ${progress.remaining} remaining points (${progress.completedItems}/${progress.totalItems} executable items).`));}
-  if(committed&&!reportCoverage().missing.length){const live=reportCommittedProgress(reportWork(),reportWork());reportBurndownProgress(burn,live,'Live remaining effort · no historical trend');}else reportEmptyChart(burn,'Burndown history not yet available','A dated trend needs recorded observations.');return;
+  if(committed&&!reportCoverage().missing.length)reportEmptyChart(burn,'No burndown trend yet','Current progress is shown above. A burndown line needs observations from at least two different dates; no observations have been recorded.');else reportEmptyChart(burn,'Burndown history not yet available','A dated trend needs recorded observations.');return;
  }
- const base=snaps[0].items;const data=snaps.map(x=>({day:reportSnapshotTimestamp(x.at).slice(0,10),...reportCommittedProgress(x.items,x.items)}));const unique=[...new Map(data.map(x=>[x.day,x])).values()];const latest=data[data.length-1];
+ const base=snaps[0].items;const data=snaps.map(x=>({day:reportObservationDay(x.at),...reportCommittedProgress(x.items,x.items)}));const unique=[...new Map(data.map(x=>[x.day,x])).values()];const latest=data[data.length-1];
  const live=reportWork();if(live.length===new Set((s.itemIds||[]).map(Number)).size || (s.itemIds||[]).every(id=>[...items,...assignedItems].some(w=>Number(w.id)===Number(id)))){const current=reportCommittedProgress(live,live);burn.append(reportNode('p','gs-health-note',`Live sprint progress: ${current.completed} completed points, ${current.remaining} remaining points (${current.completedItems}/${current.totalItems} executable items). Historical charts update only from saved observations.`));}
  burn.append(reportNode('p','muted',`Last recorded observation: ${latest.completed} completed points, ${latest.remaining} remaining points (${latest.completedItems} of ${latest.totalItems} executable items completed).`));
  if(data.some(p=>p.total!==data[0].total||p.totalItems!==data[0].totalItems))burn.append(reportNode('p','gs-health-note','Sprint membership or estimates changed between recorded observations. The actual line reflects each dated observation; the ideal line is based on the earliest recorded baseline and is not a fixed-scope comparison.')); 
- if(unique.length<2){reportBurndownProgress(burn,latest,'Recorded effort · one observation day (no trend yet)');return;}
- const max=Math.max(1,...unique.map(x=>x.total));const start=s.start&&reportSafeDate(s.start)?s.start:unique[0].day,end=s.end&&reportSafeDate(s.end)?s.end:unique[unique.length-1].day,span=Math.max(1,reportDay(end)-reportDay(start));const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 700 220');svg.setAttribute('role','img');svg.setAttribute('aria-label','Remaining estimated effort compared with ideal burndown');svg.style.width='100%';svg.style.maxHeight='270px';const ns='http://www.w3.org/2000/svg';const add=(tag,attrs)=>{const el=document.createElementNS(ns,tag);for(const [k,v] of Object.entries(attrs))el.setAttribute(k,String(v));svg.append(el);return el;};const x=d=>40+Math.max(0,Math.min(1,(reportDay(d)-reportDay(start))/span))*640,y=n=>190-(n/max)*160;add('line',{x1:40,y1:190,x2:680,y2:190,stroke:'currentColor','stroke-opacity':'.4'});add('line',{x1:40,y1:30,x2:40,y2:190,stroke:'currentColor','stroke-opacity':'.4'});add('line',{x1:x(start),y1:y(unique[0].total),x2:x(end),y2:y(0),stroke:'#8a9bab','stroke-dasharray':'7 5','stroke-width':2});add('polyline',{points:unique.map(p=>`${x(p.day)},${y(p.remaining)}`).join(' '),fill:'none',stroke:'#287fc1','stroke-width':3});for(const p of unique)add('circle',{cx:x(p.day),cy:y(p.remaining),r:4,fill:'#287fc1'});burn.append(svg,reportNode('p','muted',`Actual remaining estimated points across ${unique.length} recorded dates. No historical states have been inferred.`));
+ if(unique.length<2){reportEmptyChart(burn,'Burndown requires more history',`Only ${unique.length} observation day is recorded. A completed/remaining bar is not a burndown trend. Global Sprints records one observation each day a sprint is loaded, even if nothing changes.`);return;}
+ const max=Math.max(1,...unique.map(x=>x.total));const start=s.start&&reportSafeDate(s.start)?s.start:unique[0].day,end=s.end&&reportSafeDate(s.end)?s.end:unique[unique.length-1].day,span=Math.max(1,reportDay(end)-reportDay(start));const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 700 220');svg.setAttribute('role','img');svg.setAttribute('aria-label','Remaining estimated effort compared with ideal burndown');svg.style.width='100%';svg.style.maxHeight='270px';const ns='http://www.w3.org/2000/svg';const add=(tag,attrs)=>{const el=document.createElementNS(ns,tag);for(const [k,v] of Object.entries(attrs))el.setAttribute(k,String(v));svg.append(el);return el;};const x=d=>40+Math.max(0,Math.min(1,(reportDay(d)-reportDay(start))/span))*640,y=n=>190-(n/max)*160;add('line',{x1:40,y1:190,x2:680,y2:190,stroke:'currentColor','stroke-opacity':'.4'});add('line',{x1:40,y1:30,x2:40,y2:190,stroke:'currentColor','stroke-opacity':'.4'});add('line',{x1:x(start),y1:y(unique[0].total),x2:x(end),y2:y(0),stroke:'#8a9bab','stroke-dasharray':'7 5','stroke-width':2});add('polyline',{points:unique.map(p=>`${x(p.day)},${y(p.remaining)}`).join(' '),fill:'none',stroke:'#287fc1','stroke-width':3});for(const p of unique)add('circle',{cx:x(p.day),cy:y(p.remaining),r:4,fill:'#287fc1'});burn.append(svg,reportNode('p','muted',`Blue solid: observed remaining effort over ${unique.length} recorded dates · Grey dashed: ideal from initial recorded scope. ${unique[0].day} to ${unique[unique.length-1].day}. Changes between observations have not been invented.`));
 }
 
-async function captureReportObservation(){const s=currentSprint();if(!s)return notify('Select a sprint.',true);const all=new Map([...items,...assignedItems].map(w=>[Number(w.id),w]));const missing=(s.itemIds||[]).filter(id=>!all.has(Number(id)));if(missing.length)return notify('Cannot capture incomplete observation: '+missing.length+' work items not loaded.',true);const snap={at:new Date().toISOString(),items:s.itemIds.map(id=>{const w=all.get(Number(id));return {id:w.id,project:w.project,title:w.title,type:w.type,state:w.state,completionCategory:workflowColumn(w),effort:w.effort,storyPoints:w.storyPoints};})};const ok=await persist(r=>{const target=r.sprints.find(x=>x.id===s.id);target.snapshots||=[];target.snapshots.push(snap);target.snapshots=retainReportHistory(target.snapshots);},false);if(ok){renderSprintHealth();notify('Dated work-item observation captured.');}}
+async function captureReportObservation(){const s=currentSprint();if(!s)return notify('Select a sprint.',true);const all=new Map([...items,...assignedItems].map(w=>[Number(w.id),w]));const missing=(s.itemIds||[]).filter(id=>!all.has(Number(id)));if(missing.length)return notify('Cannot capture incomplete observation: '+missing.length+' work items not loaded.',true);const snap={at:new Date().toISOString(),items:s.itemIds.map(id=>{const w=all.get(Number(id));return {id:w.id,project:w.project,title:w.title,type:w.type,state:w.state,completionCategory:workflowColumn(w),deliveryCategory:boardColumn(w),effort:w.effort,storyPoints:w.storyPoints,parentId:w.parentId||null,remainingWork:w.remainingWork??null};})};const ok=await persist(r=>{const target=r.sprints.find(x=>x.id===s.id);target.snapshots||=[];target.snapshots.push(snap);target.snapshots=retainReportHistory(target.snapshots);},false);if(ok){renderSprintHealth();notify('Dated work-item observation captured.');}}
 async function updateTimelineTicket(w,changes){if(timelineBusy)return;const entries=Object.entries(changes).filter(([,v])=>v!==undefined);if(!entries.length)return;timelineBusy=true;const button=$('timelineSave');if(button)button.disabled=true;try{diagnostic('ado.timeline_update_attempt',{workItemId:w.id,fieldCount:entries.length,revision:w.rev,fields:entries.map(([path])=>path.split('.').at(-1)).join(',')});const patch=[{op:'test',path:'/rev',value:w.rev},...entries.map(([path,value])=>value?{op:'add',path:'/fields/'+path,value}: {op:'remove',path:'/fields/'+path})];const result=await api(`/_apis/wit/workitems/${w.id}?api-version=7.1`,{method:'PATCH',headers:{'Content-Type':'application/json-patch+json'},body:JSON.stringify(patch)});diagnostic('ado.timeline_update_success',{workItemId:w.id,fieldCount:entries.length,revisionBefore:w.rev,revisionAfter:result.rev,fields:entries.map(([path])=>path.split('.').at(-1)).join(',')});const fresh=normalizeItem(result);for(const item of [...items,...assignedItems,...ancestorItems])if(item.id===w.id)Object.assign(item,fresh);renderBoard();renderSprintHealth();renderTimeline();void autoReportObservation(currentSprint(),reportWork());notify('Saved ticket #'+w.id+' directly to Azure DevOps.');}catch(e){diagnostic('ado.timeline_update_failure',{workItemId:w.id,reason:String(e.message||e)},'error');notify('Ticket update rejected. No local changes saved: '+e.message,true);await reportRefresh();}finally{timelineBusy=false;if(button)button.disabled=false;}}
 let timelineSelectedId=null;
 function reportTimelineAxis(min,max){
@@ -2703,7 +2887,7 @@ function ganttShowEditor(existing=null){
 }
 $('ganttHierarchyFilter')?.addEventListener('change',()=>{renderGantt();});$('ganttProject')?.addEventListener('change',()=>{ganttEditId=null;renderGantt();});$('ganttLoad')?.addEventListener('click',()=>void ganttLoad());$('ganttAdd')?.addEventListener('click',()=>{ganttEditId=null;ganttShowEditor();$('ganttEditor').scrollIntoView({block:'nearest',behavior:'smooth'});});
 async function refreshTrackedWorkItemsQuietly(){
- if(!registry||busy||timelineBusy||sprintDirty()||projectsDirty()||document.hidden)return;
+ if(!registry||busy||timelineBusy||sprintDirty()||projectsDirty()||document.hidden||typeof GS46Board!=='undefined'&&GS46Board.isEditing())return {status:'deferred'};
  const selected=currentSprint();if(!selected?.itemIds?.length)return;
  const focused=document.activeElement;if(focused&&$('timelineEditor')?.contains(focused)&&['INPUT','SELECT','TEXTAREA'].includes(focused.tagName))return;
  const ids=[...new Set(selected.itemIds.map(Number))],fresh=[];
@@ -2713,8 +2897,9 @@ async function refreshTrackedWorkItemsQuietly(){
   const existing=new Map(assignedItems.map(w=>[w.id,w]));let changed=false;
   for(const item of fresh){const prior=existing.get(item.id);if(prior?.rev!==item.rev){changed=true;existing.set(item.id,{...prior,...item});}}
   if(changed){assignedItems=[...existing.values()];renderBoard();renderSprintHealth();renderTimeline();notify('Azure DevOps work-item changes synchronized.');}
-  diagnostic('ado.refresh.completed',{sprintId:selected.id,requested:ids.length,received:fresh.length,changed,missing:ids.length-fresh.length});
- }catch(e){diagnostic('ado.refresh.failed',{reason:String(e.message||e)},'warn');console.warn('Background work-item refresh failed',e);}
+  diagnostic('ado.refresh.completed',{loaded:fresh.length,changed,missing:ids.length-fresh.length});
+  return {status:'complete',changed,loaded:fresh.length};
+ }catch(e){diagnostic('ado.refresh.failed',{operation:'refresh',status:Number(e.status)||0,errorCode:'refresh_failed'},'warn');console.warn('Background work-item refresh failed',e);return {status:'failed',error:e};}
 }
 window.setInterval(()=>void refreshTrackedWorkItemsQuietly(),120000);
 
@@ -2739,9 +2924,14 @@ $('reportRefresh')?.addEventListener('click',()=>void reportRefresh());
 $('reportObserve')?.addEventListener('click',()=>void captureReportObservation());
 $('reportExport')?.addEventListener('click',reportExport);
 
-function sprintHealthData(){const s=currentSprint();if(!s)return {label:'No sprint selected',reason:'Select a sprint to assess its health.',metrics:[]};const ids=(s.itemIds||[]).map(Number),byId=new Map([...items,...assignedItems].map(w=>[Number(w.id),w]));const missing=ids.filter(id=>!byId.has(id)).length;const work=ids.map(id=>byId.get(id)).filter(Boolean).filter(w=>!isPlanningContextType(w));const completed=work.filter(reportCompletedState).length;const blocked=work.filter(w=>!!s.blockedItems?.[w.id]).length;const today=new Date().toISOString().slice(0,10);const overdue=work.filter(w=>{const date=w.dueDate||w.targetDate||w.due||'';return date&&String(date).slice(0,10)<today&&!reportCompletedState(w);}).length;const remaining=work.length-completed;const end=s.end||'';let label='On track',reason='No blockers or overdue items are visible in the loaded work.';if(!work.length||missing||!s.start||!s.end||(!work.some(w=>w.startDate||w.targetDate||w.dueDate)&&!s.snapshots?.length)){label='Insufficient data';reason=missing?`${missing} assigned work items have not loaded; the assessment is incomplete.`:!work.length?'No executable assigned work is loaded yet.':!s.start||!s.end?'Sprint start/end dates are required for a reliable assessment.':'No work-item dates or recorded progress observations are available to establish schedule health.';}else if(blocked||overdue||(end&&end<today&&remaining)){label='At risk';reason=[blocked?`${blocked} blocked`:null,overdue?`${overdue} overdue`:null,end&&end<today&&remaining?`${remaining} incomplete after sprint end`:null].filter(Boolean).join(' · ');}else if(end&&remaining&&((planDate(end)-planDate(today))/86400000)<=2){label='Needs attention';reason=`${remaining} unfinished items with two days or fewer remaining.`;}return {label,reason,metrics:[['Loaded work',work.length],['Completed',completed],['Blocked',blocked],['Overdue (known dates)',overdue],['Not loaded',missing]]};}
+function sprintHealthData(){const s=currentSprint();if(!s)return {label:'No sprint selected',reason:'Select a sprint to assess its health.',metrics:[]};const ids=(s.itemIds||[]).map(Number),byId=new Map([...items,...assignedItems].map(w=>[Number(w.id),w]));const missing=ids.filter(id=>!byId.has(id)).length;const available=ids.map(id=>byId.get(id)).filter(Boolean);const work=available.filter(w=>!isPlanningContextType(w)||GS40Core.featureOwner(w,available));const completed=work.filter(w=>reportIsDone(w)||reportIsClosed(w)).length;const awaiting=work.filter(reportIsDone).length;const accepted=work.filter(reportIsClosed).length;const blocked=work.filter(w=>!!s.blockedItems?.[w.id]).length;const today=reportToday();const overdue=work.filter(w=>{const date=reportDate(w.dueDate||w.targetDate||w.due||'');return reportSafeDate(date)&&date<today&&!reportIsDone(w)&&!reportIsClosed(w);}).length;const remaining=work.length-completed;const end=s.end||'';const progress=work.length?Math.round(completed/work.length*100):0;let label='On track',reason=`${completed}/${work.length} delivered (${progress}%) · ${remaining} development items remaining. Validation tracked separately.`;
+ if(!work.length||missing||!reportSafeDate(s.start)||!reportSafeDate(s.end)){label='Insufficient data';reason=missing?`${missing} assigned work items have not loaded; delivery progress is incomplete.`:!work.length?'No executable assigned work is loaded yet.':'Valid sprint start and end dates are required for schedule health.';}
+ else if(blocked||overdue||(end<today&&remaining)){label='At risk';reason=[blocked?`${blocked} blocked`:null,overdue?`${overdue} overdue`:null,end<today&&remaining?`${remaining} unfinished after sprint end`:null].filter(Boolean).join(' · ');}
+ else if(remaining&&end>=today&&Math.round((planDate(end)-planDate(today))/86400000)<=2){label='Needs attention';reason=`${remaining} development items remain with two days or fewer until sprint end; QA may continue separately.`;}
+ const snapshots=s.snapshots||[],baseline=snapshots[0]?.items||[],initialIds=new Set(baseline.map(w=>Number(w.id))),scopeAdded=baseline.length?work.filter(w=>!initialIds.has(Number(w.id))).length:0;
+ return {label,reason,metrics:[['Executable work',work.length],['Development delivered',completed],['Active or New',remaining],['Awaiting validation',awaiting],['Accepted / Closed',accepted],['Blocked',blocked],['Overdue (known dates)',overdue],['Not loaded',missing],['Added since baseline',scopeAdded]]};}
 function renderSprintHealth(){const data=sprintHealthData();const node=$('sprintHealthReport');if(node){node.replaceChildren();const heading=document.createElement('p');heading.className='health-indicator';heading.textContent=data.label+' — '+data.reason;node.append(heading);const row=document.createElement('div');row.className='health-metrics';for(const [label,n] of data.metrics){const el=document.createElement('div');el.className='health-metric';const strong=document.createElement('strong');strong.textContent=String(n);const span=document.createElement('span');span.textContent=label;el.append(strong,span);row.append(el);}node.append(row);}const compact=$('planningHealthIndicator');if(compact)compact.textContent=data.label+' · '+data.reason;renderReportCatalogue();renderCeremonyInsights();reportSelectors();renderReportDashboard();}
-function openReport(id){activateTab('reports');const detail=$('reportDetail');if(!detail)return;const data=sprintHealthData();const w=activeScheduleWorkspace();const meetings=(w?.meetingSchedules||[]).flatMap(sc=>sc.meetings||[]);const s=currentSprint();const text={health:data.label+' — '+data.reason,progress:`${data.metrics.find(m=>m[0]==='Completed')?.[1]||0} completed work items among ${data.metrics.find(m=>m[0]==='Loaded work')?.[1]||0} loaded executable items.`,blockers:`${data.metrics.find(m=>m[0]==='Blocked')?.[1]||0} blocked items; ${data.metrics.find(m=>m[0]==='Overdue (known dates)')?.[1]||0} overdue items with known dates.`,ceremonies:`${meetings.length} workspace schedule records; ${meetings.filter(m=>m.status==='Completed').length} marked completed. Sprint-specific ceremony records: ${(s?.ceremonies||[]).length}.`,people:'Select By person in Ceremony Insights for participant commitments and meeting records. Individual workload depends on loaded Azure DevOps assignments.',workspace:`Workspace: ${w?.name||'none'} · ${(w?.meetingSchedules||[]).length} saved meeting schedules · ${(registry?.sprints||[]).filter(x=>x.workspaceId===activeWorkspaceId).length} sprints.`};detail.textContent=text[id]||'Select a report.';detail.scrollIntoView({block:'nearest'});}
+function openReport(id){activateTab('reports');const detail=$('reportDetail');if(!detail)return;const data=sprintHealthData();const w=activeScheduleWorkspace();const meetings=(w?.meetingSchedules||[]).flatMap(sc=>sc.meetings||[]);const s=currentSprint();const text={health:data.label+' — '+data.reason,progress:`${data.metrics.find(m=>m[0]==='Development delivered')?.[1]||0} delivered work items among ${data.metrics.find(m=>m[0]==='Executable work')?.[1]||0} loaded executable items.`,blockers:`${data.metrics.find(m=>m[0]==='Blocked')?.[1]||0} blocked items; ${data.metrics.find(m=>m[0]==='Overdue (known dates)')?.[1]||0} overdue items with known dates.`,ceremonies:`${meetings.length} workspace schedule records; ${meetings.filter(m=>m.status==='Completed').length} marked completed. Sprint-specific ceremony records: ${(s?.ceremonies||[]).length}.`,people:'Select By person in Ceremony Insights for participant commitments and meeting records. Individual workload depends on loaded Azure DevOps assignments.',workspace:`Workspace: ${w?.name||'none'} · ${(w?.meetingSchedules||[]).length} saved meeting schedules · ${(registry?.sprints||[]).filter(x=>x.workspaceId===activeWorkspaceId).length} sprints.`};detail.textContent=text[id]||'Select a report.';detail.scrollIntoView({block:'nearest'});}
 function renderReportCatalogue(){const node=$('reportCatalogue');if(!node)return;node.replaceChildren();for(const [id,title] of [['health','Sprint Health'],['progress','Work Progress'],['blockers','Blockers & Overdue'],['ceremonies','Ceremony Insights'],['people','Individual Workload'],['workspace','Workspace Overview']]){const b=document.createElement('button');b.type='button';b.textContent=title;b.onclick=()=>openReport(id);node.append(b);}}
 function renderCeremonyInsights(){const node=$('ceremonyInsightsContent');if(!node)return;node.replaceChildren();const w=activeScheduleWorkspace(),s=currentSprint(),meetings=[...(w?.meetingSchedules||[]).flatMap(sc=>sc.meetings||[]),...(s?.ceremonies||[])];const mode=$('insightMode')?.value||'overview';$('insightDateWrap')?.classList.toggle('hidden',mode!=='date');$('insightPersonWrap')?.classList.toggle('hidden',mode!=='person');const personSelect=$('insightPerson');if(personSelect){const previous=personSelect.value;const names=[...new Set(meetings.flatMap(m=>(m.participants||'').split(/[,;]+/).map(v=>v.trim()).filter(Boolean)))].sort();personSelect.replaceChildren(new Option('Choose participant',''),...names.map(n=>new Option(n,n)));personSelect.value=names.includes(previous)?previous:'';}const metric=(label,value)=>{const div=document.createElement('div');div.className='insight-metric';const strong=document.createElement('strong');strong.textContent=String(value);const caption=document.createElement('span');caption.textContent=label;div.append(strong,caption);return div;};const cards=document.createElement('div');cards.className='insight-metrics';cards.append(metric('Meeting records',meetings.length),metric('Marked completed',meetings.filter(m=>m.status==='Completed').length),metric('Outcomes recorded',meetings.filter(m=>!!m.outcome?.trim()).length),metric('Sprint health',sprintHealthData().label));node.append(cards);const filtered=meetings.filter(m=>mode==='date'?m.date===$('insightDate').value:mode==='person'?(personSelect.value&&m.participants?.split(/[,;]+/).some(v=>v.trim()===personSelect.value)):true).sort((a,b)=>(a.date||'').localeCompare(b.date||''));const description=document.createElement('p');description.className='muted';description.textContent=mode==='person'&&!personSelect.value?'Choose a participant to see their meeting commitments.':`${filtered.length} matching meeting records. Only recorded completion and outcomes count.`;node.append(description);for(const m of filtered.slice(0,35)){const row=document.createElement('p');row.textContent=`${m.date||'Undated'} · ${m.type||'Meeting'} · ${m.status||'Proposed'}${m.outcome?' · Outcome recorded':''}`;node.append(row);}if(filtered.length>35){const p=document.createElement('p');p.className='muted';p.textContent=`Showing first 35 of ${filtered.length} records.`;node.append(p);}}
 $('planningHealthDetails')?.addEventListener('click',()=>openReport('health'));$('insightsFullReport')?.addEventListener('click',()=>openReport('ceremonies'));for(const id of ['insightMode','insightDate','insightPerson'])$(id)?.addEventListener('change',renderCeremonyInsights);
@@ -2847,6 +3037,7 @@ function wizardStepError(message){
 }
 function showWizardStep(n){renderOutlookPlanningReadiness();if(n===1&&wizardStep===1)restoreSavedMeetingPreferences();wizardStep=Math.max(1,Math.min(4,n));for(let i=1;i<=4;i++)$('wizardStep'+i).classList.toggle('hidden',i!==wizardStep);$('wizardStepLabel').textContent='Step '+wizardStep+' of 4';const hint=$('wizardStepHelp');if(hint)hint.textContent=['','Choose the sprint or project period. Past dates remain part of the plan, but must not be invited retroactively.','Choose ceremonies to include. Previously saved ceremonies remain in the schedule below and are never silently replaced.','Configure standups and attendees. Choose whether to repeat all ceremonies through consecutive sprints, then set the end date.','Review the proposed dates and recurrence. Save a draft first, then open its meetings to book Outlook invitations explicitly.'][wizardStep];$('wizardBack').disabled=wizardStep===1;$('wizardBack').classList.remove('gs-review-back-hidden');$('wizardNext').classList.toggle('hidden',wizardStep===4);$('previewCeremonies').classList.toggle('hidden',wizardStep!==4);$('confirmCeremonies').classList.toggle('hidden',wizardStep!==4);$('wizardReset').classList.remove('hidden');$('wizardNext').textContent=wizardStep===1?'Start':'Continue';$('wizardNext').classList.toggle('gs-start-action',wizardStep===1);if(wizardStep===3){syncRepeatSprints();syncPlanManualStandups();$('planContactEnable').textContent=peopleLookupEnabled?'Disable Outlook recipient suggestions':'Enable Outlook recipient suggestions';$('planContactEnable').setAttribute('aria-pressed',String(peopleLookupEnabled));renderStep3Calendar();}if(wizardStep===4&&ceremonySetupMode()!=='external')previewCeremonyPlan();syncCeremonySetupChoice();}
 function activeScheduleWorkspace(){return registry?.workspaces?.find(w=>w.id===activeWorkspaceId);}
+function gs43Today(){const d=new Date();return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;}
 function scheduleRange(){
  const scope=$('planScope').value;
  const base=scope==='sprint'?{start:currentSprint()?.start||'',end:currentSprint()?.end||''}:{start:$('planStart').value,end:$('planEnd').value};
@@ -3017,7 +3208,12 @@ function previewCeremonyPlan(){
  // For Monday-start two-week sprints: final Friday. Tuesday-start: final Monday.
  const asDate=i=>planISO(new Date(start.getTime()+i*86400000));
  const weekdaysBetween=(from,to)=>{const days=[];for(let d=planDate(from);d<=planDate(to);d.setUTCDate(d.getUTCDate()+1))if(d.getUTCDay()>0&&d.getUTCDay()<6)days.push(planISO(d));return days;};
- const baseEnd=sprint?.end||range.end;
+ // A defined project period may start AFTER the currently selected sprint.
+ // Borrow its cadence (duration), never its historic end date, when staging a
+ // replacement schedule. Repeating reviews/retros then align to the new period.
+ const cycleLength=sprintDays>=7?sprintDays:14;
+ const projectCycleEnd=planISO(new Date(start.getTime()+(cycleLength-1)*86400000));
+ const baseEnd=$('planScope').value==='sprint'&&sprint?.end>=range.start?sprint.end:projectCycleEnd;
  const cycles=gsCeremonyCycle(range.start,baseEnd,range.end,cadenceRange);
  if(!cycles.length)throw Error('No complete sprint ends within the selected schedule. Extend the end date or review sprint dates.');
  const firstCycle=cycles[0];
@@ -3069,10 +3265,11 @@ function previewCeremonyPlan(){
 async function confirmCeremonyPlan(){const w=activeScheduleWorkspace();if(!w||w.id!==proposalWorkspaceId||!proposalRange)return notify('Workspace changed. Regenerate the proposal.',true);const selected=proposedCeremonies.filter(c=>!c.excluded);if(!selected.length)return notify('Select at least one meeting.',true);if(selected.some(c=>!c.date||c.date<proposalRange.start||c.date>proposalRange.end||!c.time||!Number.isInteger(c.duration)||c.duration<5||c.duration>480))return notify('Selected meetings need valid dates, times and durations within the chosen period.',true);
  const keys=new Set();for(const c of selected){const k=[c.date,c.type,c.secondary||''].join('|');if(keys.has(k))return notify('Duplicate meetings in preview.',true);keys.add(k);}
  const existing=scheduleMeetingRecords(w).concat((registry.sprints||[]).filter(s=>s.workspaceId===w.id).flatMap(s=>s.ceremonies||[]));const unique=selected.filter(c=>!existing.some(e=>e.status!=='Cancelled'&&e.date===c.date&&e.type===c.type&&e.secondary===c.secondary));if(!unique.length)return notify('These meetings already exist.',true);
- if(!confirm(`CONFIRM MEETING SCHEDULE\n\nWorkspace: ${w.name}\nPeriod: ${proposalRange.start} to ${proposalRange.end}\nMeetings: ${unique.length}\nParticipants: ${$('planParticipants').value||'Not specified'}\n\nSave this draft schedule and open its overview?\nNo Outlook invitations will be sent.`))return;const now=new Date().toISOString();const scheduleId=crypto.randomUUID();const ok=await persist(r=>{const target=r.workspaces.find(x=>x.id===w.id);target.meetingSchedules||=[];target.meetingSchedules.push({id:scheduleId,name:'Meeting schedule '+proposalRange.start+' – '+proposalRange.end,start:proposalRange.start,end:proposalRange.end,createdAt:now,updatedAt:now,lifecycle:'Draft',preferences:{repeatSprints:$('planRepeatSprints').checked,repeatEnd:$('planRepeatSprints').checked?$('planRepeatEnd').value:null,standupDuration:Number($('planDuration').value),cadence:$('planCadence').value,standupRepeat:$('planStandupRepeat').value,otherRepeat:$('planOtherRepeat').value,weekdays:resolvePlanStandupDays(proposalRange,scheduleMeetingRecords(w),proposedCeremonies),manualWeekdays:[...$('planDays').querySelectorAll('input:checked')].map(x=>Number(x.value)),time:$('planTime').value,participants:$('planParticipants').value,types:['Planning','Standup','Review','Retro','Groom'].filter((x,i)=>[$('planPlanning'),$('planStandup'),$('planReview'),$('planRetro'),$('planGroom')][i].checked),combine:$('planCombine').checked},meetings:unique.map(c=>{const {excluded,...meeting}=c;return {...meeting,id:crypto.randomUUID(),createdAt:now,updatedAt:now};})});},false);
- if(ok){diagnostic('workspace.schedule.created',{workspaceId:w.id,scheduleId,count:unique.length});clearCeremonyProposal();expandedScheduleId=scheduleId;renderWorkspaceSchedules();renderCeremonies();renderCeremonyInsights();showWizardStep(1);const saved=$('scheduleSavedNotice');if(saved)saved.textContent=`Saved ${unique.length} meetings as an internal schedule. Review saved meetings below, then select Schedule in Outlook for each meeting or series. No invitations have been sent.`;const section=$('workspaceSchedules');section?.scrollIntoView({behavior:'smooth',block:'start'});notify(`${unique.length} meetings saved as a draft. No Outlook events created.`);}}
+ if(!confirm(`CONFIRM MEETING SCHEDULE\n\nWorkspace: ${w.name}\nPeriod: ${proposalRange.start} to ${proposalRange.end}\nMeetings: ${unique.length}\nParticipants: ${$('planParticipants').value||'Not specified'}\n\nSave this draft schedule and open its overview?\nNo Outlook invitations will be sent.`))return;const now=new Date().toISOString();const scheduleId=crypto.randomUUID();const ok=await persist(r=>{const target=r.workspaces.find(x=>x.id===w.id);target.meetingSchedules||=[];target.meetingSchedules.push({id:scheduleId,name:'Meeting schedule '+proposalRange.start+' – '+proposalRange.end,start:proposalRange.start,end:proposalRange.end,createdAt:now,updatedAt:now,lifecycle:'Draft',scope:$('planScope').value,sprintId:$('planScope').value==='sprint'?currentSprint()?.id||null:null,preferences:{repeatSprints:$('planRepeatSprints').checked,repeatEnd:$('planRepeatSprints').checked?$('planRepeatEnd').value:null,standupDuration:Number($('planDuration').value),cadence:$('planCadence').value,standupRepeat:$('planStandupRepeat').value,otherRepeat:$('planOtherRepeat').value,weekdays:resolvePlanStandupDays(proposalRange,scheduleMeetingRecords(w),proposedCeremonies),manualWeekdays:[...$('planDays').querySelectorAll('input:checked')].map(x=>Number(x.value)),time:$('planTime').value,participants:$('planParticipants').value,types:['Planning','Standup','Review','Retro','Groom'].filter((x,i)=>[$('planPlanning'),$('planStandup'),$('planReview'),$('planRetro'),$('planGroom')][i].checked),combine:$('planCombine').checked},meetings:unique.map(c=>{const {excluded,...meeting}=c;return {...meeting,sprintId:(registry.sprints||[]).find(sp=>sp.workspaceId===w.id&&sp.start&&sp.end&&sp.start<=meeting.date&&meeting.date<=sp.end)?.id||null,id:crypto.randomUUID(),createdAt:now,updatedAt:now};})});},false);
+ if(ok){diagnostic('workspace.schedule.created',{workspaceId:w.id,scheduleId,count:unique.length});clearCeremonyProposal();expandedScheduleId=scheduleId;renderWorkspaceSchedules();renderCeremonies();renderCeremonyInsights();renderPlanningSteps();showWizardStep(1);const saved=$('scheduleSavedNotice');if(saved)saved.textContent=`Saved ${unique.length} meetings as an internal schedule. Review saved meetings below, then select Schedule in Outlook for each meeting or series. No invitations have been sent.`;const section=$('workspaceSchedules');section?.scrollIntoView({behavior:'smooth',block:'start'});notify(`${unique.length} meetings saved as a draft. No Outlook events created.`);}}
 let bulkOutlookBooking=false;
 async function bookScheduleMeetings(sc){
+ if(sc.lifecycle!=='Committed')return notify('Commit this schedule before booking Outlook meetings. Draft records cannot send invitations.',true);
  if(bulkOutlookBooking||outlookBookingBusy)return notify('An Outlook booking is already running.',true);
  const pending=(sc.meetings||[]).filter(c=>!c.outlook?.state&&c.status!=='Cancelled'&&c.status!=='Completed');
  const now=new Date();const today=[now.getFullYear(),String(now.getMonth()+1).padStart(2,'0'),String(now.getDate()).padStart(2,'0')].join('-');
@@ -3091,13 +3288,39 @@ async function bookScheduleMeetings(sc){
  if(status)status.textContent=completed+' of '+eligible.length+' meetings booked.';
  }finally{bulkOutlookBooking=false;renderWorkspaceSchedules();}
 }
-function renderWorkspaceSchedules(){const list=$('workspaceSchedules');if(!list)return;list.replaceChildren();const w=activeScheduleWorkspace();if(!w)return;const schedules=w.meetingSchedules||[];renderFinalSprintScheduleWarning();if(!schedules.length){list.textContent='No workspace meeting schedules yet.';return;}for(const sc of schedules){const box=document.createElement('div');box.className='ceremony-record';const heading=document.createElement('strong');heading.textContent=sc.name;const info=document.createElement('p');info.className='muted';info.textContent=`${sc.start} to ${sc.end} · ${(sc.meetings||[]).length} meeting record(s) · ${(sc.meetings||[]).filter(m=>m.outlook?.state==='booked').length} Outlook booking(s) · ${sc.lifecycle||'Draft'}${sc.retirementReason?' · '+sc.retirementReason:''}`;box.append(heading,info);const actions=document.createElement('div');actions.className='row';const extend=document.createElement('button');extend.textContent='Extend';extend.onclick=()=>{const date=prompt('New end date (YYYY-MM-DD)',sc.end);if(date!==null)void extendWorkspaceSchedule(sc.id,date);};const details=document.createElement('button');details.className='secondary';details.textContent=expandedScheduleId===sc.id?'Hide meetings':'View meetings';details.onclick=()=>{expandedScheduleId=expandedScheduleId===sc.id?null:sc.id;renderWorkspaceSchedules();};actions.append(extend,details);const bulk=document.createElement('button');bulk.className='secondary';bulk.textContent='Book all in Outlook';bulk.disabled=bulkOutlookBooking||!(sc.meetings||[]).some(c=>!c.outlook?.state&&c.status!=='Cancelled'&&c.status!=='Completed');bulk.onclick=()=>void bookScheduleMeetings(sc);actions.append(bulk);const bulkStatus=reportNode('span','muted');bulkStatus.id='bulkScheduleStatus-'+sc.id;actions.append(bulkStatus);
+function gs49RenderScheduleContinuity(list,sprint,workspace,today){
+ if(!sprint?.start||!sprint?.end)return;
+ const coverage=GS43Schedules.planning(sprint,workspace,today);
+ const block=reportNode('div','gs49-schedule-continuity');block.setAttribute('role','status');
+ const heading=reportNode('strong','',coverage.done?'Existing ceremonies cover this sprint':'Ceremony coverage for this sprint');
+ const detail=reportNode('p','muted',coverage.done?`${coverage.label} · ${coverage.count||0} matching meeting record(s) across workspace and sprint records${coverage.through?' · covering dates through '+coverage.through:''}. Previous-sprint or project-period bookings are retained. Closing a sprint never cancels workspace meetings.`:'No matching workspace meetings are recorded for this sprint. Check the Guided Ceremony Planner before booking new invitations.');
+ block.append(heading,detail);
+ if(coverage.unresolved)block.append(reportNode('p','gs-health-note',`${coverage.unresolved} meeting record(s) have unresolved Outlook operations; verify them rather than rebooking.`));
+ list.append(block);
+}
+function gs49PlanReplacement(sc){
+ const begin=prompt('Start date for the NEW meeting plan (YYYY-MM-DD). Existing Outlook events will NOT be cancelled or rescheduled.',currentSprint()?.start||gs43Today());
+ if(begin===null)return;
+ if(!GS43Schedules.validDay(begin))return notify('Enter a valid start date in YYYY-MM-DD format.',true);
+ const sprint=currentSprint(),cadence=sprint?.start&&sprint?.end?Math.round((planDate(sprint.end)-planDate(sprint.start))/86400000)+1:0;
+ const minEnd=planISO(new Date(planDate(begin).getTime()+(cadence>=7?cadence-1:13)*86400000));
+ const proposedEnd=sc.end&&sc.end>minEnd?sc.end:minEnd;
+ $('planScope').value='period';syncPlanScope();$('planStart').value=begin;$('planEnd').value=proposedEnd;
+ // For a year-end replacement, preserve consecutive-sprint recurrence by
+ // default; a shorter standalone period stays a one-cycle proposal.
+ const repeating=cadence>=7&&cadence%7===0&&proposedEnd>minEnd;
+ $('planRepeatSprints').checked=repeating;if(repeating)$('planRepeatEnd').value=proposedEnd;
+ syncRepeatSprints();showWizardStep(1);
+ $('ceremonyAssistant')?.scrollIntoView({block:'start',behavior:'smooth'});
+ notify('New project-period proposal prepared. Existing schedule and Outlook meetings are unchanged. Review overlapping invitations before committing a replacement.');
+}
+function renderWorkspaceSchedules(){const list=$('workspaceSchedules');if(!list)return;list.replaceChildren();const w=activeScheduleWorkspace();const schedules=w?.meetingSchedules||[];const today=gs43Today();const active=schedules.filter(sc=>!GS43Schedules.view(sc,today).history);const historical=schedules.filter(sc=>GS43Schedules.view(sc,today).history);const summary=$('gs42SavedSchedulesSummary');if(summary){const booked=active.reduce((n,sc)=>n+(sc.meetings||[]).filter(m=>m.outlook?.state==='booked').length,0);const committed=active.filter(sc=>sc.lifecycle==='Committed').length;summary.textContent=`· ${active.length} active · ${committed} committed · ${historical.length} historical · ${booked} active Outlook booking${booked===1?'':'s'}`;}if(!w)return;renderFinalSprintScheduleWarning();gs49RenderScheduleContinuity(list,currentSprint(),w,today);if(!schedules.length){list.textContent='No workspace meeting schedules yet.';renderPlanningSteps();return;}if(!active.length){const empty=document.createElement('p');empty.className='muted';empty.textContent='No active schedules need attention. Completed meetings are retained under History.';list.append(empty);}let historyPanel=null;let historyList=null;if(historical.length){historyPanel=document.createElement('details');historyPanel.id='gs43ScheduleHistory';historyPanel.className='gs43-schedule-history';historyPanel.open=!!window.gs43HistoryExpanded;const summary=document.createElement('summary');summary.textContent=`History · ${historical.length} completed or retired schedule(s)`;historyList=document.createElement('div');historyPanel.append(summary,historyList);historyPanel.addEventListener('toggle',()=>{window.gs43HistoryExpanded=historyPanel.open;});}for(const sc of [...active,...historical]){const derived=GS43Schedules.view(sc,today);const archived=derived.history;const box=document.createElement('div');box.className='ceremony-record';const heading=document.createElement('strong');heading.textContent=sc.name;const info=document.createElement('p');info.className='muted';info.textContent=`${sc.start} to ${sc.end} · ${(sc.meetings||[]).length} meeting record(s) · ${(sc.meetings||[]).filter(m=>m.outlook?.state==='booked').length} Outlook booking(s) · ${derived.label}${sc.retirementReason?' · '+sc.retirementReason:''}`;box.append(heading,info);if(derived.finished){const note=document.createElement('p');note.className='muted';note.textContent='Past meeting records retained in history. Outlook events were not changed; live calendar status was not reverified.';box.append(note);}else if(derived.attention){const note=document.createElement('p');note.className='muted';note.textContent=derived.uncertainty?'Some Outlook operations are unresolved. Review linked meetings before destructive actions.':derived.booked?'This draft already has recorded Outlook bookings. Commit it to manage future invitations; no duplicates will be sent.':'Past unbooked proposal; review or discard the draft.';box.append(note);}const actions=document.createElement('div');actions.className='row';const extend=document.createElement('button');extend.textContent='Extend';extend.onclick=()=>{const date=prompt('New end date (YYYY-MM-DD)',sc.end);if(date!==null)void extendWorkspaceSchedule(sc.id,date);};const details=document.createElement('button');details.className='secondary';details.textContent=expandedScheduleId===sc.id?'Hide meetings':'View meetings';details.onclick=()=>{expandedScheduleId=expandedScheduleId===sc.id?null:sc.id;renderWorkspaceSchedules();};if(archived){actions.append(details);}else{actions.append(extend,details);}const bulk=document.createElement('button');bulk.className='secondary';bulk.textContent='Book all in Outlook';bulk.disabled=archived||sc.lifecycle!=='Committed'||bulkOutlookBooking||!(sc.meetings||[]).some(c=>!c.outlook?.state&&c.status!=='Cancelled'&&c.status!=='Completed');bulk.title=sc.lifecycle!=='Committed'?'Commit the schedule before Outlook booking':'Book remaining future, unbooked meetings';bulk.onclick=()=>void bookScheduleMeetings(sc);if(!archived)actions.append(bulk);const bulkStatus=reportNode('span','muted');bulkStatus.id='bulkScheduleStatus-'+sc.id;actions.append(bulkStatus);
  const calendarButton=document.createElement('button');calendarButton.className='secondary';calendarButton.textContent='Calendar';calendarButton.onclick=()=>{expandedScheduleId=sc.id;calendarScheduleId=calendarScheduleId===sc.id?null:sc.id;renderWorkspaceSchedules();};actions.append(calendarButton);
  const lifecycle=sc.lifecycle||'Draft';
- if(lifecycle==='Draft'){const commit=document.createElement('button');commit.textContent='Commit schedule';commit.onclick=()=>void changeScheduleLifecycle(sc.id,'commit');const discard=document.createElement('button');discard.className='secondary';discard.textContent='Discard draft';discard.onclick=()=>void changeScheduleLifecycle(sc.id,'discard');actions.append(commit,discard);}
- if(lifecycle==='Committed'){const end=document.createElement('button');end.className='secondary';end.textContent='End schedule…';end.onclick=()=>void changeScheduleLifecycle(sc.id,'retire');actions.append(end);}
+ if(!archived&&lifecycle==='Draft'){const commit=document.createElement('button');commit.textContent='Commit schedule';commit.onclick=()=>void changeScheduleLifecycle(sc.id,'commit');const discard=document.createElement('button');discard.className='secondary';discard.textContent='Discard draft';discard.onclick=()=>void changeScheduleLifecycle(sc.id,'discard');actions.append(commit,discard);}
+ if(!archived&&lifecycle==='Committed'){const replaceButton=document.createElement('button');replaceButton.className='secondary';replaceButton.textContent='Plan replacement…';replaceButton.title='Start a new project-period plan without cancelling existing Outlook invitations';replaceButton.onclick=()=>gs49PlanReplacement(sc);actions.append(replaceButton);const clear=document.createElement('button');clear.className='danger';clear.textContent='Clear All Meetings';clear.disabled=gs40BulkCancelBusy;clear.title='Cancel all Outlook invitations associated with this committed schedule; retain history';clear.onclick=()=>void gs40ClearSchedule(sc.id);actions.append(clear);const end=document.createElement('button');end.className='danger';end.textContent='End schedule…';end.onclick=()=>void changeScheduleLifecycle(sc.id,'retire');actions.append(end);}
  if(lifecycle==='Retired')extend.disabled=true;
- box.append(actions);if(calendarScheduleId===sc.id){const calendar=document.createElement('div');renderMeetingCalendar(calendar,sc.meetings||[],sc.start);box.append(calendar);}if(expandedScheduleId===sc.id){const panel=document.createElement('div');panel.className='schedule-meetings';for(const c of [...(sc.meetings||[])].sort((a,b)=>(a.date||'').localeCompare(b.date||''))){const line=document.createElement('div');line.className='row';const label=document.createElement('span');label.textContent=`${c.originalPlannedDate?'Originally '+c.originalPlannedDate+' → ':''}${c.date} ${c.time} · ${c.title||c.type}${c.secondary?' + '+c.secondary:''} · ${c.duration||30} min · ${c.status||'Proposed'}`;const edit=document.createElement('button');edit.className='secondary';edit.textContent='Edit';edit.onclick=()=>editCeremony(c.id,sc.id);line.append(label,edit);
+ box.append(actions);if(calendarScheduleId===sc.id){const calendar=document.createElement('div');renderMeetingCalendar(calendar,sc.meetings||[],sc.start);box.append(calendar);}if(expandedScheduleId===sc.id){const panel=document.createElement('div');panel.className='schedule-meetings';for(const c of [...(sc.meetings||[])].sort((a,b)=>(a.date||'').localeCompare(b.date||''))){const line=document.createElement('div');line.className='row';const label=document.createElement('span');label.textContent=`${c.originalPlannedDate?'Originally '+c.originalPlannedDate+' → ':''}${c.date} ${c.time} · ${c.title||c.type}${c.secondary?' + '+c.secondary:''} · ${c.duration||30} min · ${c.status||'Proposed'}`;const edit=document.createElement('button');edit.className='secondary';edit.textContent='Edit';edit.onclick=()=>editCeremony(c.id,sc.id);line.append(label);if(archived){panel.append(line);continue;}line.append(edit);
  const outlook=document.createElement('button');outlook.type='button';outlook.className='secondary';
  outlook.textContent=c.outlook?.state==='booked'?'Booked in Outlook':c.outlook?.state==='pending'?'Booking needs review':c.outlook?.state==='cancelled'?'Cancelled in Outlook':c.outlook?.state?'Outlook sync needs review':'Schedule in Outlook';
  outlook.disabled=!!c.outlook?.state||c.status==='Cancelled'||c.status==='Completed';
@@ -3110,23 +3333,25 @@ function renderWorkspaceSchedules(){const list=$('workspaceSchedules');if(!list)
  removeMeeting.onclick=()=>void deleteCeremony(c.id,sc.id);
  if(c.outlook?.state==='booked'){const cancel=document.createElement('button');cancel.type='button';cancel.className='danger';cancel.textContent='Cancel Outlook meeting';cancel.onclick=()=>void outlookCancelCeremony(c.id,sc.id);line.append(cancel);}
  else if(['pending','sync-pending','cancel-pending'].includes(c.outlook?.state)){const review=document.createElement('button');review.type='button';review.className='secondary';review.textContent='Review Outlook status';review.onclick=()=>void outlookReconcile(c.id,sc.id);line.append(review);}
- line.append(removeMeeting);panel.append(line);}box.append(panel);}list.append(box);}}
+ line.append(removeMeeting);panel.append(line);}box.append(panel);}(archived?historyList:list).append(box);}if(historyPanel)list.append(historyPanel);renderPlanningSteps();}
 
 
 async function changeScheduleLifecycle(id,action){
  const w=activeScheduleWorkspace(),sc=w?.meetingSchedules?.find(x=>x.id===id);if(!sc)return;
  const state=sc.lifecycle||'Draft';const now=new Date().toISOString();
- if((action==='discard'||action==='retire')&&(sc.meetings||[]).some(m=>m.outlook?.state&&m.outlook.state!=='cancelled'))return notify('This schedule contains Outlook bookings or unresolved requests. Cancel or reconcile the linked Outlook meetings before retiring or discarding this schedule.',true);
+ if(action==='discard'&&(sc.meetings||[]).some(m=>m.outlook?.state&&m.outlook.state!=='cancelled'))return notify('This draft contains Outlook bookings or unresolved requests. Cancel or reconcile them before discarding it.',true);
+ if(action==='retire'&&(sc.meetings||[]).some(m=>m.outlook?.state&&m.outlook.state!=='cancelled'&&GS43Schedules.outcome(m,gs43Today())!=='finished'))return notify('Future or unresolved Outlook meetings are linked to this schedule. Cancel or reconcile those invitations before ending it. Past completed bookings are preserved.',true);
  if(action==='discard'&&state!=='Draft')return notify('Only draft schedules can be discarded.',true);
  if(action==='commit'&&state!=='Draft')return notify('Only drafts can be committed.',true);
  if(action==='retire'&&state==='Retired')return;
  let reason='';
  if(action==='retire'){reason=prompt('Reason for ending schedule (completed, pivot, paused, cancelled or other):','Project pivot');if(reason===null)return;reason=reason.trim()||'Not specified';}
  const count=(sc.meetings||[]).filter(m=>m.status!=='Completed'&&m.status!=='Cancelled').length;
- const question=action==='discard'?`Discard draft schedule and its ${sc.meetings.length} proposed records? This cannot be undone.`:action==='commit'?`Commit this internal schedule with ${sc.meetings.length} meetings? This does not book Outlook events.`:`End this schedule and cancel ${count} unfinished meeting records? Completed meetings and notes remain in history. No Outlook events will be changed.`;
+ const bookedDraft=state==='Draft'&&(sc.meetings||[]).some(m=>m.outlook?.state==='booked');
+ const question=action==='discard'?`Discard draft schedule and its ${sc.meetings.length} proposed records? This cannot be undone.`:action==='commit'?`Commit this internal schedule with ${sc.meetings.length} meetings? ${bookedDraft?'Recorded Outlook bookings will be retained unchanged. No duplicate invitations will be sent.':'This does not book Outlook events.'}`:`End this schedule and cancel ${count} unfinished meeting records? Completed meetings and notes remain in history. No Outlook events will be changed.`;
  if(!confirm(question))return;
- const ok=await persist(r=>{const ws=r.workspaces.find(x=>x.id===w.id);const item=ws.meetingSchedules.find(x=>x.id===id);if(action==='discard'){ws.meetingSchedules=ws.meetingSchedules.filter(x=>x.id!==id);return;}if(action==='commit'){item.lifecycle='Committed';item.committedAt=now;}else{item.lifecycle='Retired';item.retiredAt=now;item.retirementReason=reason;for(const m of item.meetings||[]){if(m.status!=='Completed'&&m.status!=='Cancelled'){m.status='Cancelled';m.cancelledBySchedule=true;m.updatedAt=now;}}}item.updatedAt=now;},false);
- if(ok){if(action==='discard'&&expandedScheduleId===id)expandedScheduleId=null;renderWorkspaceSchedules();renderCeremonies();renderCeremonyInsights();notify(action==='discard'?'Draft discarded.':action==='commit'?'Schedule committed internally. No Outlook bookings made.':'Schedule retired; history retained. No Outlook bookings changed.');}
+ const ok=await persist(r=>{const ws=r.workspaces.find(x=>x.id===w.id);const item=ws.meetingSchedules.find(x=>x.id===id);if(action==='discard'){ws.meetingSchedules=ws.meetingSchedules.filter(x=>x.id!==id);return;}if(action==='commit'){item.lifecycle='Committed';item.committedAt=now;}else{item.lifecycle='Retired';item.retiredAt=now;item.retirementReason=reason;for(const m of item.meetings||[]){if(m.status!=='Completed'&&m.status!=='Cancelled'&&!m.outlook?.state){m.status='Cancelled';m.cancelledBySchedule=true;m.updatedAt=now;}}}item.updatedAt=now;},false);
+ if(ok){if(action==='discard'&&expandedScheduleId===id)expandedScheduleId=null;renderWorkspaceSchedules();renderCeremonies();renderCeremonyInsights();renderPlanningSteps();notify(action==='discard'?'Draft discarded.':action==='commit'?'Schedule committed internally. No Outlook bookings made.':'Schedule retired; history retained. No Outlook bookings changed.');}
 }
 function meetingOccurrencesInMonth(meetings,year,month){
  const first=new Date(Date.UTC(year,month,1)),last=new Date(Date.UTC(year,month+1,0));
@@ -3656,6 +3881,657 @@ m365RenderCalendars();
 for(const [id,op] of [['licenseRoomCheck','entitlement'],['licenseRoomTrial','trial'],['licenseRoomActivate','activate']]){
  if($(id))$(id).addEventListener('click',()=>void checkRoom(op));
 }
+
+
+/* BEGIN generated v1.0.49 runtime */
+// v1.0.40 features share the existing Azure DevOps module scope.
+// This file is inserted into the application module by build.py, before init().
+let gs40BulkCancelBusy=false;
+const gs40PackageLimit=150;
+
+async function gs40EnrichBrowseParents(found,sequence){
+ // Source WIQL is a recency window, not a complete hierarchy. Recover just
+ // missing ancestor context so the search tree has real User Story/PBI parents.
+ const byId=new Map(found.map(w=>[Number(w.id),w]));
+ let frontier=found.filter(w=>w.parentId&&!byId.has(Number(w.parentId)));let recovered=0;
+ const permitted=new Set(projects.filter(p=>workspaceProjectIds().includes(p.id)).map(p=>p.name));
+ for(let depth=0;depth<3&&frontier.length&&recovered<50;depth++){
+  const ids=[...new Set(frontier.map(w=>Number(w.parentId)).filter(id=>id&&!byId.has(id)))].slice(0,50-recovered);
+  if(!ids.length)break;
+  const next=[];
+  for(let offset=0;offset<ids.length;offset+=6){
+   const batch=ids.slice(offset,offset+6);
+   const records=await Promise.allSettled(batch.map(id=>api(`/_apis/wit/workitems/${id}?$expand=Relations&api-version=7.1`)));
+   if(sequence!==browserSequence)return found;
+   for(const r of records){if(r.status!=='fulfilled')continue;
+    const item=normalizeItem(r.value);if(!permitted.has(item.project)||byId.has(Number(item.id)))continue;
+    item.parentId=GS40Core.relationIds(r.value,'System.LinkTypes.Hierarchy-Reverse')[0]||null;
+    item.contextOnly=true;byId.set(Number(item.id),item);next.push(item);recovered++;
+   }
+  }
+  frontier=next.filter(w=>w.parentId&&!byId.has(Number(w.parentId)));
+ }
+ return [...byId.values()];
+}
+async function gs40FetchPackage(rootId){
+ const resolved=new Map(),visited=new Set(),stack=[{id:Number(rootId),parentId:null,depth:0}];
+ const allowedProjects=new Set(projects.filter(p=>workspaceProjectIds().includes(p.id)).map(p=>p.name));
+ let excluded=0;
+ while(stack.length){
+  if(resolved.size>=gs40PackageLimit)throw Error('Work package exceeds 150 work items. Narrow the selection before adding it.');
+  const node=stack.shift();if(visited.has(node.id))continue;visited.add(node.id);
+  const source=await api(`/_apis/wit/workitems/${node.id}?$expand=Relations&api-version=7.1`);
+  const item=normalizeItem(source);item.parentId=node.parentId??GS40Core.relationIds(source,'System.LinkTypes.Hierarchy-Reverse')[0]??null;
+  if(!allowedProjects.has(item.project)){excluded++;continue;}
+  resolved.set(item.id,item);
+  if(node.depth<12)for(const childId of GS40Core.relationIds(source,'System.LinkTypes.Hierarchy-Forward')){
+   if(!visited.has(childId))stack.push({id:childId,parentId:item.id,depth:node.depth+1});
+  }
+ }
+ return {items:[...resolved.values()],excluded};
+}
+// Work packages must be previewed before any membership changes. See gs41-runtime.js.
+async function gs40AddWorkPackage(id){return gs41OpenPackagePreview(id);}
+function gs40AppendCardChildren(card,item){
+ const sprint=currentSprint();if(!sprint)return;
+ const members=new Set((sprint.itemIds||[]).map(Number));
+ const children=assignedItems.filter(w=>Number(w.parentId)===Number(item.id)&&members.has(Number(w.id)));
+ if(children.length){
+  const detail=document.createElement('details');detail.className='gs40-child-summary gs41-child-work';detail.open=true;
+  const heading=document.createElement('summary');heading.textContent=`Work package · ${children.length} direct child item(s)`;
+  detail.append(heading);
+  for(const kid of children){
+   const line=document.createElement('div');line.className='gs41-child-line';
+   const button=document.createElement('button');button.type='button';button.className='secondary';button.textContent=`↳ #${kid.id} ${kid.title}`;
+   button.onclick=()=>void openBoardItemDetail(kid);
+   const state=document.createElement('small');state.textContent=`${kid.type} · ${kid.state} · ${kid.assignee||'Unassigned'}`;
+   line.append(button,state);detail.append(line);
+  }
+  const footer=document.createElement('small');footer.className='muted';footer.textContent='Children keep their own ADO state, assignee and Board card.';detail.append(footer);
+  card.append(detail);
+ }else if(item.parentId){
+  const parent=assignedItems.find(w=>Number(w.id)===Number(item.parentId))||ancestorItems.find(w=>Number(w.id)===Number(item.parentId));
+  const context=document.createElement('small');context.className='gs41-parent-context';
+  context.textContent=parent?`↳ Child of #${parent.id} · ${parent.title}`:`↳ Child of #${item.parentId}`;
+  card.append(context);
+ }
+}
+function gs40RenderReportDrilldown(host,work){
+ const section=reportNode('section','gs-report-block');section.append(reportNode('h3','','Work packages · hierarchy and estimates'));
+ section.append(reportNode('p','muted','Parent commitment estimates count once. Child task remaining work is shown independently where available. Select any item to inspect its Azure DevOps record.'));
+ const rows=GS40Core.commitmentRows(work),points=rows.reduce((n,w)=>n+w.commitmentEffort,0),taskHours=work.filter(GS40Core.isTask).reduce((n,w)=>n+(Number(w.remainingWork)||0),0);
+ section.append(reportNode('p','gs-health-note',`${points} committed points / effort · ${work.filter(GS40Core.isTask).length} task(s) · ${taskHours} remaining task-hours (where reported)`));
+ const sprint=currentSprint(),shared=(sprint?.itemIds||[]).filter(id=>(registry?.sprints||[]).some(other=>other.id!==sprint.id&&other.workspaceId===sprint.workspaceId&&(other.itemIds||[]).some(otherId=>Number(otherId)===Number(id)))&&[...items,...assignedItems].some(w=>Number(w.id)===Number(id)&&GS40Core.isContext(w)&&GS40Core.metric(w)>0));
+ if(shared.length)section.append(reportNode('p','gs-health-note',`${shared.length} shared Feature-level estimate(s) are excluded from this sprint's live total until effort is allocated to sprint-specific work items. This avoids counting a multi-sprint Feature repeatedly.`));
+ const search=document.createElement('input');search.className='gs40-report-filter';search.type='search';search.placeholder='Filter by work item or project';search.setAttribute('aria-label','Filter work package drilldown');
+ section.append(search);const list=reportNode('div','gs40-package-list');section.append(list);
+ const render=()=>{list.replaceChildren();const q=search.value.trim().toLowerCase();const byId=new Map(work.map(w=>[Number(w.id),w]));
+  const roots=work.filter(w=>!byId.has(Number(w.parentId)));
+  for(const parent of roots){const family=GS40Core.packageGraph(work,parent.id);if(q&&!family.some(w=>`${w.id} ${w.title} ${w.project}`.toLowerCase().includes(q)))continue;
+   const node=document.createElement('details');node.className='gs40-report-group';node.open=!!q||roots.length<5;
+   const summary=document.createElement('summary');const weight=GS40Core.commitmentRows(family).reduce((n,w)=>n+w.commitmentEffort,0);
+   summary.textContent=`#${parent.id} · ${parent.title} · ${weight} commitment points · ${family.length} work item(s)`;node.append(summary);
+   for(const item of family){const line=reportNode('div','row');line.style.paddingLeft=(item.id===parent.id?0:20)+'px';
+    const action=document.createElement('button');action.className='secondary';action.textContent='#'+item.id+' · '+item.title;
+    action.onclick=()=>openBoardItemDetail(item);
+    line.append(action,reportNode('small','muted',`${item.type} · ${item.state} · ${item.assignee}`));node.append(line);
+   }list.append(node);
+  }
+  if(!list.children.length)list.append(reportNode('p','muted','No work packages match the filter.'));
+ };search.addEventListener('input',render);render();host.append(section);
+}
+function gs40ScheduleCandidates(sc){return GS43Schedules.currentCandidates(GS40Core.cancellationCandidates([sc]),{meetingSchedules:[sc]},gs43Today());}
+async function gs40CancelMeetingTargets(candidates,workspaceId){
+ let cancelled=0;const failures=[];
+ for(const candidate of candidates){const workspace=registry.workspaces.find(x=>x.id===workspaceId);
+  const record=workspace?.meetingSchedules?.find(x=>x.id===candidate.scheduleId)?.meetings?.find(x=>x.id===candidate.meetingId);
+  if(!record) {failures.push('#'+candidate.meetingId+' missing');break;}
+  if(['finished','cancelled'].includes(GS43Schedules.outcome(record,gs43Today())))continue;
+  if(candidate.state==='unresolved'){failures.push((record.title||record.type||candidate.meetingId)+' needs Outlook reconciliation');break;}
+  if(candidate.state==='booked'){
+   const success=await outlookCancelCeremony(candidate.meetingId,candidate.scheduleId,{bulk:true});
+   if(!success){failures.push((record.title||record.type||candidate.meetingId)+' could not be confirmed cancelled');break;}
+   cancelled++;
+  }else if(candidate.state==='internal'){
+   const ok=await persist(r=>{const target=outlookTarget(r,candidate.meetingId,candidate.scheduleId,workspaceId,currentSprint()?.id);
+    if(!target||target.outlook?.state)throw Error('Meeting changed during cancellation');target.status='Cancelled';target.updatedAt=new Date().toISOString();
+   },false);
+   if(!ok){failures.push('Could not save internal cancellation for '+candidate.meetingId);break;}cancelled++;
+  }
+ }
+ return {cancelled,failures};
+}
+async function gs40ClearSchedule(scheduleId,{confirmed=false}={}){
+ if(gs40BulkCancelBusy)return notify('A bulk meeting operation is already running.',true);
+ const w=activeScheduleWorkspace(),sc=w?.meetingSchedules?.find(x=>x.id===scheduleId);
+ if(!sc)return notify('Schedule not found.',true);
+ if(sc.lifecycle!=='Committed')return notify('Clear All Meetings is available for committed schedules only.',true);
+ const targets=gs40ScheduleCandidates(sc);
+ if(!targets.length)return notify('No active meeting records remain in this committed schedule.');
+ if(!confirmed&&!confirm(`Clear ALL ${targets.length} remaining meeting(s) from "${sc.name}"? This cancels organizer-owned Outlook events and notifies attendees. The schedule and cancellation history are retained. This cannot be undone.`))return;
+ gs40BulkCancelBusy=true;
+ try{
+  const result=await gs40CancelMeetingTargets(targets,w.id);
+  if(result.failures.length)return notify(`${result.cancelled} meeting(s) cancelled; stopped with ${result.failures.length} unresolved: ${result.failures.join('; ')}. Reconcile before retrying.`,true);
+  diagnostic('m365.bulk_schedule_cancelled',{scheduleId,count:result.cancelled});
+  notify(`${result.cancelled} meeting(s) cancelled, including Outlook invitations. The committed schedule remains in history.`);
+ }finally{gs40BulkCancelBusy=false;renderWorkspaceSchedules();renderCeremonies();}
+}
+async function gs40ClearSprintMeetings(){
+ if(gs40BulkCancelBusy)return notify('A bulk meeting cancellation is already running.',true);
+ const sprint=currentSprint(),workspace=activeScheduleWorkspace();
+ if(!sprint||!workspace)return notify('Select a sprint and workspace first.',true);
+ const included=[];const unsafe=[];
+ for(const sc of workspace.meetingSchedules||[]){if(sc.lifecycle!=='Committed')continue;
+  for(const meeting of sc.meetings||[]){
+   const scoped=meeting.sprintId===sprint.id||(!meeting.sprintId&&meeting.date>=sprint.start&&meeting.date<=sprint.end);
+   if(!scoped||['finished','cancelled'].includes(GS43Schedules.outcome(meeting,gs43Today())))continue;
+   const end=meeting.repeatEnd||meeting.recurrenceEnd||'';
+   if(end&&sprint.end&&end>sprint.end){unsafe.push(meeting.title||meeting.type||meeting.id);continue;}
+   if(meeting.outlook?.state==='cancelled'||meeting.status==='Cancelled'||meeting.status==='Completed')continue;
+   included.push({scheduleId:sc.id,meetingId:meeting.id,state:meeting.outlook?.state==='booked'?'booked':meeting.outlook?.state?'unresolved':'internal'});
+  }
+ }
+ // Older sprint-native ceremonies can be cancelled individually. Bulk operations
+ // must not guess the origin or identity of a saved Outlook meeting.
+ const native=(sprint.ceremonies||[]).filter(m=>m.outlook?.state&&m.outlook?.state!=='cancelled');
+ if(unsafe.length||native.length)return notify(`Sprint cancellation needs manual reconciliation: ${unsafe.length} series span beyond the sprint end, ${native.length} legacy sprint bookings. Use the existing per-event cancellation or the explicit schedule-wide action. Nothing was cancelled.`,true);
+ if(!included.length)return notify('No active committed meetings belong to this sprint.');
+ if(!confirm(`Cancel ${included.length} committed meeting(s) belonging to "${sprint.name}"? Outlook will notify attendees. Other sprints and workspace schedules will not be cleared.`))return;
+ gs40BulkCancelBusy=true;
+ try{const result=await gs40CancelMeetingTargets(included,workspace.id);
+  if(result.failures.length)notify(`Cancelled ${result.cancelled}; ${result.failures.length} unresolved: ${result.failures.join('; ')}. Reconcile and retry.`,true);
+  else notify(`${result.cancelled} meeting(s) cancelled for ${sprint.name}. Other sprint meetings were preserved.`);
+ }finally{gs40BulkCancelBusy=false;renderWorkspaceSchedules();renderCeremonies();}
+}
+async function gs40CloseWorkspace(){
+ const w=activeWorkspace();if(!w)return notify('Select a workspace.',true);
+ // Even the original default workspace can close; replacement workspace is created atomically below.
+ if(gs40BulkCancelBusy)return notify('Another bulk meeting cancellation is running.',true);
+ const schedules=w.meetingSchedules||[];
+ const targets=GS43Schedules.currentCandidates(GS40Core.cancellationCandidates(schedules),w,gs43Today());
+ const legacy=registry.sprints.filter(sp=>sp.workspaceId===w.id).flatMap(sp=>(sp.ceremonies||[]).filter(m=>!['finished','cancelled'].includes(GS43Schedules.outcome(m,gs43Today()))&&(m.outlook?.state==='booked'||['pending','cancel-pending','sync-pending'].includes(m.outlook?.state))).map(m=>({sp,m})));
+ if(!confirm(`Close out "${w.name}"? ${targets.length} workspace meeting record(s) and ${legacy.length} legacy sprint booking(s) must be cancelled or reconciled first. Future Outlook invitations will be cancelled, attendees notified, and the workspace archived. All sprint history stays intact; restoration requires new planning.`))return;
+ if(legacy.length)return notify('Closeout is blocked by legacy sprint ceremony bookings. Cancel or reconcile these individually before closing the workspace. No workspace data was changed.',true);
+ gs40BulkCancelBusy=true;
+ try{
+  const result=await gs40CancelMeetingTargets(targets,w.id);
+  if(result.failures.length)return notify(`Closeout stopped after ${result.cancelled} cancellation(s). Resolve: ${result.failures.join('; ')}. Workspace remains active.`,true);
+  const fresh=registry.workspaces.find(x=>x.id===w.id);
+  const unresolved=GS43Schedules.currentCandidates(GS40Core.cancellationCandidates(fresh.meetingSchedules||[]),fresh,gs43Today()).filter(x=>x.state!=='internal');
+  if(unresolved.length)return notify('Closeout blocked: some Outlook cancellations have not been confirmed.',true);
+  const closedAt=new Date().toISOString();
+  const replacementId=w.id===DEFAULT_WORKSPACE_ID?crypto.randomUUID():DEFAULT_WORKSPACE_ID;
+  const ok=await persist(r=>{const ws=r.workspaces.find(x=>x.id===w.id);if(!ws||ws.archived)throw Error('Workspace was changed elsewhere.');
+   const pending=GS43Schedules.currentCandidates(GS40Core.cancellationCandidates(ws.meetingSchedules||[]),ws,gs43Today()).filter(x=>x.state!=='internal');
+   if(pending.length)throw Error('Unresolved Outlook meetings prevent closeout.');
+   for(const sp of r.sprints||[])if(sp.workspaceId===w.id)for(const meeting of sp.ceremonies||[]){
+    if(['finished','cancelled'].includes(GS43Schedules.outcome(meeting,gs43Today())))continue;
+    if(meeting.outlook?.state&&meeting.outlook.state!=='cancelled')throw Error('Legacy sprint Outlook booking remains unresolved.');
+    if(meeting.status!=='Completed')meeting.status='Cancelled';
+   }
+   for(const sc of ws.meetingSchedules||[])if(sc.lifecycle==='Committed'){
+    sc.lifecycle='Retired';sc.retiredAt=closedAt;sc.retirementReason='Workspace closeout';
+   }
+   ws.archived=true;ws.closedOutAt=closedAt;ws.archivedAt=closedAt;ws.planningRequired=true;
+   ws.closedSprintIds=(r.sprints||[]).filter(sp=>sp.workspaceId===w.id).map(sp=>sp.id);
+   if(w.id===DEFAULT_WORKSPACE_ID)r.workspaces.push({id:replacementId,name:'New Workspace',description:'New planning cycle after default workspace closeout',projectIds:[...ws.projectIds],createdAt:closedAt,planningRequired:true});
+  },false);
+  if(ok){activeWorkspaceId=replacementId;renderWorkspacePicker();syncWorkspaceProjects();renderSprintPicker('');clearWorkspaceViews();rememberContext();
+   notify('Workspace closed and archived. Historical records are preserved; restoring requires a new planning cycle.');
+  }
+ }catch(error){notify('Workspace closeout failed: '+String(error.message||error),true);}
+ finally{gs40BulkCancelBusy=false;renderWorkspaceSchedules();}
+}
+function gs42CloseoutFeedback(message='',error=false){
+ const node=$('gs42CloseoutFeedback');if(!node)return;
+ node.textContent=message;node.classList.toggle('error',!!error);
+}
+function gs40ReadRetro(){const sprint=currentSprint(),retro=sprint?.retrospective;
+ const status=$('gs40RetroStatus');if(!status)return;
+ gs42CloseoutFeedback();
+ for(const [id,key] of [['gs40RetroWell','wentWell'],['gs40RetroImprove','improve'],['gs40RetroLessons','lessons']])$(id).value=retro?.[key]||'';
+ $('gs40RetroActions').value=(retro?.actions||[]).map(x=>[x.title,x.owner,x.due].join(' | ')).join('\n');
+ const finalized=!!retro?.finalizedAt;
+ for(const id of ['gs40RetroWell','gs40RetroImprove','gs40RetroLessons','gs40RetroActions'])$(id).disabled=!sprint||finalized;
+ $('gs40RetroSave').disabled=!sprint||finalized;$('gs40RetroFinalize').disabled=!sprint||finalized;
+ $('gs40RetroReopen').classList.toggle('hidden',!finalized);
+ status.textContent=!sprint?'Select a sprint':finalized?'Finalized '+new Date(retro.finalizedAt).toLocaleDateString():'Draft · '+sprint.name;
+ $('gs40RetroHistory').textContent=(sprint?.retrospectiveHistory||[]).length+' finalized historical version(s) retained.';
+}
+async function gs40SaveRetro(finalize){const sprint=currentSprint();if(!sprint)return gs42CloseoutFeedback('Select a sprint.',true);
+ if(sprint.retrospective?.finalizedAt)return gs42CloseoutFeedback('These notes are finalized. Reopen them to create a tracked revision.',true);
+ if(finalize&&!confirm('Finalize these Sprint Closeout Notes? This preserves an immutable history version and locks editing until reopened.'))return;
+ const rows=$('gs40RetroActions').value.split(/\n/).filter(x=>x.trim()).map(x=>{const bits=x.split('|');return {title:(bits[0]||'').trim(),owner:(bits[1]||'').trim(),due:(bits[2]||'').trim()};});
+ if(rows.some(x=>x.due&&!/^\d{4}-\d{2}-\d{2}$/.test(x.due)))return gs42CloseoutFeedback('Use YYYY-MM-DD for action due dates.',true);
+ const clean=GS40Core.validateRetrospective({wentWell:$('gs40RetroWell').value,improve:$('gs40RetroImprove').value,lessons:$('gs40RetroLessons').value,actions:rows});
+ gs42CloseoutFeedback('Saving closeout notes…');
+ const now=new Date().toISOString();const ok=await persist(r=>{const sp=r.sprints.find(x=>x.id===sprint.id);if(!sp)throw Error('Sprint was removed.');
+  const updated={...clean,updatedAt:now,finalizedAt:finalize?now:null};sp.retrospective=updated;
+  if(finalize){sp.retrospectiveHistory||=[];sp.retrospectiveHistory.push(JSON.parse(JSON.stringify(updated)));}
+ },false,false,gs42CloseoutFeedback);
+ if(ok){gs40ReadRetro();gs42CloseoutFeedback(finalize?'Closeout notes finalized and saved to sprint history.':'Closeout notes draft saved.');}
+}
+async function gs40ReopenRetro(){const sp=currentSprint();if(!sp?.retrospective?.finalizedAt)return;
+ if(!confirm('Reopen these Sprint Closeout Notes for a tracked revision? Earlier finalized history will remain unchanged.'))return;
+ const ok=await persist(r=>{const record=r.sprints.find(x=>x.id===sp.id);record.retrospective={...record.retrospective,finalizedAt:null,updatedAt:new Date().toISOString()};},false,false,gs42CloseoutFeedback);
+ if(ok){gs40ReadRetro();gs42CloseoutFeedback('Closeout notes reopened. Earlier finalized versions are preserved.');}
+}
+$('gs40RetroSave')?.addEventListener('click',()=>void gs40SaveRetro(false));
+$('gs40RetroFinalize')?.addEventListener('click',()=>void gs40SaveRetro(true));
+$('gs40RetroReopen')?.addEventListener('click',()=>void gs40ReopenRetro());
+$('sprintPicker')?.addEventListener('change',()=>queueMicrotask(gs40ReadRetro));
+$('workspacePicker')?.addEventListener('change',()=>queueMicrotask(gs40ReadRetro));
+// Scheduling already changes sprint context programmatically; refresh the panel on focus.
+// Sprint change and startup restore render this panel; do not overwrite in-progress drafts on focus.
+
+$('gs40ClearSprintMeetings')?.addEventListener('click',()=>void gs40ClearSprintMeetings());
+
+/* v1.0.41: explicit work-package preview, consent and atomic membership update.
+   This module runs in the original app's Azure DevOps module scope. */
+let gs41PreviewBusy=false;
+function gs41SelectionPlan(pack,sprint){
+ const root=pack.items[0];
+ const existing=new Set((sprint.itemIds||[]).map(Number));
+ const owners=new Map();
+ for(const sp of registry.sprints||[]){
+  if(sp.id===sprint.id||['Closed','Completed'].includes(sp.status))continue;
+  for(const id of sp.itemIds||[])if(!owners.has(Number(id)))owners.set(Number(id),sp.name||'another sprint');
+ }
+ return pack.items.map((item,index)=>{
+  const already=existing.has(Number(item.id));
+  const otherSprint=owners.get(Number(item.id))||'';
+  // Cross-sprint membership is permitted; only duplicate membership in THIS sprint is prevented.
+  const conflict=otherSprint;
+  const otherIteration=index>0&&!!root.iterationPath&&!!item.iterationPath&&root.iterationPath!==item.iterationPath;
+  const depth=(()=>{let level=0,node=item,seen=new Set();const byId=new Map(pack.items.map(w=>[Number(w.id),w]));
+   while(Number(node.id)!==Number(root.id)&&node.parentId&&byId.has(Number(node.parentId))&&!seen.has(Number(node.id))){seen.add(Number(node.id));node=byId.get(Number(node.parentId));level++;if(level>12)break;}
+   return level;
+  })();
+  return {item,depth,already,conflict,otherIteration,selectable:!already,selected:!already&&!otherIteration};
+ });
+}
+async function gs41CommitWorkPackage(pack,selectedIds,sprintId){
+ const sprint=registry.sprints.find(sp=>sp.id===sprintId);
+ if(!sprint||currentSprint()?.id!==sprintId)throw Error('The active sprint changed; reopen the work package.');
+ const selected=new Set([...selectedIds].map(Number));
+ const plan=gs41SelectionPlan(pack,sprint);
+ for(const id of selected){const row=plan.find(x=>Number(x.item.id)===id);
+  if(!row||(!row.selectable&&!row.already))throw Error('A selected work item is no longer eligible for this sprint. Refresh the preview.');
+ }
+ const ids=[...selected].filter(id=>!(sprint.itemIds||[]).some(current=>Number(current)===id));
+ if(!ids.length)return 0;
+ const ok=await persist(r=>{
+  const target=r.sprints.find(sp=>sp.id===sprintId);
+  if(!target)throw Error('Sprint no longer exists.');
+  // A work item may be included in multiple sprints/workspaces. This does not change native ADO iterations.
+  const permitted=new Set(projects.filter(p=>workspaceProjectIds().includes(p.id)).map(p=>p.name));
+  for(const id of ids)if(!permitted.has(plan.find(x=>Number(x.item.id)===id)?.item.project))throw Error('Selected item is outside the workspace project scope.');
+  target.itemIds=[...new Set([...(target.itemIds||[]).map(Number),...ids])];
+ },false);
+ if(!ok)throw Error('Sprint membership could not be saved; please retry.');
+ const multiSprintCount=ids.filter(id=>(registry.sprints||[]).some(sp=>sp.id!==sprintId&&(sp.itemIds||[]).some(x=>Number(x)===id))).length;
+ diagnostic('sprint.membership.package_added',{count:ids.length,otherSprintCount:multiSprintCount,operation:'save'});
+ for(const item of pack.items){
+  const index=browserItems.findIndex(x=>Number(x.id)===Number(item.id));
+  if(index<0)browserItems.push(item);else browserItems[index]=item;
+  browserSelection.delete(item.id);
+ }
+ await loadAssignedItems();
+ renderBrowser();renderBacklog();renderSuggestions();renderBoard();updateBulkToolbar();
+ return ids.length;
+}
+async function gs41OpenPackagePreview(rootId){
+ const sprint=currentSprint();
+ if(!sprint||gs41PreviewBusy||bulkBusy)return notify('Select a sprint before previewing work packages.',true);
+ if(!(await guardSprint()))return;
+ gs41PreviewBusy=true;let opened=false,dialogNode=null;
+ try{
+  const pack=await gs40FetchPackage(rootId);
+  if(!pack.items.length)return notify('No accessible work items found for this package.',true);
+  const plan=gs41SelectionPlan(pack,sprint);
+  const dialog=document.createElement('dialog');dialogNode=dialog;dialog.className='gs41-package-dialog';
+  dialog.setAttribute('aria-label','Review work package');
+  const head=document.createElement('h2');head.textContent=`#${plan[0].item.id} · ${plan[0].item.title}`;
+  const intro=document.createElement('p');intro.className='muted';intro.textContent=`${plan.length} linked work item(s) found from Azure DevOps. Review the hierarchy and choose exactly what to add to ${sprint.name}. Existing work-item states, parent links and native iterations will not be changed.`;
+  const summary=document.createElement('p');summary.className='gs41-package-status';summary.setAttribute('role','status');
+  const list=document.createElement('div');list.className='gs41-package-tree';
+  const choices=[];
+  for(const row of plan){
+   const line=document.createElement('label');line.className='gs41-package-entry';
+   line.style.paddingLeft=(10+row.depth*22)+'px';
+   const check=document.createElement('input');check.type='checkbox';check.checked=row.selected;check.disabled=!row.selectable;
+   const content=document.createElement('span');content.className='gs41-package-description';
+   const name=document.createElement('strong');name.textContent=`${row.depth?'↳ ':''}#${row.item.id} · ${row.item.title}`;
+   const meta=document.createElement('small');meta.textContent=`${row.item.type} · ${row.item.state} · ${row.item.assignee||'Unassigned'}`;
+   content.append(name,meta);
+   if(row.already){const status=document.createElement('small');status.textContent='Already on this sprint';status.className='gs41-package-warning';content.append(status);}
+   if(row.conflict){const note=document.createElement('small');note.textContent=`Also in ${row.conflict} · inclusion in this sprint is allowed`;note.className='gs41-package-note';content.append(note);}
+   if(row.otherIteration){const note=document.createElement('small');note.className='gs41-package-warning';note.textContent=`Other native iteration (${row.item.iterationPath}); unchecked by default. Select explicitly to include without changing ADO iteration.`;content.append(note);}
+   line.append(check,content);list.append(line);choices.push({row,check});
+  }
+  if(pack.excluded){const excluded=document.createElement('p');excluded.className='gs41-package-warning';excluded.textContent=`${pack.excluded} linked item(s) belong to projects outside this workspace and cannot be added.`;list.append(excluded);}
+  const footer=document.createElement('div');footer.className='gs41-package-footer';
+  const cancel=document.createElement('button');cancel.type='button';cancel.className='secondary';cancel.textContent='Cancel';
+  const add=document.createElement('button');add.type='button';add.className='primary';
+  const update=()=>{const selected=choices.filter(x=>x.check.checked&&!x.check.disabled);const other=selected.filter(x=>x.row.otherIteration);
+   summary.textContent=`${selected.length} item(s) selected${other.length?' · '+other.length+' from a different native iteration (explicitly included)':''}`;
+   add.textContent=`Add ${selected.length} selected item(s) to Board`;add.disabled=!selected.length;
+  };
+  for(const choice of choices)choice.check.addEventListener('change',update);update();
+  const close=()=>{dialog.close();dialog.remove();};cancel.onclick=close;
+  dialog.addEventListener('close',()=>{dialog.remove();gs41PreviewBusy=false;});
+  add.onclick=async()=>{
+   add.disabled=true;cancel.disabled=true;
+   try{const ids=choices.filter(x=>x.check.checked&&!x.check.disabled).map(x=>Number(x.row.item.id));
+    const n=await gs41CommitWorkPackage(pack,ids,sprint.id);
+    close();notify(n?`Added ${n} item(s) to ${sprint.name}. Parent-child relationships are visible in Board hierarchy and on each work-package card.`:'All selected work items are already on this sprint.');
+   }catch(error){summary.textContent='Could not save package: '+String(error.message||error);summary.classList.add('gs41-package-warning');cancel.disabled=false;update();}
+  };
+  footer.append(cancel,add);dialog.append(head,intro,summary,list,footer);document.body.append(dialog);
+  dialog.showModal();opened=true;
+ }catch(error){dialogNode?.remove();notify('Could not preview work package: '+String(error.message||error),true);}
+ finally{if(!opened)gs41PreviewBusy=false;}
+}
+
+/* v1.0.43 read-only lifecycle and sprint-ceremony coverage.
+   This deliberately does not call Microsoft Graph or mutate the registry. */
+const GS43Schedules = (()=>{
+ const day = value => typeof value==='string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(value+'T00:00:00Z')) && new Date(value+'T00:00:00Z').toISOString().slice(0,10)===value ? value : '';
+ const unresolved = new Set(['pending','sync-pending','cancel-pending']);
+ const unresolvedStates=unresolved;
+ const hasSeries = m => !!m.repeat && m.repeat!=='none';
+ function endDay(m){
+  const begin=day(m?.date);
+  if(!begin)return '';
+  if(!hasSeries(m))return begin;
+  // Outlook series may continue beyond the first meeting. Never assume its
+  // source sprint or schedule end closes the actual recurring invitation.
+  const last=day(m.repeatEnd||m.recurrenceEnd);
+  return last && last>=begin ? last : '';
+ }
+ function outcome(m,today){
+  const o=m?.outlook?.state||'',end=endDay(m),start=day(m?.date);
+  if(!start||!end)return 'review';
+  if(unresolved.has(o)||o&&!['booked','cancelled'].includes(o))return 'review';
+  if((m.status==='Cancelled'&&o==='booked')||(o==='cancelled'&&m.status!=='Cancelled'&&m.status!=='Completed'))return 'review';
+  if(o==='booked'&&(!m.outlook?.eventId||!m.outlook?.calendarId))return 'review';
+  if(end>=today)return o==='cancelled'||m.status==='Cancelled'&&!o ? 'cancelled':'active';
+  if(o==='booked'||o==='cancelled'||m.status==='Completed'||m.status==='Cancelled')return 'finished';
+  return 'stale'; // Past draft without evidence it ever happened.
+ }
+ function view(sc,today){
+  const meetings=Array.isArray(sc?.meetings)?sc.meetings:[];
+  const states=meetings.map(m=>outcome(m,today));
+  const booked=meetings.filter(m=>m.outlook?.state==='booked').length;
+  const uncertainty=states.filter(x=>x==='review').length;
+  const finished=meetings.length>0&&states.every(x=>x==='finished'||x==='cancelled');
+  const lifecycle=sc?.lifecycle||'Draft';
+  if(lifecycle==='Retired'){
+   if(uncertainty||states.includes('active'))return {label:'Retired · needs Outlook review',history:false,finished:false,booked,uncertainty,attention:true};
+   return {label:'Retired',history:true,finished:false,booked,uncertainty:0,attention:false};
+  }
+  if(finished)return {label:states.every(x=>x==='cancelled')?'Cancelled':'Completed',history:true,finished:true,booked,uncertainty:0,attention:false};
+  if(uncertainty)return {label:'Needs Outlook review',history:false,finished:false,booked,uncertainty,attention:true};
+  if(lifecycle==='Draft'&&booked)return {label:'Draft · Outlook-booked (commit to manage)',history:false,finished:false,booked,uncertainty:0,attention:true};
+  if(states.includes('stale')&&states.every(x=>x==='stale'||x==='cancelled'))return {label:'Past unbooked draft',history:false,finished:false,booked,uncertainty:0,attention:true};
+  return {label:lifecycle,history:false,finished:false,booked,uncertainty:0,attention:false};
+ }
+ function inSprint(meeting,sprint){
+  if(!meeting||!sprint||!day(sprint.start)||!day(sprint.end))return false;
+  const first=day(meeting.date),last=endDay(meeting);
+  if(!first||!last||first>sprint.end||last<sprint.start)return false;
+  if(!hasSeries(meeting))return !meeting.sprintId||meeting.sprintId===sprint.id;
+  // A recurring Outlook series can outlive the sprint that created it, but
+  // coverage requires at least ONE actual non-excluded occurrence. A broad
+  // date-range intersection alone would count a cancelled/excluded series.
+  const since=Math.max(Date.parse(first+'T00:00:00Z'),Date.parse(sprint.start+'T00:00:00Z'));
+  const until=Math.min(Date.parse(last+'T00:00:00Z'),Date.parse(sprint.end+'T00:00:00Z'));
+  const excluded=new Set(meeting.excludedDates||[]),period=Math.max(1,Number(meeting.repeatInterval)||2)*7;
+  const days=(meeting.repeatDays||[]).map(x=>String(x).toLowerCase());
+  for(let ms=since,n=0;ms<=until&&n<740;ms+=86400000,n++){
+   const d=new Date(ms),iso=d.toISOString().slice(0,10);
+   if(excluded.has(iso))continue;
+   if(meeting.repeat==='weekly'){
+    const names=['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
+    if((days.length?days:[names[new Date(first+'T00:00:00Z').getUTCDay()]]).includes(names[d.getUTCDay()]))return true;
+   }else if(meeting.repeat==='sprint'){
+    if(Math.round((ms-Date.parse(first+'T00:00:00Z'))/86400000)%period===0)return true;
+   }else return true;
+  }
+  return false;
+ }
+ function planning(sprint,workspace,today){
+  const legacy=(sprint?.ceremonies||[]).filter(m=>m.status!=='Cancelled'&&m.outlook?.state!=='cancelled'&&(m.sprintId===undefined||m.sprintId===sprint.id));
+  const matching=[];
+  for(const sc of workspace?.meetingSchedules||[]){
+   if(sc.lifecycle==='Retired')continue;
+   for(const m of sc.meetings||[]){
+    if(m.status==='Cancelled'||m.outlook?.state==='cancelled'||!inSprint(m,sprint))continue;
+    matching.push({scheduleId:sc.id,meeting:m,lifecycle:sc.lifecycle||'Draft',view:view(sc,today)});
+   }
+  }
+  if(!matching.length&&!legacy.length)return {done:false,label:'',scheduleId:null,history:false,count:0,through:'',unresolved:0};
+  const anyBooked=[...matching.map(x=>x.meeting),...legacy].some(m=>m.outlook?.state==='booked'&&m.outlook?.eventId&&m.outlook?.calendarId);
+  const anyCommitted=matching.some(x=>x.lifecycle==='Committed');
+  const schedule=matching.find(x=>x.lifecycle==='Committed'&&x.meeting.outlook?.state==='booked')||matching.find(x=>x.lifecycle==='Committed')||matching[0]||null;
+  const unresolved=matching.filter(x=>unresolvedStates.has(x.meeting.outlook?.state)||x.view.uncertainty).length;
+  const dates=matching.map(x=>endDay(x.meeting)).filter(Boolean);
+  return {done:true,label:anyBooked?'Booked in Outlook':anyCommitted?'Committed':'Planned',scheduleId:schedule?.scheduleId||null,history:!!schedule?.view.history,count:matching.length+legacy.length,through:dates.length?dates.sort().at(-1):'',unresolved};
+ }
+ function currentCandidates(candidates,workspace,today){
+  const byId=new Map((workspace?.meetingSchedules||[]).map(sc=>[sc.id,sc]));
+  return (candidates||[]).filter(c=>{const meeting=byId.get(c.scheduleId)?.meetings?.find(m=>m.id===c.meetingId);return !meeting||!['finished','cancelled'].includes(outcome(meeting,today));});
+ }
+ return {validDay:day,endDay,outcome,view,inSprint,planning,currentCandidates};
+})();
+
+/* v1.0.44: stale ADO iframe recovery. No SDK calls or reloads while writes are unresolved. */
+const GS44Session=(()=>{
+ const IDLE_MS=5*60*1000, DRAFT_KEY='pnpc-gs-recovery-draft-v1', RELOAD_KEY='pnpc-gs-last-automatic-reload-v1';
+ let inactiveAt=0,lastInteraction=Date.now(),writeCount=0,cardProvider=null,reloading=false,pending=false,deferredScheduled=false;
+ const diagnosticSafe=(kind,details)=>{try{diagnostic(kind,details,'warn');}catch{}};
+ const session=()=>{try{return window.sessionStorage||sessionStorage;}catch{return null;}};
+ function readDraft(){try{const raw=session()?.getItem(DRAFT_KEY);if(!raw)return null;const data=JSON.parse(raw);if(!data||Date.now()-data.at>30*60*1000){session()?.removeItem(DRAFT_KEY);return null;}return data;}catch{return null;}}
+ function setCardProvider(provider){cardProvider=typeof provider==='function'?provider:null;}
+ function restoreCard(id,project){const d=readDraft();if(!d||Number(d.id)!==Number(id)||String(d.project)!==String(project))return null;try{session()?.removeItem(DRAFT_KEY);}catch{}return d;}
+ function hasRecoveredDraft(){return !!readDraft();}
+ function notice(message){
+  if(typeof document==='undefined')return;
+  let node=document.getElementById('gs44-session-warning');
+  if(!node){node=document.createElement('div');node.id='gs44-session-warning';node.setAttribute('role','alert');node.className='gs44-session-warning';
+   const text=document.createElement('span');text.id='gs44-session-warning-text';
+   const button=document.createElement('button');button.type='button';button.textContent='Reload Global Sprints';button.addEventListener('click',()=>reload('manual'));node.append(text,button);document.body.append(node);}
+  const target=document.getElementById('gs44-session-warning-text');if(target)target.textContent=message;
+ }
+ function reload(reason){
+  if(reloading)return;
+  if(writeCount>0||typeof busy!=='undefined'&&busy||typeof outlookBookingBusy!=='undefined'&&outlookBookingBusy||typeof bulkOutlookBooking!=='undefined'&&bulkOutlookBooking){
+   pending=true;notice('Your Azure DevOps session needs refreshing. Current writes or Outlook operations must finish first; no operation will be repeated automatically.');
+   if(!deferredScheduled){deferredScheduled=true;setTimeout(()=>{deferredScheduled=false;if(pending)reload('deferred');},1000);}return;}
+  const store=session();let last=0;
+  try{last=Number(store?.getItem(RELOAD_KEY)||0);}catch{}
+  if(reason!=='manual'&&Date.now()-last<45000){notice('Azure DevOps still needs authorization after a recent reload. Reopen the extension or reload once the host session is restored.');return;}
+  if(cardProvider){try{const draft=cardProvider();if(draft?.dirty&&draft.id){if(!store)throw Error('Session storage unavailable');store.setItem(DRAFT_KEY,JSON.stringify({...draft,at:Date.now()}));if(!readDraft())throw Error('Session storage did not retain card draft');diagnosticSafe('session.card_draft_preserved',{itemId:Number(draft.id)});}}catch(e){pending=true;notice('Unable to preserve unsaved card edits. Copy them before reloading Global Sprints.');diagnosticSafe('session.draft_capture_failed',{reason:String(e?.name||'storage')});return;}}
+  try{store?.setItem(RELOAD_KEY,String(Date.now()));}catch{}
+  reloading=true;diagnosticSafe('session.reload',{reason,hadUnsavedDraft:hasRecoveredDraft()});
+  try{window.location.reload();}catch(e){reloading=false;pending=true;notice('Automatic session refresh was blocked. Reload the extension manually after saving your work.');diagnosticSafe('session.reload_blocked',{reason:String(e?.name||'reload')});}
+ }
+ function markAuthenticationFailure(status){pending=true;diagnosticSafe('session.authentication_stale',{status});setTimeout(()=>reload('authentication'),120);}
+ function resume(reason){
+  const since=inactiveAt?Date.now()-inactiveAt:0;inactiveAt=0;
+  if(!token||!registry)return;
+  if(pending){diagnosticSafe('session.resume_stale',{});reload(reason);return;}
+  if(since>=IDLE_MS){diagnosticSafe('session.resume_stale',{});if(typeof GS46Board!=='undefined')void GS46Board.refresh({automatic:true});else reload(reason);}
+ }
+ function start(){
+  window.addEventListener('blur',()=>{inactiveAt=Date.now();});
+  window.addEventListener('focus',()=>resume('focus'));
+  document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden')inactiveAt=Date.now();else resume('visibility');});
+  window.addEventListener('pageshow',event=>{if(event.persisted)reload('page-cache');});
+  document.addEventListener('pointerdown',()=>{const previous=lastInteraction;lastInteraction=Date.now();if(!inactiveAt&&Date.now()-previous>=IDLE_MS&&token&&registry){if(pending)reload('inactive-tab');else if(typeof GS46Board!=='undefined')void GS46Board.refresh({automatic:true});else reload('inactive-tab');}},{capture:true,passive:true});
+  if(hasRecoveredDraft())diagnosticSafe('session.recovered_draft_available',{});
+ }
+ function beginWrite(){writeCount++;}
+ function endWrite(){writeCount=Math.max(0,writeCount-1);if(pending&&writeCount===0)setTimeout(()=>reload('deferred'),0);}
+ function resumeDeferred(){if(pending&&writeCount===0)setTimeout(()=>reload('deferred'),0);}
+ return {start,setCardProvider,restoreCard,hasRecoveredDraft,markAuthenticationFailure,beginWrite,endWrite,resumeDeferred,reload};
+})();
+GS44Session.start();
+
+/* v1.0.45 — selected @mentions remain resolved while the user continues typing.
+ * Pure composer helpers; Azure DevOps identity resolution stays in app-main.js.
+ */
+const GS45Mentions=(()=>{
+ const mentionId=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+ const boundary=ch=>!ch||/[\s.,!?;:()[\]{}]/.test(ch);
+ const allowedPrefix=ch=>!ch||/[\s([{'"\u201c]/.test(ch);
+ function selectedAt(text,at,selected){
+  for(const [token,identity] of selected){
+   if(!identity||!mentionId.test(String(identity.id||'')))continue;
+   if(text.startsWith(token,at)&&boundary(text[at+token.length]))return token;
+  }
+  return null;
+ }
+ function active(text,caret,selected){
+  const value=String(text||''),left=value.slice(0,Math.max(0,Math.min(value.length,Number(caret)||0)));
+  const match=left.match(/(?:^|[\s([{'"\u201c])@([^@\n]{0,60})$/);
+  if(!match)return null;
+  const start=left.length-match[0].length+(match[0].startsWith('@')?0:1);
+  // Once the full @Name has been selected, any following words are comment
+  // content, not another query for '@Name and then the rest of the sentence'.
+  if(selectedAt(value,start,selected))return null;
+  return {name:match[1],start,end:left.length};
+ }
+ function select(text,match,identity){
+  const value=String(text||'');
+  if(!match||!identity||!mentionId.test(String(identity.id||'')))throw Error('Select a verified Azure DevOps user.');
+  const name=String(identity.name||'').trim();if(!name)throw Error('Selected user has no display name.');
+  const token='@'+name,prefix=value.slice(0,match.start),suffix=value.slice(match.end);
+  // Insert a word boundary so subsequent words can never extend the search term.
+  const spacer=/^\s/.test(suffix)?'':' ';
+  return {value:prefix+token+spacer+suffix,caret:(prefix+token+spacer).length,token};
+ }
+ function selectedTokens(text,selected){
+  const value=String(text||'');return [...selected.keys()].filter(token=>{
+   let at=value.indexOf(token);
+   while(at>=0){if(allowedPrefix(value[at-1])&&selectedAt(value,at,selected)===token)return true;at=value.indexOf(token,at+1);}
+   return false;
+  });
+ }
+ function prune(text,selected){
+  const existing=new Set(selectedTokens(text,selected));
+  for(const token of selected.keys())if(!existing.has(token))selected.delete(token);
+  return [...existing];
+ }
+ function serialize(text,selected,escapeHtml){
+  const value=String(text||''),esc=escapeHtml||((v)=>String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'));
+  const names=[...selected.keys()].sort((a,b)=>b.length-a.length);
+  let html='',i=0;const unresolved=[];
+  while(i<value.length){
+   if(value[i]==='@'&&allowedPrefix(value[i-1])){
+    const token=names.find(key=>value.startsWith(key,i)&&boundary(value[i+key.length])&&mentionId.test(String(selected.get(key)?.id||'')));
+    if(token){
+     const identity=selected.get(token);
+     html+=`<a href="#" data-vss-mention="version:2.0,${identity.id}">${esc(token)}</a>`;
+     i+=token.length;continue;
+    }
+    if(/[a-z]/i.test(value[i+1]||'')){
+     const unresolvedName=(value.slice(i).match(/^@[a-z][\w.'-]*/i)||[])[0];
+     if(unresolvedName)unresolved.push(unresolvedName);
+    }
+   }
+   html+=value[i]==='\n'?'<br>':esc(value[i]);i++;
+  }
+  return {html:'<div>'+html+'</div>',unresolved:[...new Set(unresolved)]};
+ }
+ return {active,select,selectedTokens,prune,serialize};
+})();
+
+/* v1.0.46: non-disruptive Board synchronisation, local and on-demand.
+ * No socket, no implicit ADO writes, no full-frame reload for ordinary staleness.
+ * Authentication expiry is still handled by GS44Session's guarded reload path.
+ */
+const GS46Board=(()=>{
+ let inFlight=null,queued=false,lastRefresh=0;
+ const button=()=>document.getElementById('gs46BoardRefresh');
+ const label=()=>document.getElementById('gs46BoardFreshness');
+ const status=(message,error=false)=>{const node=label();if(node){node.textContent=message;node.classList.toggle('error',error);}};
+ function isEditing(){
+  const openDialogs=[...document.querySelectorAll('dialog[open], [role="dialog"]:not(.hidden)')];
+  if(openDialogs.some(d=>d.id==='gs-board-item-dialog'||d.classList.contains('gs41-package-dialog')||d.id==='laneDialog'))return true;
+  const current=document.activeElement;
+  return !!(current&&current.closest?.('#gs-board-item-dialog, .gs41-package-dialog, #laneDialog'));
+ }
+ function unsafe(){return !!(busy||typeof bulkBusy!=='undefined'&&bulkBusy||typeof switchingSprint!=='undefined'&&switchingSprint||typeof timelineBusy!=='undefined'&&timelineBusy||typeof outlookBookingBusy!=='undefined'&&outlookBookingBusy||typeof gs40BulkCancelBusy!=='undefined'&&gs40BulkCancelBusy||sprintDirty()||projectsDirty()||isEditing());}
+ async function refresh({automatic=false}={}){
+  if(!token||!registry||!currentSprint())return;
+  if(automatic&&document.hidden)return;
+  if(inFlight)return inFlight;
+  if(unsafe()){
+   queued=true;status('Updates paused while editing or saving');
+   diagnostic('board.refresh.deferred',{operation:'refresh',deferred:true});return {status:'deferred'};
+  }
+  // Resist focus/visibility events arriving almost simultaneously.
+  if(automatic&&Date.now()-lastRefresh<30000)return {status:'recent'};
+  const sprintId=currentSprint()?.id;
+  inFlight=(async()=>{
+   const action=button();if(action)action.disabled=true;
+   status(automatic?'Checking for updates…':'Refreshing Board…');
+   try{
+    const selectedBefore=currentSprint();
+    const before=[...(selectedBefore?.itemIds||[])].map(Number).sort((a,b)=>a-b).join(',');
+    // Registry-only changes (for example another PM accepting a Done card)
+    // must redraw even when ADO work-item revisions are unchanged.
+    const presentationOf=sp=>JSON.stringify({doneDisplayIds:sp?.doneDisplayIds||{},itemLanes:sp?.itemLanes||{},blockedItems:sp?.blockedItems||{},customLanes:sp?.customLanes||[],laneMappings:sp?.laneMappings||{}});
+    const presentationBefore=presentationOf(selectedBefore);
+    await refreshSharedRegistryForExecution();
+    if(!registry.sprints.some(x=>x.id===sprintId)||currentSprint()?.id!==sprintId){
+     status('Sprint changed; select it again',true);return {status:'changed'};
+    }
+    if(unsafe()){
+     queued=true;status('Update ready after editing');return {status:'deferred'};
+    }
+    const after=[...(currentSprint()?.itemIds||[])].map(Number).sort((a,b)=>a-b).join(',');
+    const presentationChanged=presentationBefore!==presentationOf(currentSprint());
+    let result;
+    if(before!==after){
+     // Reload only work item data, not the iframe. Do not change native ADO iterations.
+     result=await loadAssignedItems();
+     if(result?.status==='failed')throw result.error||Error('Unable to refresh assigned work items');
+     renderBoard();renderSprintHealth();
+    }else{
+     result=await refreshTrackedWorkItemsQuietly();
+     if(result?.status==='failed')throw result.error||Error('Work item refresh failed');
+     if(presentationChanged&&!result?.changed){
+      // ADO did not change but GS sprint-owned validation/lane data did.
+      renderBoard();renderSprintHealth();
+     }
+    }
+    lastRefresh=Date.now();queued=false;
+    status('Updated '+new Date(lastRefresh).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}));
+    diagnostic('board.refresh.success',{operation:'refresh',changed:before!==after||presentationChanged||!!result?.changed,loaded:assignedItems.length});
+    return {status:'complete',membershipChanged:before!==after};
+   }catch(error){
+    status('Update failed · try Refresh Board',true);
+    diagnostic('board.refresh.failed',{operation:'refresh',status:Number(error?.status)||0,errorCode:'refresh_failed'},'warn');
+    return {status:'failed'};
+   }finally{if(action)action.disabled=false;inFlight=null;}
+  })();
+  return inFlight;
+ }
+ function start(){
+  button()?.addEventListener('click',()=>void refresh());
+  // Queued updates are intentionally not applied while a dialog is open.
+  document.addEventListener('close',()=>{if(queued)queueMicrotask(()=>{if(!unsafe())void refresh();});},true);
+  // Some dialogs remove themselves without emitting `close` to the document.
+  document.addEventListener('click',()=>{if(queued)setTimeout(()=>{if(!unsafe())void refresh();},100);},true);
+ }
+ return {start,refresh,isEditing};
+})();
+GS46Board.start();
+
+/* END generated v1.0.49 runtime */
 
 init();
 

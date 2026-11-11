@@ -1,0 +1,1 @@
+Legacy unused licensing display contract (never authoritative). Preserved for audit only. Not loaded, tested as current behavior or packaged. Current license enforcement is contained in src/app-main.js and backed by Product Command.

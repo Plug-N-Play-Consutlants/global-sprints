@@ -1,0 +1,16 @@
+'use strict';
+const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
+const src=fs.readFileSync('app.js','utf8');
+const a=src.indexOf('function roomStoreVerified('),b=src.indexOf('function roomScheduleRetry(',a);
+assert.ok(a>=0&&b>a);const subset=src.slice(a,b);
+const host={id:'adf07d80-dc20-4430-99c1-38a0321d9509'};let stored=null;
+const cache={getItem:()=>stored,setItem:(key,val)=>stored=val};
+const ctx={console,Date,JSON,Error,localStorage:cache,roomCacheKey:()=> 'test',sdk:{getHost:()=>host},roomOrganization:()=> 'org',ALLOWED:new Set(['licensed','trial_active','trial_expired','unlicensed','expired','suspended']),diagnostic:()=>{},roomStatus:null};
+vm.createContext(ctx);vm.runInContext(subset,ctx);
+const save=vm.runInContext('roomStoreVerified',ctx),restore=vm.runInContext('roomRestoreVerified',ctx);
+const tomorrow=new Date(Date.now()+86400000).toISOString(),yesterday=new Date(Date.now()-86400000).toISOString();
+save({status:'licensed',allowed:true,expiresAt:tomorrow});assert.equal(restore(),true);assert.equal(vm.runInContext('roomStatus.allowed',ctx),true);
+save({status:'licensed',allowed:true,expiresAt:yesterday});assert.equal(restore(),true);assert.equal(vm.runInContext('roomStatus.allowed',ctx),false);assert.equal(vm.runInContext('roomStatus.status',ctx),'expired');
+save({status:'trial_active',allowed:true,expiresAt:yesterday});assert.equal(restore(),true);assert.equal(vm.runInContext('roomStatus.status',ctx),'trial_expired');
+save({status:'licensed',allowed:true,expiresAt:null});assert.equal(restore(),true);assert.equal(vm.runInContext('roomStatus.allowed',ctx),true);
+console.log('PASS: license cache respects explicit paid/trial expirations and outage-tolerant unexpired entitlements');

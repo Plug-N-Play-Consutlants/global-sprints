@@ -57,7 +57,7 @@ const cell={classList:{add:()=>{},remove:()=>{}}};
  console.log('PASS: failed ADO state change rolls back Board placement');
  // Mention lookups must reach the host SDK service without a network call.
  let networkCalls=0;
- const sdk={getService:async(id)=>{assert.strictEqual(id,'ms.vss-features.identity-service');return{searchIdentitiesAsync:async(q,types,scopes)=>{assert.deepEqual(Array.from(types),['user']);return [{entityId:'81fa6389-0872-6fdd-a451-7ba7880f566a',displayName:'Wendy Potter',mailAddress:'wendy@example.com'}];}};}};
+ const sdk={getService:async(id)=>{assert.strictEqual(id,'ms.vss-features.identity-service');return{searchIdentitiesAsync:async(q,types,scopes)=>{assert.deepEqual(Array.from(types),['user']);return [{id:'81fa6389-0872-6fdd-a451-7ba7880f566a',displayName:'Wendy Potter',mailAddress:'wendy@example.com'}];}};}};
  const M={console,Map,Set,Error,Promise,encodeURIComponent,URL,Date,sdk,items:[],assignedItems:[],ancestorItems:[],browserItems:[],nearbyResults:[],diagnostic:()=>{},api:async()=>{networkCalls++;throw Error('Failed to fetch');}};
  vm.createContext(M);vm.runInContext(mention,M);
  const users=await vm.runInContext('searchMentionIdentities',M)('Wendy');
@@ -65,7 +65,7 @@ const cell={classList:{add:()=>{},remove:()=>{}}};
  assert.strictEqual(users[0].id,'81fa6389-0872-6fdd-a451-7ba7880f566a');
  console.log('PASS: host identity service works even when browser fetch fails');
  assert(source.includes('data-vss-mention="version:2.0,${identity.id}"'),'Mention HTML markup preserved');
- assert(source.includes("const DIAG_VERSION='1.0.39'"));
+ assert(source.includes("const DIAG_VERSION='"+JSON.parse(require('node:fs').readFileSync('extension.vsomanifest','utf8')).version+"'"));
  assert(!source.includes('has no native Done / Resolved state. Move it'));
  console.log('PASS: markup, removed warning and runtime version');
 })().catch(e=>{console.error(e);process.exitCode=1;});

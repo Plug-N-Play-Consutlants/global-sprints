@@ -98,6 +98,6 @@ const cases=[
  await drop(9300,'Closed','Default',cel);
  assert.strictEqual(currentItem.state,'Complete');assert.strictEqual(board(currentItem),'Closed');
  console.log('PASS explicit Board acceptance does not invent ADO states');testCount++;
- assert(src.includes("const DIAG_VERSION='1.0.39'"));
+ assert(src.includes("const DIAG_VERSION='"+JSON.parse(require('node:fs').readFileSync('extension.vsomanifest','utf8')).version+"'"));
  console.log(`PASS ${testCount} process-aware scenarios`);
 })().catch(e=>{console.error(e);process.exitCode=1;});

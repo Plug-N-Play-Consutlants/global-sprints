@@ -1,0 +1,53 @@
+PASS: selected user sends WIT unique email
+PASS: SDK result without email sends IdentityRef instead of ambiguous name
+PASS: validated email fallback, unassign and ambiguous-name rejection
+PASS: picker selection, ADO PATCH wiring, successful-save reset and independent option buttons
+PASS: header/runtime version guard
+PASS Agile User Story with Resolved categorized InProgress
+PASS Agile Bug with Resolved category
+PASS Agile Task with Closed terminal
+PASS Scrum Product Backlog Item
+PASS Basic Issue
+PASS CMMI Requirement Resolved is InProgress
+PASS Inherited custom Complete in Completed category
+PASS Inherited Complete in InProgress category fallback
+PASS Unknown native state name in Completed category
+PASS Missing state category with recognized Complete name
+PASS separate project/type maps
+PASS validator skips blocked resolved state and uses allowed completed state
+PASS rejecting all transitions preserves ADO and Board
+PASS ADO write failure rolls back staged Done placement
+PASS custom category remains authoritative for Sprint Health
+PASS inherited process changed after initial metadata load
+PASS alternate stateCategory metadata field
+PASS explicit Board acceptance does not invent ADO states
+PASS 18 process-aware scenarios
+PASS: Scrum terminal Completed
+PASS: Resolved and Completed
+PASS: Done and Closed
+PASS: Terminal Closed only
+PASS: failed ADO state change rolls back Board placement
+PASS: host identity service works even when browser fetch fails
+PASS: markup, removed warning and runtime version
+PASS: authorized WIT assignee uses real VSID, zero network
+PASS: slim SDK identity resolves via IMS VSID on correct host
+PASS: IMS name search resolves identity without work item records
+PASS: Graph subjectQuery descriptor converted to storage key
+PASS: team fallback survives browser network failure
+PASS: authenticated mention markup and header version
+PASS: v1.0.41 pure hierarchy, single-count accounting, meeting lifecycle and retrospective tests
+PASS: v1.0.41 runtime integration, retirement, package and accounting hooks
+PASS: REST hierarchy traversal, cross-iteration exclusion, atomic add, idempotency
+PASS: sprint-level cancellation does not touch another sprint in the same schedule
+PASS: cross-sprint recurrence blocks unsafe mass cancellation
+PASS: closeout remains active on unresolved meeting
+PASS: successful closeout cancels remaining Outlook meetings and archives history
+PASS: license cache respects explicit paid/trial expirations and outage-tolerant unexpired entitlements
+PASS: 11 accepted v1.0.39 workflow, identity, Outlook, Gantt and Board implementations unchanged
+PASS: visible hierarchy preview, default child selection, explicit cross-iteration consent, conflict lockout and atomic add
+PASS: reopening an existing story still exposes its descendants
+PASS: search, browse and Board presentation integration hooks
+PASS: v1.0.42 inline closeout feedback, accessible disclosure, red End schedule, opt-in local save/errors, validated trial expiry and authorization status normalization
+PASS: 17 schedule lifecycle, read-only history, sprint coverage and cancellation scope checks
+PASS: v1.0.43 real schedule renderer, active/history counts, completed historical booked draft, actions and planning guidance
+PASS: v1.0.43 source-first build, 13 test files, 9 VSIX entries, 269181 bytes

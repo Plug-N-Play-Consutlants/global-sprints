@@ -1,0 +1,11 @@
+const assert=require('node:assert/strict');const fs=require('node:fs');
+const src=fs.readFileSync('app.js','utf8'),html=fs.readFileSync('index.html','utf8');
+for(const term of ['gs40AddWorkPackage(item.id)','gs40AppendCardChildren(card,w)','gs40RenderReportDrilldown(host,work)','gs40ClearSchedule(sc.id)','gs40CloseWorkspace()','function gs40FetchPackage','function gs40EnrichBrowseParents','function gs40SaveRetro','function gs40CancelMeetingTargets'])assert.ok(src.includes(term),'missing '+term);
+assert.ok(src.indexOf('function gs40FetchPackage','function gs40EnrichBrowseParents')<src.lastIndexOf('\ninit();'),'runtime must run inside app module');
+assert.ok(html.includes('id="gs40RetrospectivePanel"'));assert.ok(html.includes('src="gs40-core.js"'));
+assert.ok(src.includes('GS40Core.progress(baseline,observed'));
+assert.ok(src.includes('parentId:w.parentId||null'));
+assert.ok(src.includes('outlookCancelCeremony(id,scheduleId=null,options={})'));
+assert.ok(src.includes("if(!options.bulk&&!confirm"));
+assert.equal(html.match(/src="app.js"/g)?.length,1);
+console.log('PASS: v1.0.41 runtime integration, retirement, package and accounting hooks');

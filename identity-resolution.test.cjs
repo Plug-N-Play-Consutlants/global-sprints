@@ -56,6 +56,6 @@ async function fixture({hostUsers=[],workItems=[],routes=()=>{throw Error('unexp
   console.log('PASS: team fallback survives browser network failure');
  }
  assert(source.includes(`data-vss-mention="version:2.0,${'${identity.id}'}"`));
- assert(source.includes("const DIAG_VERSION='1.0.39'"));
+ assert(source.includes("const DIAG_VERSION='"+JSON.parse(require('node:fs').readFileSync('extension.vsomanifest','utf8')).version+"'"));
  console.log('PASS: authenticated mention markup and header version');
 })().catch(e=>{console.error(e);process.exitCode=1;});
